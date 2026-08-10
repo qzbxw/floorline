@@ -12,9 +12,6 @@ import (
 	"floorline/internal/tonnel"
 )
 
-// App implements bot.Backend. Handlers get finished, HTML-safe text back.
-var _ bot.Backend = (*App)(nil)
-
 // priceGift runs the full valuation for one listing, fetching whatever market
 // data it needs. Shared by /val and the Buy button so both see the same numbers
 // the detector saw.
@@ -55,7 +52,7 @@ func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pric
 }
 
 // Status reports the health of every moving part.
-func (a *App) Status(ctx context.Context) string {
+func (a *App) statusText(ctx context.Context) string {
 	now := time.Now()
 	var b strings.Builder
 
@@ -128,7 +125,7 @@ func (a *App) Status(ctx context.Context) string {
 }
 
 // Floor shows a collection's models, or one model in detail.
-func (a *App) Floor(ctx context.Context, collection, model string) string {
+func (a *App) floorText(ctx context.Context, collection, model string) string {
 	name := a.resolveCollection(ctx, collection)
 	if name == "" {
 		return a.unknownCollection(ctx, collection)
@@ -189,7 +186,7 @@ func (a *App) Floor(ctx context.Context, collection, model string) string {
 }
 
 // BookText prints the ask ladder with cumulative depth.
-func (a *App) BookText(ctx context.Context, collection, model string) string {
+func (a *App) bookText(ctx context.Context, collection, model string) string {
 	key, msg := a.mustResolve(ctx, collection, model)
 	if msg != "" {
 		return msg
@@ -220,7 +217,7 @@ func (a *App) BookText(ctx context.Context, collection, model string) string {
 }
 
 // Hist prints the real trade history for a model.
-func (a *App) Hist(ctx context.Context, collection, model string) string {
+func (a *App) histText(ctx context.Context, collection, model string) string {
 	key, msg := a.mustResolve(ctx, collection, model)
 	if msg != "" {
 		return msg
@@ -260,7 +257,7 @@ func (a *App) Hist(ctx context.Context, collection, model string) string {
 }
 
 // Val prices one listing in full, including the gates it fails.
-func (a *App) Val(ctx context.Context, giftID int64) string {
+func (a *App) valText(ctx context.Context, giftID int64) string {
 	g, err := a.api.GiftData(ctx, giftID)
 	if err != nil {
 		return "Could not fetch that listing: " + bot.Esc(err.Error())
@@ -288,7 +285,7 @@ func (a *App) Val(ctx context.Context, giftID int64) string {
 }
 
 // Positions lists open inventory with live marks.
-func (a *App) Positions(ctx context.Context) string {
+func (a *App) positionsText(ctx context.Context) string {
 	positions, err := a.st.OpenPositions(ctx)
 	if err != nil {
 		return "Could not read positions: " + bot.Esc(err.Error())
@@ -327,7 +324,7 @@ func (a *App) Positions(ctx context.Context) string {
 }
 
 // PnL reports realised and unrealised profit, net of fees.
-func (a *App) PnL(ctx context.Context) string {
+func (a *App) pnlText(ctx context.Context) string {
 	closed, err := a.st.ClosedPositions(ctx, 500)
 	if err != nil {
 		return "Could not read closed positions: " + bot.Esc(err.Error())
@@ -396,7 +393,7 @@ func (a *App) PnL(ctx context.Context) string {
 }
 
 // BalanceText reports the account balance.
-func (a *App) BalanceText(ctx context.Context) string {
+func (a *App) balanceText(ctx context.Context) string {
 	bal, err := a.api.Balance(ctx)
 	if err != nil {
 		return "Could not read the balance: " + bot.Esc(err.Error())
@@ -415,7 +412,7 @@ func (a *App) BalanceText(ctx context.Context) string {
 }
 
 // Relist reprices an owned gift against the current book.
-func (a *App) Relist(ctx context.Context, giftID int64) string {
+func (a *App) relistText(ctx context.Context, giftID int64) string {
 	p, err := a.st.GetPosition(ctx, giftID)
 	if err != nil {
 		return "Could not read that position: " + bot.Esc(err.Error())
@@ -438,7 +435,7 @@ func (a *App) Relist(ctx context.Context, giftID int64) string {
 }
 
 // Arm enables unattended buying.
-func (a *App) Arm(ctx context.Context) string {
+func (a *App) armText(ctx context.Context) string {
 	if err := a.rm.Arm(ctx); err != nil {
 		return "❌ " + bot.Esc(err.Error())
 	}
@@ -450,7 +447,7 @@ func (a *App) Arm(ctx context.Context) string {
 }
 
 // Disarm stops unattended buying.
-func (a *App) Disarm(ctx context.Context) string {
+func (a *App) disarmText(ctx context.Context) string {
 	if err := a.rm.Disarm(ctx, "disarmed manually"); err != nil {
 		return "❌ " + bot.Esc(err.Error())
 	}
@@ -458,13 +455,13 @@ func (a *App) Disarm(ctx context.Context) string {
 }
 
 // LimitsText shows the limits and today's usage.
-func (a *App) LimitsText(ctx context.Context) string {
+func (a *App) limitsText(ctx context.Context) string {
 	return "<b>Limits</b>\n<pre>" + bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>" +
 		"\nChange one with <code>/limits set max_ticket 50</code>"
 }
 
 // SetLimit updates one limit.
-func (a *App) SetLimit(ctx context.Context, key, value string) string {
+func (a *App) setLimitText(ctx context.Context, key, value string) string {
 	if err := a.rm.SetLimit(ctx, key, value); err != nil {
 		return "❌ " + bot.Esc(err.Error())
 	}
@@ -473,7 +470,7 @@ func (a *App) SetLimit(ctx context.Context, key, value string) string {
 }
 
 // Watch subscribes to a model.
-func (a *App) Watch(ctx context.Context, collection, model string, maxPrice float64) string {
+func (a *App) watchText(ctx context.Context, collection, model string, maxPrice float64) string {
 	key, msg := a.mustResolve(ctx, collection, model)
 	if msg != "" {
 		return msg
@@ -488,7 +485,7 @@ func (a *App) Watch(ctx context.Context, collection, model string, maxPrice floa
 }
 
 // Unwatch removes a subscription.
-func (a *App) Unwatch(ctx context.Context, collection, model string) string {
+func (a *App) unwatchText(ctx context.Context, collection, model string) string {
 	key := tonnel.ModelKey{Name: tonnel.TitleCase(collection), Model: tonnel.TitleCase(model)}
 	if resolved, ok := a.resolveModel(ctx, key.Name, model); ok {
 		key = resolved
@@ -500,7 +497,7 @@ func (a *App) Unwatch(ctx context.Context, collection, model string) string {
 }
 
 // Watchlist lists subscriptions with their current floors.
-func (a *App) Watchlist(ctx context.Context) string {
+func (a *App) watchlistText(ctx context.Context) string {
 	watches, err := a.st.Watches(ctx)
 	if err != nil {
 		return "Could not read the watchlist: " + bot.Esc(err.Error())
@@ -524,7 +521,7 @@ func (a *App) Watchlist(ctx context.Context) string {
 }
 
 // Mute silences alerts for a collection or a single model.
-func (a *App) Mute(ctx context.Context, collection, model string, d time.Duration) string {
+func (a *App) muteText(ctx context.Context, collection, model string, d time.Duration) string {
 	scope, label := a.muteScope(ctx, collection, model)
 	until := time.Now().Add(d)
 	if err := a.st.SetMute(ctx, scope, until); err != nil {
@@ -534,7 +531,7 @@ func (a *App) Mute(ctx context.Context, collection, model string, d time.Duratio
 }
 
 // Unmute clears a mute.
-func (a *App) Unmute(ctx context.Context, collection, model string) string {
+func (a *App) unmuteText(ctx context.Context, collection, model string) string {
 	scope, label := a.muteScope(ctx, collection, model)
 	if err := a.st.ClearMute(ctx, scope); err != nil {
 		return "Could not clear the mute: " + bot.Esc(err.Error())
@@ -559,7 +556,7 @@ func (a *App) muteScope(ctx context.Context, collection, model string) (scope, l
 
 // SetAuth replaces the Tonnel session and verifies it immediately, so a bad
 // paste is reported now rather than as silent poller failures later.
-func (a *App) SetAuth(ctx context.Context, authData string) string {
+func (a *App) setAuthText(ctx context.Context, authData string) string {
 	prev := a.api.Auth()
 	a.api.SetAuth(authData)
 
@@ -573,63 +570,64 @@ func (a *App) SetAuth(ctx context.Context, authData string) string {
 	return fmt.Sprintf("✅ Tonnel session updated (user %d).", a.api.UserID())
 }
 
-// BuySignal executes the Buy button.
+// buySignal executes a confirmed purchase and returns the message to show plus
+// the gift id, so the caller can attach a link to the lot.
 //
-// A manual tap is an explicit override, so the auto-buy gates and the armed
-// switch do not apply — but the price is re-read first, because the card may
+// A confirmed tap is an explicit override, so the auto-buy gates and the armed
+// switch do not apply — but the listing is re-read first, because the card may
 // have been sitting in the chat for a while.
-func (a *App) BuySignal(ctx context.Context, signalID int64) string {
+func (a *App) buySignal(ctx context.Context, signalID int64) (string, int64) {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil {
-		return "Could not read that signal: " + bot.Esc(err.Error())
+		return "Could not read that signal: " + bot.Esc(err.Error()), 0
 	}
 	if sig == nil {
-		return "That signal is gone."
+		return "That signal is gone.", 0
 	}
 
 	g, err := a.api.GiftData(ctx, sig.GiftID)
 	if err != nil {
-		return "Could not re-read the listing: " + bot.Esc(err.Error())
+		return "Could not re-read the listing: " + bot.Esc(err.Error()), sig.GiftID
 	}
 	if g.GiftID.Int() == 0 {
 		g.GiftID = tonnel.FlexInt(sig.GiftID)
 	}
 	if g.Buyer != nil {
-		return "Too late — that listing has already been bought."
+		return "🏃 Too late — that listing has already been bought.", sig.GiftID
 	}
 
 	price := g.Price.Float()
 	if price <= 0 {
-		return "That listing is no longer for sale."
+		return "That listing is no longer for sale.", sig.GiftID
 	}
 	if price > sig.Price {
-		return fmt.Sprintf("Price moved up from %s to %s since the alert. Not buying — run <code>/val %d</code> if you still want it.",
-			num(sig.Price), num(price), sig.GiftID)
+		return fmt.Sprintf(
+			"⚠️ Price moved up from %s to %s since the alert, so nothing was bought.\nRun <code>/val %d</code> if you still want it.",
+			num(sig.Price), num(price), sig.GiftID), sig.GiftID
 	}
 
 	now := time.Now()
 	v, err := a.priceGift(ctx, *g, now)
 	if err != nil {
-		return "Could not value the listing before buying: " + bot.Esc(err.Error())
+		return "Could not value the listing before buying: " + bot.Esc(err.Error()), sig.GiftID
 	}
 
 	out, buyErr := a.ex.Buy(ctx, v, *g, "manual", now)
-	a.reportPurchase(ctx, signalID, out, buyErr, false)
-	return ""
+	return a.renderPurchase(ctx, signalID, out, buyErr, false), sig.GiftID
 }
 
 // BookForSignal shows the ladder behind a card.
-func (a *App) BookForSignal(ctx context.Context, signalID int64) string {
+func (a *App) bookForSignalText(ctx context.Context, signalID int64) string {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil || sig == nil {
 		return "That signal is gone."
 	}
 	a.books.Invalidate(sig.Key)
-	return a.BookText(ctx, sig.Key.Name, sig.Key.Model)
+	return a.bookText(ctx, sig.Key.Name, sig.Key.Model)
 }
 
 // MuteSignal silences the model behind a card.
-func (a *App) MuteSignal(ctx context.Context, signalID int64, d time.Duration) string {
+func (a *App) muteSignalText(ctx context.Context, signalID int64, d time.Duration) string {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil || sig == nil {
 		return "That signal is gone."

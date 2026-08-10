@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"floorline/internal/bot"
-	"floorline/internal/exec"
 	"floorline/internal/pricing"
 	"floorline/internal/signal"
 	"floorline/internal/store"
@@ -104,7 +103,7 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 		if allowed {
 			// Buy first, explain afterwards — the listing is a race.
 			out, buyErr := a.ex.Buy(ctx, v, dec.Gift, "auto", now)
-			a.reportPurchase(ctx, sigID, out, buyErr, true)
+			a.notify(a.renderPurchase(ctx, sigID, out, buyErr, true))
 			return nil
 		}
 		note = "auto-buy blocked: " + why
@@ -119,7 +118,7 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 		log.Info().Str("model", v.Key.String()).Float64("edge", v.Edge).Msg("signal (no telegram configured)")
 		return nil
 	}
-	a.tg.NotifySignal(a.renderCard(ctx, dec, note), sigID, v.Price)
+	a.tg.NotifySignal(a.renderCard(ctx, dec, note), sigID, dec.Gift.GiftID.Int(), v.Price)
 	return a.st.MarkSignalSent(ctx, sigID, time.Now())
 }
 
@@ -493,49 +492,4 @@ func (a *App) trackedModels(ctx context.Context) ([]tonnel.ModelKey, error) {
 // maintenance prunes data that no longer affects a decision.
 func (a *App) maintenance(ctx context.Context) error {
 	return a.st.Prune(ctx, time.Now(), a.cfg.LookbackDays*3)
-}
-
-// reportPurchase renders the outcome of a buy and records what happened.
-func (a *App) reportPurchase(ctx context.Context, sigID int64, out *exec.Outcome, err error, auto bool) {
-	kind := "Manual buy"
-	if auto {
-		kind = "Auto-buy"
-	}
-
-	if err != nil || out == nil || !out.Bought {
-		action := "failed"
-		msg := fmt.Sprintf("❌ <b>%s failed</b>", kind)
-		if out != nil {
-			msg += "\n" + bot.Esc(out.Key.String())
-			if out.Note != "" {
-				msg += "\n" + bot.Esc(out.Note)
-			}
-		}
-		if err != nil {
-			msg += "\n<code>" + bot.Esc(err.Error()) + "</code>"
-		}
-		a.notify(msg)
-		if sigID > 0 {
-			_ = a.st.SetSignalAction(ctx, sigID, action)
-		}
-		return
-	}
-
-	msg := fmt.Sprintf("✅ <b>%s</b> — %s\nBought at %s", kind, bot.Esc(out.Key.String()), num(out.BuyPrice))
-	if out.Listed {
-		gain := out.ListPrice*(1-a.cfg.TonnelFee) - out.BuyPrice
-		msg += fmt.Sprintf("\nRelisted at %s → net %s if it fills (%+.1f%%)",
-			num(out.ListPrice), num(gain), gain/out.BuyPrice*100)
-	} else {
-		msg += "\n⚠️ <b>Not relisted.</b>"
-	}
-	if out.Note != "" {
-		msg += "\n<i>" + bot.Esc(out.Note) + "</i>"
-	}
-	msg += fmt.Sprintf("\n<code>/relist %d</code>", out.GiftID)
-	a.notify(msg)
-
-	if sigID > 0 {
-		_ = a.st.SetSignalAction(ctx, sigID, "bought")
-	}
 }

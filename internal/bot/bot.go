@@ -1,7 +1,7 @@
 // Package bot is the Telegram front end.
 //
 // It deliberately contains no market logic: every handler forwards to a Backend
-// and prints what comes back. That keeps the trading rules in one place and
+// and renders what comes back. That keeps the trading rules in one place and
 // makes the bot layer trivial to reason about.
 package bot
 
@@ -18,44 +18,52 @@ import (
 )
 
 // Backend is everything the bot can ask the application to do. Handlers render
-// nothing themselves — each method returns a ready, HTML-safe message.
+// nothing themselves — each method returns ready, HTML-safe output.
 type Backend interface {
-	Status(ctx context.Context) string
-	Floor(ctx context.Context, collection, model string) string
-	BookText(ctx context.Context, collection, model string) string
-	Hist(ctx context.Context, collection, model string) string
-	Val(ctx context.Context, giftID int64) string
+	Status(ctx context.Context) Reply
+	Floor(ctx context.Context, collection, model string) Reply
+	BookText(ctx context.Context, collection, model string) Reply
+	Hist(ctx context.Context, collection, model string) Reply
+	Val(ctx context.Context, giftID int64) Reply
 
-	Positions(ctx context.Context) string
-	PnL(ctx context.Context) string
-	BalanceText(ctx context.Context) string
-	Relist(ctx context.Context, giftID int64) string
+	Positions(ctx context.Context) Reply
+	PnL(ctx context.Context) Reply
+	BalanceText(ctx context.Context) Reply
+	Relist(ctx context.Context, giftID int64) Reply
 
-	Arm(ctx context.Context) string
-	Disarm(ctx context.Context) string
-	LimitsText(ctx context.Context) string
-	SetLimit(ctx context.Context, key, value string) string
+	Arm(ctx context.Context) Reply
+	Disarm(ctx context.Context) Reply
+	LimitsText(ctx context.Context) Reply
+	SetLimit(ctx context.Context, key, value string) Reply
 
-	Watch(ctx context.Context, collection, model string, maxPrice float64) string
-	Unwatch(ctx context.Context, collection, model string) string
-	Watchlist(ctx context.Context) string
-	Mute(ctx context.Context, collection, model string, d time.Duration) string
-	Unmute(ctx context.Context, collection, model string) string
+	Watch(ctx context.Context, collection, model string, maxPrice float64) Reply
+	Unwatch(ctx context.Context, collection, model string) Reply
+	Watchlist(ctx context.Context) Reply
+	Mute(ctx context.Context, collection, model string, d time.Duration) Reply
+	Unmute(ctx context.Context, collection, model string) Reply
 
-	SetAuth(ctx context.Context, authData string) string
+	SetAuth(ctx context.Context, authData string) Reply
 
-	BuySignal(ctx context.Context, signalID int64) string
-	BookForSignal(ctx context.Context, signalID int64) string
-	MuteSignal(ctx context.Context, signalID int64, d time.Duration) string
+	// BuySignal executes a purchase the operator confirmed on a card.
+	BuySignal(ctx context.Context, signalID int64) Reply
+	BookForSignal(ctx context.Context, signalID int64) Reply
+	MuteSignal(ctx context.Context, signalID int64, d time.Duration) Reply
+	// ModelByRef resolves a keyboard reference produced by a list view.
+	ModelByRef(ctx context.Context, ref string, view string) Reply
 }
 
-// Callback identifiers. Payloads carry a signal id only, because Telegram caps
-// callback data at 64 bytes and collection/model names do not reliably fit.
+// Callback routes. Payloads stay short because Telegram caps callback data at
+// 64 bytes, which real collection and model names do not reliably fit into.
 const (
-	cbBuy  = "fl_buy"
-	cbBook = "fl_book"
-	cbMute = "fl_mute"
-	cbDrop = "fl_drop"
+	cbBuy     = "fl_buy"     // ask for confirmation
+	cbConfirm = "fl_ok"      // actually spend money
+	cbCancel  = "fl_no"      // back out
+	cbBook    = "fl_book"    // ladder behind a card
+	cbMute    = "fl_mute"    // silence the model
+	cbDrop    = "fl_drop"    // dismiss the card
+	cbRelist  = "fl_relist"  // reprice an owned gift
+	cbModel   = "fl_model"   // drill into a model from a list view
+	cbRefresh = "fl_refresh" // re-run a read-only view
 )
 
 // telegramMessageLimit is the hard cap on a single message body.
@@ -72,7 +80,7 @@ type recipient struct{ id int64 }
 
 func (r recipient) Recipient() string { return strconv.FormatInt(r.id, 10) }
 
-// New creates the bot and registers all handlers.
+// New creates the bot, registers all handlers and publishes the command menu.
 func New(token string, ownerID int64, back Backend) (*Bot, error) {
 	tb, err := tele.NewBot(tele.Settings{
 		Token:  token,
@@ -99,6 +107,10 @@ func New(token string, ownerID int64, back Backend) (*Bot, error) {
 	})
 
 	b.register()
+	if err := tb.SetCommands(commandMenu); err != nil {
+		// A missing menu is cosmetic; it must not stop the desk from running.
+		log.Warn().Err(err).Msg("could not publish the command menu")
+	}
 	return b, nil
 }
 
@@ -120,27 +132,35 @@ func (b *Bot) Username() string {
 }
 
 // Notify pushes an informational message to the owner.
-func (b *Bot) Notify(text string) {
-	b.send(text, nil)
+func (b *Bot) Notify(text string) { b.send(Text(text)) }
+
+// NotifySignal pushes an actionable card.
+//
+// The Buy button only opens a confirmation — a stray tap on a phone must not be
+// able to spend money on its own.
+func (b *Bot) NotifySignal(text string, signalID, giftID int64, price float64) {
+	b.send(Reply{Text: text}.
+		WithRow(Callback(fmt.Sprintf("⚡️ Buy %s", trimNum(price)), cbBuy, signalID)).
+		WithRow(
+			Link("🔗 Open on Tonnel", TonnelGiftURL(giftID)),
+			Callback("📊 Book", cbBook, signalID),
+		).
+		WithRow(
+			Callback("🔕 Mute 1h", cbMute, signalID),
+			Callback("🗑", cbDrop, signalID),
+		))
 }
 
-// NotifySignal pushes an actionable card with its inline keyboard.
-func (b *Bot) NotifySignal(text string, signalID int64, price float64) {
-	id := strconv.FormatInt(signalID, 10)
-	m := &tele.ReplyMarkup{}
-	buy := m.Data(fmt.Sprintf("⚡️ Buy %s", trimNum(price)), cbBuy, id)
-	book := m.Data("📊 Book", cbBook, id)
-	mute := m.Data("🔕 Mute 1h", cbMute, id)
-	drop := m.Data("🗑", cbDrop, id)
-	m.Inline(m.Row(buy), m.Row(book, mute, drop))
-	b.send(text, m)
-}
-
-func (b *Bot) send(text string, markup *tele.ReplyMarkup) {
-	for i, chunk := range splitMessage(text) {
+func (b *Bot) send(r Reply) {
+	if r.Empty() {
+		return
+	}
+	chunks := splitMessage(r.Text)
+	for i, chunk := range chunks {
 		opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}
-		if markup != nil && i == 0 {
-			opts.ReplyMarkup = markup
+		// The keyboard belongs on the last chunk, next to where the eye ends up.
+		if i == len(chunks)-1 {
+			opts.ReplyMarkup = markup(r.Rows)
 		}
 		if _, err := b.tb.Send(b.owner, chunk, opts); err != nil {
 			log.Error().Err(err).Msg("telegram send failed")
@@ -149,110 +169,138 @@ func (b *Bot) send(text string, markup *tele.ReplyMarkup) {
 	}
 }
 
+// markup converts rows of Buttons into a telebot keyboard.
+func markup(rows [][]Button) *tele.ReplyMarkup {
+	if len(rows) == 0 {
+		return nil
+	}
+	m := &tele.ReplyMarkup{}
+	out := make([]tele.Row, 0, len(rows))
+	for _, row := range rows {
+		btns := make([]tele.Btn, 0, len(row))
+		for _, bt := range row {
+			if bt.URL != "" {
+				btns = append(btns, m.URL(bt.Label, bt.URL))
+				continue
+			}
+			btns = append(btns, m.Data(bt.Label, bt.Unique, bt.Data))
+		}
+		if len(btns) > 0 {
+			out = append(out, m.Row(btns...))
+		}
+	}
+	m.Inline(out...)
+	return m
+}
+
 func (b *Bot) register() {
 	tb := b.tb
 
-	tb.Handle("/start", b.reply(func(ctx context.Context, c tele.Context) string { return helpText }))
-	tb.Handle("/help", b.reply(func(ctx context.Context, c tele.Context) string { return helpText }))
+	tb.Handle("/start", b.reply(func(ctx context.Context, c tele.Context) Reply { return Text(helpText) }))
+	tb.Handle("/help", b.reply(func(ctx context.Context, c tele.Context) Reply { return Text(helpText) }))
 
-	tb.Handle("/status", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/status", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Status(ctx)
 	}))
 
-	tb.Handle("/floor", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/floor", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" {
-			return "Usage: <code>/floor Plush Pepe</code> or <code>/floor Plush Pepe / Pink Diamond</code>"
+			return Text("Usage: <code>/floor Plush Pepe</code> or <code>/floor Plush Pepe / Pink Diamond</code>")
 		}
 		return b.back.Floor(ctx, col, model)
 	}))
 
-	tb.Handle("/book", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/book", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" || model == "" {
-			return "Usage: <code>/book Plush Pepe / Pink Diamond</code>"
+			return Text("Usage: <code>/book Plush Pepe / Pink Diamond</code>")
 		}
 		return b.back.BookText(ctx, col, model)
 	}))
 
-	tb.Handle("/hist", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/hist", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" || model == "" {
-			return "Usage: <code>/hist Plush Pepe / Pink Diamond</code>"
+			return Text("Usage: <code>/hist Plush Pepe / Pink Diamond</code>")
 		}
 		return b.back.Hist(ctx, col, model)
 	}))
 
-	tb.Handle("/val", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/val", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
 		if err != nil {
-			return "Usage: <code>/val 123456</code> (Tonnel gift id)"
+			return Text("Usage: <code>/val 123456</code> (Tonnel gift id)")
 		}
 		return b.back.Val(ctx, id)
 	}))
 
-	tb.Handle("/pos", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/pos", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Positions(ctx)
 	}))
-	tb.Handle("/pnl", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/pnl", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.PnL(ctx)
 	}))
-	tb.Handle("/balance", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/balance", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.BalanceText(ctx)
 	}))
 
-	tb.Handle("/relist", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/relist", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
 		if err != nil {
-			return "Usage: <code>/relist 123456</code> (Tonnel gift id from /pos)"
+			return Text("Usage: <code>/relist 123456</code> — or just tap the button under <code>/pos</code>")
 		}
 		return b.back.Relist(ctx, id)
 	}))
 
-	tb.Handle("/arm", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/arm", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Arm(ctx)
 	}))
-	tb.Handle("/disarm", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/disarm", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Disarm(ctx)
 	}))
 
-	tb.Handle("/limits", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/limits", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		f := strings.Fields(c.Message().Payload)
-		if len(f) == 0 {
+		switch {
+		case len(f) == 0:
 			return b.back.LimitsText(ctx)
-		}
-		if len(f) == 3 && strings.EqualFold(f[0], "set") {
+		case len(f) == 3 && strings.EqualFold(f[0], "set"):
 			return b.back.SetLimit(ctx, f[1], f[2])
+		case len(f) == 2:
+			// "/limits max_ticket 50" is the obvious typo; accept it.
+			return b.back.SetLimit(ctx, f[0], f[1])
+		default:
+			return Text("Usage: <code>/limits</code> or <code>/limits set max_ticket 50</code>")
 		}
-		return "Usage: <code>/limits</code> or <code>/limits set max_ticket 50</code>"
 	}))
 
-	tb.Handle("/watch", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/watch", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		target, maxPrice := splitTrailingNumber(c.Message().Payload)
 		col, model := splitTarget(target)
 		if col == "" || model == "" {
-			return "Usage: <code>/watch Plush Pepe / Pink Diamond [max price]</code>"
+			return Text("Usage: <code>/watch Plush Pepe / Pink Diamond [max price]</code>")
 		}
 		return b.back.Watch(ctx, col, model, maxPrice)
 	}))
 
-	tb.Handle("/unwatch", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/unwatch", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" || model == "" {
-			return "Usage: <code>/unwatch Plush Pepe / Pink Diamond</code>"
+			return Text("Usage: <code>/unwatch Plush Pepe / Pink Diamond</code>")
 		}
 		return b.back.Unwatch(ctx, col, model)
 	}))
 
-	tb.Handle("/watchlist", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/watchlist", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Watchlist(ctx)
 	}))
 
-	tb.Handle("/mute", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/mute", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		target, hours := splitTrailingNumber(c.Message().Payload)
 		col, model := splitTarget(target)
 		if col == "" {
-			return "Usage: <code>/mute Plush Pepe [hours]</code> or <code>/mute Plush Pepe / Pink Diamond 4</code>"
+			return Text("Usage: <code>/mute Plush Pepe [hours]</code> or <code>/mute Plush Pepe / Pink Diamond 4</code>")
 		}
 		if hours <= 0 {
 			hours = 1
@@ -260,83 +308,199 @@ func (b *Bot) register() {
 		return b.back.Mute(ctx, col, model, time.Duration(hours*float64(time.Hour)))
 	}))
 
-	tb.Handle("/unmute", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/unmute", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" {
-			return "Usage: <code>/unmute Plush Pepe</code>"
+			return Text("Usage: <code>/unmute Plush Pepe</code>")
 		}
 		return b.back.Unmute(ctx, col, model)
 	}))
 
-	tb.Handle("/auth", b.reply(func(ctx context.Context, c tele.Context) string {
+	tb.Handle("/auth", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return "Usage: <code>/auth &lt;authData&gt;</code> — the initData string from LocalStorage of market.tonnel.network"
+			return Text("Usage: <code>/auth &lt;authData&gt;</code> — the initData string from LocalStorage of market.tonnel.network")
+		}
+		// The credential must not stay visible in the chat history.
+		if err := c.Delete(); err != nil {
+			log.Warn().Err(err).Msg("could not delete the message carrying authData")
 		}
 		return b.back.SetAuth(ctx, raw)
 	}))
 
-	tb.Handle(&tele.Btn{Unique: cbBuy}, b.callback(func(ctx context.Context, id int64, c tele.Context) string {
+	b.registerCallbacks()
+}
+
+func (b *Bot) registerCallbacks() {
+	tb := b.tb
+
+	// Tapping Buy only swaps the keyboard for a confirmation. The card text is
+	// left alone so the numbers stay on screen while deciding.
+	tb.Handle(&tele.Btn{Unique: cbBuy}, func(c tele.Context) error {
+		id := strings.TrimSpace(c.Data())
+		_ = c.Respond(&tele.CallbackResponse{Text: "confirm to buy"})
+		return c.Edit(&tele.ReplyMarkup{InlineKeyboard: markup([][]Button{
+			{Callback("✅ Confirm purchase", cbConfirm, id)},
+			{Callback("✖️ Cancel", cbCancel, id)},
+		}).InlineKeyboard})
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbCancel}, func(c tele.Context) error {
+		sigID, err := strconv.ParseInt(strings.TrimSpace(c.Data()), 10, 64)
+		if err != nil {
+			return c.Respond(&tele.CallbackResponse{Text: "malformed button", ShowAlert: true})
+		}
+		_ = c.Respond(&tele.CallbackResponse{Text: "cancelled"})
+		return c.Edit(&tele.ReplyMarkup{InlineKeyboard: markup([][]Button{
+			{Callback("⚡️ Buy", cbBuy, sigID)},
+			{Callback("📊 Book", cbBook, sigID), Callback("🔕 Mute 1h", cbMute, sigID), Callback("🗑", cbDrop, sigID)},
+		}).InlineKeyboard})
+	})
+
+	// The purchase result replaces the card. Leaving a live Buy button on a
+	// listing we already acted on is how double-taps happen.
+	tb.Handle(&tele.Btn{Unique: cbConfirm}, b.editing(func(ctx context.Context, id int64, c tele.Context) Reply {
 		return b.back.BuySignal(ctx, id)
 	}))
-	tb.Handle(&tele.Btn{Unique: cbBook}, b.callback(func(ctx context.Context, id int64, c tele.Context) string {
+
+	tb.Handle(&tele.Btn{Unique: cbBook}, b.sending(func(ctx context.Context, id int64, c tele.Context) Reply {
 		return b.back.BookForSignal(ctx, id)
 	}))
-	tb.Handle(&tele.Btn{Unique: cbMute}, b.callback(func(ctx context.Context, id int64, c tele.Context) string {
+
+	tb.Handle(&tele.Btn{Unique: cbMute}, b.editing(func(ctx context.Context, id int64, c tele.Context) Reply {
 		return b.back.MuteSignal(ctx, id, time.Hour)
 	}))
+
 	tb.Handle(&tele.Btn{Unique: cbDrop}, func(c tele.Context) error {
 		_ = c.Respond(&tele.CallbackResponse{Text: "skipped"})
 		return c.Delete()
 	})
-}
 
-// reply adapts a text-producing function into a telebot handler.
-func (b *Bot) reply(fn func(context.Context, tele.Context) string) tele.HandlerFunc {
-	return func(c tele.Context) error {
+	tb.Handle(&tele.Btn{Unique: cbRelist}, b.sending(func(ctx context.Context, id int64, c tele.Context) Reply {
+		return b.back.Relist(ctx, id)
+	}))
+
+	// Drill-down from a list view. The payload is "<ref>|<view>", where ref is
+	// an opaque handle the backend minted when it rendered the list.
+	tb.Handle(&tele.Btn{Unique: cbModel}, func(c tele.Context) error {
+		parts := strings.SplitN(c.Data(), "|", 2)
+		if len(parts) != 2 {
+			return c.Respond(&tele.CallbackResponse{Text: "malformed button", ShowAlert: true})
+		}
+		_ = c.Respond(&tele.CallbackResponse{Text: "loading…"})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return b.deliver(c, b.back.ModelByRef(ctx, parts[0], parts[1]))
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbRefresh}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "refreshing…"})
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		text := fn(ctx, c)
-		if text == "" {
+		var r Reply
+		switch strings.TrimSpace(c.Data()) {
+		case "pos":
+			r = b.back.Positions(ctx)
+		case "status":
+			r = b.back.Status(ctx)
+		case "pnl":
+			r = b.back.PnL(ctx)
+		default:
 			return nil
 		}
-		for _, chunk := range splitMessage(text) {
-			if err := c.Send(chunk, &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}); err != nil {
-				return err
-			}
-		}
-		return nil
+		return b.editWith(c, r)
+	})
+}
+
+// reply adapts a Reply-producing function into a telebot message handler.
+func (b *Bot) reply(fn func(context.Context, tele.Context) Reply) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return b.deliver(c, fn(ctx, c))
 	}
 }
 
-// callback adapts a signal-id handler, acknowledging the tap immediately so the
-// button stops spinning while a purchase is in flight.
-func (b *Bot) callback(fn func(context.Context, int64, tele.Context) string) tele.HandlerFunc {
+// sending answers a callback with a new message, for views that supplement the
+// card rather than replace it.
+func (b *Bot) sending(fn func(context.Context, int64, tele.Context) Reply) tele.HandlerFunc {
+	return b.callback(fn, false)
+}
+
+// editing answers a callback by replacing the card it came from.
+func (b *Bot) editing(fn func(context.Context, int64, tele.Context) Reply) tele.HandlerFunc {
+	return b.callback(fn, true)
+}
+
+func (b *Bot) callback(fn func(context.Context, int64, tele.Context) Reply, edit bool) tele.HandlerFunc {
 	return func(c tele.Context) error {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Data()), 10, 64)
 		if err != nil {
 			return c.Respond(&tele.CallbackResponse{Text: "malformed button", ShowAlert: true})
 		}
+		// Acknowledge immediately so the button stops spinning while a purchase
+		// is in flight.
 		_ = c.Respond(&tele.CallbackResponse{Text: "working…"})
 
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
-		text := fn(ctx, id, c)
-		if text == "" {
-			return nil
+		r := fn(ctx, id, c)
+		if edit {
+			return b.editWith(c, r)
 		}
-		for _, chunk := range splitMessage(text) {
-			if err := c.Send(chunk, &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}); err != nil {
-				return err
-			}
-		}
-		return nil
+		return b.deliver(c, r)
 	}
 }
 
-// splitTarget parses "Collection / Model" into its two halves. A slash is
+// editWith replaces the message a callback came from. Telegram rejects an edit
+// that changes nothing, and a result too long to fit is sent as a new message
+// rather than truncated.
+func (b *Bot) editWith(c tele.Context, r Reply) error {
+	if r.Empty() {
+		return nil
+	}
+	if len(r.Text) > telegramMessageLimit {
+		return b.deliver(c, r)
+	}
+	opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}
+	if m := markup(r.Rows); m != nil {
+		opts.ReplyMarkup = m
+	}
+	if err := c.Edit(r.Text, opts); err != nil {
+		if strings.Contains(err.Error(), "message is not modified") {
+			return nil
+		}
+		// The card may be too old to edit; do not lose the result over that.
+		log.Warn().Err(err).Msg("editing the card failed, sending a new message")
+		return b.deliver(c, r)
+	}
+	return nil
+}
+
+// deliver sends a Reply as one or more new messages.
+func (b *Bot) deliver(c tele.Context, r Reply) error {
+	if r.Empty() {
+		return nil
+	}
+	chunks := splitMessage(r.Text)
+	for i, chunk := range chunks {
+		opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}
+		if i == len(chunks)-1 {
+			if m := markup(r.Rows); m != nil {
+				opts.ReplyMarkup = m
+			}
+		}
+		if err := c.Send(chunk, opts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// splitTarget parses "Collection / Model" into its two halves. A separator is
 // required because both parts contain spaces and are otherwise ambiguous.
 func splitTarget(payload string) (collection, model string) {
 	payload = strings.TrimSpace(payload)
@@ -390,8 +554,29 @@ func splitMessage(text string) []string {
 // marketplace, so they are never trusted as markup.
 func Esc(s string) string { return html.EscapeString(s) }
 
-func trimNum(v float64) string {
-	return strconv.FormatFloat(v, 'f', -1, 64)
+func trimNum(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+
+// commandMenu is what Telegram shows when the operator types "/".
+var commandMenu = []tele.Command{
+	{Text: "status", Description: "pollers, data freshness, auto-buy state"},
+	{Text: "pos", Description: "open positions"},
+	{Text: "pnl", Description: "realised and unrealised profit"},
+	{Text: "balance", Description: "account balance"},
+	{Text: "floor", Description: "Collection [/ Model] — floors and cheapest asks"},
+	{Text: "book", Description: "Collection / Model — the ask ladder"},
+	{Text: "hist", Description: "Collection / Model — real trades and velocity"},
+	{Text: "val", Description: "gift_id — full valuation of one listing"},
+	{Text: "watch", Description: "Collection / Model [max price] — alert on any listing"},
+	{Text: "unwatch", Description: "Collection / Model"},
+	{Text: "watchlist", Description: "show subscriptions"},
+	{Text: "mute", Description: "Collection [/ Model] [hours] — silence alerts"},
+	{Text: "unmute", Description: "Collection [/ Model]"},
+	{Text: "relist", Description: "gift_id — reprice an owned gift"},
+	{Text: "arm", Description: "enable auto-buy"},
+	{Text: "disarm", Description: "stop auto-buy"},
+	{Text: "limits", Description: "show or change the money limits"},
+	{Text: "auth", Description: "replace an expired Tonnel session"},
+	{Text: "help", Description: "command reference"},
 }
 
 const helpText = `<b>Floorline</b> — Tonnel gift trading desk.
@@ -403,7 +588,7 @@ const helpText = `<b>Floorline</b> — Tonnel gift trading desk.
 /val <i>gift_id</i> — full valuation of one listing
 
 <b>Book</b>
-/pos — open positions
+/pos — open positions, each with a Relist button
 /pnl — realised and unrealised, net of fees
 /balance — account balance
 /relist <i>gift_id</i> — reprice an owned gift against the current book
@@ -423,4 +608,7 @@ const helpText = `<b>Floorline</b> — Tonnel gift trading desk.
 
 <b>Ops</b>
 /status — pollers, data freshness, warm-up
-/auth <i>authData</i> — replace an expired Tonnel session`
+/auth <i>authData</i> — replace an expired Tonnel session
+/help — this reference
+
+<i>Collection and model are separated by a slash: </i><code>/book Plush Pepe / Pink Diamond</code><i>. Partial names in any case work when they match one thing.</i>`

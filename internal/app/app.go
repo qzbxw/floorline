@@ -34,6 +34,10 @@ type App struct {
 	cross *market.Comparison
 	tg    *bot.Bot
 
+	// nav holds short handles for keyboard buttons, because collection and
+	// model names do not fit in Telegram's 64-byte callback payload.
+	nav *navRefs
+
 	startedAt time.Time
 
 	mu          sync.RWMutex
@@ -64,6 +68,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		cfg:           cfg,
 		st:            st,
 		startedAt:     time.Now(),
+		nav:           newNavRefs(),
 		pollers:       make(map[string]*pollerState),
 		collections:   make(map[string]struct{}),
 		alertCooldown: make(map[string]time.Time),
