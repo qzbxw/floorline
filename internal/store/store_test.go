@@ -96,8 +96,8 @@ func TestInsertSalesIsIdempotent(t *testing.T) {
 	ts := tonnel.FlexTime{Time: time.Now().Truncate(time.Second)}
 
 	sales := []tonnel.Sale{
-		{GiftID: 1, Name: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 1000, Timestamp: ts},
-		{GiftID: 2, Name: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 1100, Timestamp: ts},
+		{GiftID: 1, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 1000, Timestamp: ts},
+		{GiftID: 2, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 1100, Timestamp: ts},
 	}
 
 	n, err := st.InsertSales(ctx, sales)
@@ -122,10 +122,10 @@ func TestInsertSalesSkipsUnusableRows(t *testing.T) {
 	st := newTestStore(t)
 
 	n, err := st.InsertSales(ctx, []tonnel.Sale{
-		{GiftID: 1, Name: "Plush Pepe", Price: 100},                                               // no timestamp
-		{GiftID: 2, Price: 100, Timestamp: tonnel.FlexTime{Time: time.Now()}},                     // no collection
-		{GiftID: 3, Name: "Plush Pepe", Price: 0, Timestamp: tonnel.FlexTime{Time: time.Now()}},   // no price
-		{GiftID: 4, Name: "Plush Pepe", Price: 100, Timestamp: tonnel.FlexTime{Time: time.Now()}}, // good
+		{GiftID: 1, GiftName: "Plush Pepe", Price: 100},                                               // no timestamp
+		{GiftID: 2, Price: 100, Timestamp: tonnel.FlexTime{Time: time.Now()}},                         // no collection
+		{GiftID: 3, GiftName: "Plush Pepe", Price: 0, Timestamp: tonnel.FlexTime{Time: time.Now()}},   // no price
+		{GiftID: 4, GiftName: "Plush Pepe", Price: 100, Timestamp: tonnel.FlexTime{Time: time.Now()}}, // good
 	})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
@@ -141,11 +141,11 @@ func TestSalesSinceFiltersByModelAndTime(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	_, err := st.InsertSales(ctx, []tonnel.Sale{
-		{GiftID: 1, Name: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 100,
+		{GiftID: 1, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 100,
 			Timestamp: tonnel.FlexTime{Time: now.Add(-1 * time.Hour)}},
-		{GiftID: 2, Name: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 200,
+		{GiftID: 2, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 200,
 			Timestamp: tonnel.FlexTime{Time: now.Add(-40 * 24 * time.Hour)}},
-		{GiftID: 3, Name: "Plush Pepe", Model: "Blue Steel (2%)", Price: 300,
+		{GiftID: 3, GiftName: "Plush Pepe", Model: "Blue Steel (2%)", Price: 300,
 			Timestamp: tonnel.FlexTime{Time: now.Add(-1 * time.Hour)}},
 	})
 	if err != nil {

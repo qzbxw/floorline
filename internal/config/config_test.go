@@ -67,7 +67,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Sig.MinEdge != 0.05 || c.Sig.MinVelocity != 1.0 || c.Sig.MinSales != 10 {
 		t.Errorf("signal gates = %+v, want the medium profile", c.Sig)
 	}
-	if c.Auto.MinEdge != 0.10 || c.Auto.MinSellers != 4 {
+	if c.Auto.MinEdge != 0.10 || c.Auto.MinTurnover != 0.6 {
 		t.Errorf("auto gates = %+v, want the strict profile", c.Auto)
 	}
 	if c.FeedInterval != 2*time.Second {
@@ -140,7 +140,7 @@ func clearConfigEnv(t *testing.T) {
 		"DB_PATH", "LOG_LEVEL", "TONNEL_FEE", "PORTALS_FEE", "MRKT_FEE", "UNDERCUT",
 		"SIG_MIN_EDGE", "SIG_MIN_VELOCITY", "SIG_MIN_SALES", "SIG_MAX_MAD_RATIO",
 		"SIG_MIN_TREND", "SIG_MIN_PRICE", "SIG_MAX_PRICE",
-		"AUTOBUY_MIN_EDGE", "AUTOBUY_MIN_VELOCITY", "AUTOBUY_MIN_SALES", "AUTOBUY_MIN_SELLERS",
+		"AUTOBUY_MIN_EDGE", "AUTOBUY_MIN_VELOCITY", "AUTOBUY_MIN_SALES", "AUTOBUY_MIN_TURNOVER",
 		"AUTOBUY_MAX_MAD_RATIO", "AUTOBUY_MIN_TREND", "AUTOBUY_MAX_DATA_AGE",
 		"LOOKBACK_DAYS", "POLL_FEED", "POLL_STATS", "POLL_SALES", "POLL_INVENTORY",
 		"BOOK_CACHE_TTL", "READ_RPS", "READ_BURST", "HTTP_TIMEOUT",

@@ -53,7 +53,7 @@ func testConfig() *config.Config {
 			MaxMADRatio: 0.35, MinTrend: 0.90, MinPrice: 1,
 		},
 		Auto: config.AutoGates{
-			MinEdge: 0.10, MinVelocity: 2.0, MinSales: 20, MinSellers: 4,
+			MinEdge: 0.10, MinVelocity: 2.0, MinSales: 20, MinTurnover: 0.6,
 			MaxMADRatio: 0.25, MinTrend: 0.95, MaxDataAge: 5 * time.Minute,
 		},
 	}
@@ -84,19 +84,18 @@ func newHarness(t *testing.T, askPrices ...float64) *harness {
 }
 
 // seedSales writes `count` trades at `price` spread over the lookback window,
-// each from a distinct seller unless sellers is smaller.
-func (h *harness) seedSales(t *testing.T, price float64, count, sellers int) {
+// cycling through `distinct` different gifts so turnover can be controlled.
+func (h *harness) seedSales(t *testing.T, price float64, count, distinct int) {
 	t.Helper()
 	now := time.Now()
 	sales := make([]tonnel.Sale, 0, count)
 	for i := 0; i < count; i++ {
 		sales = append(sales, tonnel.Sale{
 			GiftID:    tonnel.FlexInt(9000 + i),
-			Name:      key.Name,
+			GiftName:  key.Name,
 			Model:     key.Model + " (0.4%)",
 			Price:     tonnel.Flex64(price),
-			Seller:    tonnel.FlexInt(int64(i%maxInt(sellers, 1)) + 1),
-			Buyer:     tonnel.FlexInt(int64(i) + 5000),
+			GiftNum:   tonnel.FlexInt(int64(i%maxInt(distinct, 1)) + 1),
 			Timestamp: tonnel.FlexTime{Time: now.Add(-time.Duration(i) * 6 * time.Hour)},
 		})
 	}
@@ -146,7 +145,7 @@ func defaultLimits() risk.Limits {
 // A clean opportunity: deeply liquid model, plenty of room above the entry.
 func TestSignalAndAutoPassForALiquidMispricing(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
-	h.seedSales(t, 1200, 40, 10)
+	h.seedSales(t, 1200, 40, 40)
 	h.seedStat(t, 800, 12)
 
 	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
@@ -207,7 +206,7 @@ func TestIlliquidModelIsNotAutoBought(t *testing.T) {
 // Few distinct sellers is the shape of a self-dealt tape.
 func TestWashTradeGuardBlocksAutoBuy(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
-	h.seedSales(t, 1200, 40, 2) // 40 trades, only two sellers
+	h.seedSales(t, 1200, 40, 2) // 40 trades, but only two different gifts
 	h.seedStat(t, 800, 12)
 
 	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
@@ -218,16 +217,16 @@ func TestWashTradeGuardBlocksAutoBuy(t *testing.T) {
 		t.Fatalf("expected a signal, got %+v", dec)
 	}
 	if dec.Auto {
-		t.Error("two sellers behind forty trades must block unattended buying")
+		t.Error("two gifts behind forty trades must block unattended buying")
 	}
-	if !containsSubstring(dec.AutoFails, "sellers") {
+	if !containsSubstring(dec.AutoFails, "self-dealt") {
 		t.Errorf("auto failures = %v, want the wash-trade guard", dec.AutoFails)
 	}
 }
 
 func TestWarmUpBlocksAutoBuy(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
-	h.seedSales(t, 1200, 40, 10)
+	h.seedSales(t, 1200, 40, 40)
 	h.seedStat(t, 800, 12)
 	h.det.Warm = func() bool { return false }
 
@@ -245,7 +244,7 @@ func TestWarmUpBlocksAutoBuy(t *testing.T) {
 
 func TestSlowExitBlocksAutoBuy(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1210, 1220, 1230)
-	h.seedSales(t, 1200, 30, 10) // ~2.1 trades/day
+	h.seedSales(t, 1200, 30, 30) // ~2.1 trades/day, all different gifts
 	h.seedStat(t, 800, 12)
 
 	limits := defaultLimits()
@@ -327,7 +326,7 @@ func TestUntradableRowsAreSkippedEntirely(t *testing.T) {
 func TestDedupeAllowsAPriceDrop(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, 800, 1200, 1250)
-	h.seedSales(t, 1200, 40, 10)
+	h.seedSales(t, 1200, 40, 40)
 	h.seedStat(t, 800, 12)
 
 	dec, err := h.det.Evaluate(ctx, gift(candidateID, 800), defaultLimits(), time.Now())
@@ -360,7 +359,7 @@ func TestDedupeAllowsAPriceDrop(t *testing.T) {
 func TestMuteSuppressesTheAlertNotTheEvaluation(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, 800, 1200, 1250)
-	h.seedSales(t, 1200, 40, 10)
+	h.seedSales(t, 1200, 40, 40)
 	h.seedStat(t, 800, 12)
 
 	if err := h.st.SetMute(ctx, key.ID(), time.Now().Add(time.Hour)); err != nil {

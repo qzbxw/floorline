@@ -18,10 +18,16 @@ type Liquidity struct {
 	Window   time.Duration // the window the caller asked for
 	Coverage time.Duration // how much history we actually hold
 
-	Sales   int // trades in the window
-	Sales7  int // trades in the most recent 7 days
-	Sellers int // distinct sellers — few sellers means the tape may be self-dealt
-	Buyers  int // distinct buyers
+	Sales  int // trades in the window
+	Sales7 int // trades in the most recent 7 days
+	// DistinctGifts is how many different physical gifts those trades involved.
+	// The endpoint carries no counterparty identities, so this is the available
+	// wash-trading signal: forty "trades" of the same gift_num is one item being
+	// passed around, not a market.
+	DistinctGifts int
+	// Turnover is DistinctGifts / Sales. Near 1 means genuinely different items
+	// changing hands; near 0 means the same one going in circles.
+	Turnover float64
 
 	Velocity float64 // trades per day, normalised to the history we really have
 	Median   float64 // median price over the window
@@ -50,19 +56,15 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 
 	prices := make([]float64, 0, len(sales))
 	prices7 := make([]float64, 0, len(sales))
-	sellers := make(map[int64]struct{}, len(sales))
-	buyers := make(map[int64]struct{}, len(sales))
+	gifts := make(map[int64]struct{}, len(sales))
 
 	for _, s := range sales {
 		if s.Price <= 0 || s.TS.Before(cut) {
 			continue
 		}
 		prices = append(prices, s.Price)
-		if s.Seller != 0 {
-			sellers[s.Seller] = struct{}{}
-		}
-		if s.Buyer != 0 {
-			buyers[s.Buyer] = struct{}{}
+		if s.GiftNum != 0 {
+			gifts[s.GiftNum] = struct{}{}
 		}
 		if s.TS.After(l.LastSale) {
 			l.LastSale = s.TS
@@ -74,11 +76,11 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 
 	l.Sales = len(prices)
 	l.Sales7 = len(prices7)
-	l.Sellers = len(sellers)
-	l.Buyers = len(buyers)
+	l.DistinctGifts = len(gifts)
 	if l.Sales == 0 {
 		return l
 	}
+	l.Turnover = float64(l.DistinctGifts) / float64(l.Sales)
 
 	l.Median = median(prices)
 	l.MAD = medianAbsDev(prices, l.Median)

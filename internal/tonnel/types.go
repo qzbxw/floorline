@@ -132,7 +132,10 @@ type Gift struct {
 
 	Seller FlexInt `json:"seller"`
 	Buyer  *int64  `json:"buyer"`
-	Status string  `json:"status"`
+	// Status is "forsale" on a live listing. The order book omits the boolean
+	// flags entirely — they exist only as filter predicates — so this is the
+	// only per-row evidence that a lot is still available.
+	Status string `json:"status"`
 
 	Refunded            FlexBool `json:"refunded"`
 	Premarket           FlexBool `json:"premarket"`
@@ -157,22 +160,36 @@ func (g *Gift) Key() ModelKey {
 }
 
 // Sale is one row of the real trade history.
+//
+// Note the collection field: saleHistory calls it `gift_name`, while pageGifts
+// calls the same thing `name`. Both spellings are accepted here because getting
+// this wrong silently drops every trade — and with it every liquidity number.
+//
+// The payload carries no counterparty identities, only a `bidder` that is 0 on
+// ordinary sales, so seller-based analysis is not possible from this endpoint.
 type Sale struct {
-	GiftID   FlexInt `json:"gift_id"`
-	GiftNum  FlexInt `json:"gift_num"`
-	Name     string  `json:"name"`
-	Model    string  `json:"model"`
-	Backdrop string  `json:"backdrop"`
-	Symbol   string  `json:"symbol"`
-	Price    Flex64  `json:"price"`
-	Asset    string  `json:"asset"`
-	Seller   FlexInt `json:"seller"`
-	Buyer    FlexInt `json:"buyer"`
-	Type     string  `json:"type"`
+	GiftID    FlexInt `json:"gift_id"`
+	GiftNum   FlexInt `json:"gift_num"`
+	GiftName  string  `json:"gift_name"`
+	NameAlias string  `json:"name"`
+	Model     string  `json:"model"`
+	Backdrop  string  `json:"backdrop"`
+	Symbol    string  `json:"symbol"`
+	Price     Flex64  `json:"price"`
+	Asset     string  `json:"asset"`
+	Type      string  `json:"type"`
 
 	Timestamp FlexTime `json:"timestamp"`
 	SoldAt    FlexTime `json:"sold_at"`
 	UpdatedAt FlexTime `json:"updatedAt"`
+}
+
+// Name returns the collection, whichever spelling the endpoint used.
+func (s *Sale) Name() string {
+	if s.GiftName != "" {
+		return s.GiftName
+	}
+	return s.NameAlias
 }
 
 // When returns the best available timestamp for the trade.
@@ -187,7 +204,7 @@ func (s *Sale) When() time.Time {
 
 // Key returns the canonical (collection, model) identifier.
 func (s *Sale) Key() ModelKey {
-	return ModelKey{Name: s.Name, Model: BaseAttr(s.Model)}
+	return ModelKey{Name: s.Name(), Model: BaseAttr(s.Model)}
 }
 
 // ModelKey identifies the actual tradable unit. Collection floor is noise —

@@ -48,6 +48,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -101,4 +105,46 @@ func (s *Store) SetKV(ctx context.Context, k, v string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v)
 	return err
+}
+
+// migrate brings an older database up to the current shape.
+//
+// The sales table is a pure cache of a remote endpoint, so when its columns
+// change the honest fix is to drop it and let backfill refetch, rather than
+// carry rows that were decoded under the wrong assumptions.
+func migrate(db *sql.DB) error {
+	cols, err := columns(db, "sales")
+	if err != nil {
+		return err
+	}
+	if _, stale := cols["seller"]; stale {
+		if _, err := db.Exec(`DROP TABLE sales`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(schemaSQL); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`DELETE FROM kv WHERE k = 'backfill.done'`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func columns(db *sql.DB, table string) (map[string]struct{}, error) {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]struct{}{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[n] = struct{}{}
+	}
+	return out, rows.Err()
 }

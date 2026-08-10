@@ -81,12 +81,21 @@ func regexEscape(s string) string {
 	return b.String()
 }
 
+// JSON renders the filter as the string the endpoint expects.
+func (f Filter) JSON() string { return f.json() }
+
 func (f Filter) json() string {
 	b, err := json.Marshal(f)
 	if err != nil {
 		return "{}"
 	}
 	return string(b)
+}
+
+// Raw performs a bare POST and decodes into out. It exists for the dump
+// command, which needs to see fields our typed structs do not know about.
+func (c *Client) Raw(ctx context.Context, host, path string, body, out any) error {
+	return c.call(ctx, callOpts{host: host, path: path, body: body, out: out, retries: 1})
 }
 
 // PageQuery describes one order-book page request.
@@ -196,6 +205,12 @@ type SaleHistoryQuery struct {
 	Type  string // ALL | SALE | INTERNAL_SALE | BID
 	Name  string
 	Model string
+	// Since restricts the result to trades at or after this time. This is the
+	// only reliable way to get *recent* history: the endpoint's ordering cannot
+	// be depended on, but the filter is passed straight to its database, so a
+	// range predicate is exact. An empty result then genuinely means "nothing
+	// traded in this window" rather than "the sort put it on another page".
+	Since time.Time
 }
 
 // SaleHistory returns real executed trades. Unlike the order book, this is
@@ -221,6 +236,9 @@ func (c *Client) SaleHistory(ctx context.Context, q SaleHistoryQuery) ([]Sale, e
 	if q.Model != "" {
 		filter.WithAttr("model", q.Model)
 	}
+	if !q.Since.IsZero() {
+		filter["timestamp"] = Filter{"$gte": q.Since.UTC().Format("2006-01-02T15:04:05.000Z")}
+	}
 
 	var sortObj map[string]any
 	_ = json.Unmarshal([]byte(sortSalesLatest), &sortObj)
@@ -237,6 +255,46 @@ func (c *Client) SaleHistory(ctx context.Context, q SaleHistoryQuery) ([]Sale, e
 	var out []Sale
 	err := c.call(ctx, callOpts{host: HostRead, path: "/api/saleHistory", body: body, out: &out, retries: 2})
 	return out, err
+}
+
+// SettledTypes are the trade types that represent a completed purchase at a
+// real price.
+//
+// BID is deliberately absent: those rows are auction bids, and a single auction
+// produces a whole escalating ladder of them for one gift. Counting them would
+// inflate velocity several-fold on exactly the collections that run auctions.
+// INTERNAL_SALE, on the other hand, is a genuine purchase that simply settles
+// inside Tonnel — on many collections it is nearly all of the volume, and
+// ignoring it makes a busy market look dead.
+var SettledTypes = []string{"SALE", "INTERNAL_SALE"}
+
+// TradeHistory fetches every settled trade for a collection in a time window,
+// paging through each type until the window is exhausted.
+//
+// maxPages bounds the work per type; a collection busier than that is already
+// far past any liquidity threshold, so the exact count stops mattering.
+func (c *Client) TradeHistory(ctx context.Context, name string, since time.Time, maxPages int) ([]Sale, error) {
+	if maxPages <= 0 {
+		maxPages = 20
+	}
+	const pageSize = 50
+
+	var out []Sale
+	for _, kind := range SettledTypes {
+		for page := 1; page <= maxPages; page++ {
+			batch, err := c.SaleHistory(ctx, SaleHistoryQuery{
+				Page: page, Limit: pageSize, Type: kind, Name: name, Since: since,
+			})
+			if err != nil {
+				return out, err
+			}
+			out = append(out, batch...)
+			if len(batch) < pageSize {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // GiftData fetches a single listing by its Tonnel gift id.

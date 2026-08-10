@@ -208,30 +208,35 @@ func (a *App) detectFloorDrops(ctx context.Context, now time.Time) {
 	}
 }
 
-// pollSales pulls new trades. It keeps walking pages while the page it just
-// read was entirely new, which is how it survives a burst without falling
-// behind or re-reading the whole history every cycle.
+// pollSales pulls new trades, one slice of the market per tick.
+//
+// Trade history can only be read per collection and only reliably by asking for
+// an explicit time window — the endpoint's ordering cannot be trusted, verified
+// against the live API. So the whole market is covered by rotation, each
+// collection refreshed over the full lookback window.
+//
+// Staleness is not a concern here: a fourteen-day velocity does not move in the
+// minutes it takes one cycle to come back around.
 func (a *App) pollSales(ctx context.Context) error {
-	const pageSize = 50
-	const maxPages = 8
+	batch := a.nextCollections(a.cfg.SalesBatch)
+	if len(batch) == 0 {
+		return nil // the market snapshot has not landed yet
+	}
 
 	total := 0
-	for page := 1; page <= maxPages; page++ {
-		sales, err := a.api.SaleHistory(ctx, tonnel.SaleHistoryQuery{Page: page, Limit: pageSize, Type: "SALE"})
+	for _, name := range batch {
+		// A short window keeps this to one page per type: the rotation comes
+		// back around every few minutes, and the deep history already exists
+		// from the backfill.
+		sales, err := a.api.TradeHistory(ctx, name, time.Now().Add(-a.cfg.SalesWindow), 3)
 		if err != nil {
-			return fmt.Errorf("read sale history page %d: %w", page, err)
-		}
-		if len(sales) == 0 {
-			break
+			return fmt.Errorf("read trades for %s: %w", name, err)
 		}
 		n, err := a.st.InsertSales(ctx, sales)
 		if err != nil {
-			return fmt.Errorf("store sales: %w", err)
+			return fmt.Errorf("store trades for %s: %w", name, err)
 		}
 		total += n
-		if n < len(sales) {
-			break // we have caught up with what we already hold
-		}
 	}
 
 	if total > 0 {
@@ -241,6 +246,39 @@ func (a *App) pollSales(ctx context.Context) error {
 	}
 	a.detectSweeps(ctx, time.Now())
 	return nil
+}
+
+// nextCollections returns the next slice of the rotation, refreshing the list
+// from the market snapshot when it is empty or exhausted.
+func (a *App) nextCollections(n int) []string {
+	if n <= 0 {
+		n = 4
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.rotation.idx >= len(a.rotation.names) {
+		names := make([]string, 0, len(a.collections))
+		for name := range a.collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		a.rotation.names = names
+		a.rotation.idx = 0
+		a.rotation.cycles++
+	}
+	if len(a.rotation.names) == 0 {
+		return nil
+	}
+
+	end := a.rotation.idx + n
+	if end > len(a.rotation.names) {
+		end = len(a.rotation.names)
+	}
+	out := append([]string(nil), a.rotation.names[a.rotation.idx:end]...)
+	a.rotation.idx = end
+	return out
 }
 
 // detectSweeps flags a model that suddenly trades far above its usual rate with
@@ -255,8 +293,8 @@ func (a *App) detectSweeps(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, r := range rows {
-		if r.Buyers < 2 {
-			continue // one buyer repeatedly hitting the book is not a market move
+		if r.Gifts < 2 {
+			continue // the same gift changing hands is not a market move
 		}
 		if !a.throttle("sweep:"+r.Key.ID(), 2*time.Hour) {
 			continue
@@ -267,8 +305,8 @@ func (a *App) detectSweeps(ctx context.Context, now time.Time) {
 			floorTxt = num(stat.Floor)
 		}
 		a.notify(fmt.Sprintf(
-			"🌊 <b>Sweep</b> — %s\n%d trades in 30 min from %d buyers\nRange %s – %s · floor now %s",
-			bot.Esc(r.Key.String()), r.Count, r.Buyers, num(r.MinPrice), num(r.MaxPrice), floorTxt))
+			"🌊 <b>Sweep</b> — %s\n%d trades in 30 min across %d different gifts\nRange %s – %s · floor now %s",
+			bot.Esc(r.Key.String()), r.Count, r.Gifts, num(r.MinPrice), num(r.MaxPrice), floorTxt))
 	}
 }
 

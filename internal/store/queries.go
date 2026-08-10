@@ -177,8 +177,8 @@ func (s *Store) InsertSales(ctx context.Context, sales []tonnel.Sale) (int, erro
 	var inserted int
 	err := s.tx(ctx, func(t *sql.Tx) error {
 		stmt, err := t.PrepareContext(ctx, `
-INSERT OR IGNORE INTO sales (gift_id, ts, name, model, backdrop, symbol, price, asset, type, seller, buyer)
-VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+INSERT OR IGNORE INTO sales (gift_id, ts, gift_num, name, model, backdrop, symbol, price, asset, type)
+VALUES (?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -187,14 +187,13 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 		for i := range sales {
 			sale := &sales[i]
 			when := sale.When()
-			if when.IsZero() || sale.Name == "" || sale.Price.Float() <= 0 {
+			if when.IsZero() || sale.Name() == "" || sale.Price.Float() <= 0 {
 				continue
 			}
 			res, err := stmt.ExecContext(ctx,
-				sale.GiftID.Int(), when.Unix(), sale.Name,
+				sale.GiftID.Int(), when.Unix(), sale.GiftNum.Int(), sale.Name(),
 				tonnel.BaseAttr(sale.Model), tonnel.BaseAttr(sale.Backdrop), tonnel.BaseAttr(sale.Symbol),
 				sale.Price.Float(), sale.Asset, sale.Type,
-				sale.Seller.Int(), sale.Buyer.Int(),
 			)
 			if err != nil {
 				return fmt.Errorf("insert sale %d: %w", sale.GiftID.Int(), err)
@@ -210,17 +209,16 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 
 // SaleRow is one stored trade.
 type SaleRow struct {
-	GiftID int64
-	TS     time.Time
-	Price  float64
-	Seller int64
-	Buyer  int64
+	GiftID  int64
+	GiftNum int64
+	TS      time.Time
+	Price   float64
 }
 
 // SalesSince returns a model's trades newer than `since`, oldest first.
 func (s *Store) SalesSince(ctx context.Context, key tonnel.ModelKey, since time.Time) ([]SaleRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT gift_id, ts, price, COALESCE(seller,0), COALESCE(buyer,0)
+SELECT gift_id, COALESCE(gift_num,0), ts, price
 FROM sales
 WHERE name = ? AND model = ? AND ts >= ? AND price > 0
 ORDER BY ts ASC`, key.Name, key.Model, unix(since))
@@ -233,7 +231,7 @@ ORDER BY ts ASC`, key.Name, key.Model, unix(since))
 	for rows.Next() {
 		var r SaleRow
 		var ts int64
-		if err := rows.Scan(&r.GiftID, &ts, &r.Price, &r.Seller, &r.Buyer); err != nil {
+		if err := rows.Scan(&r.GiftID, &r.GiftNum, &ts, &r.Price); err != nil {
 			return nil, err
 		}
 		r.TS = fromUnix(ts)
@@ -303,7 +301,7 @@ func (s *Store) CountSales(ctx context.Context) (int, error) {
 // window — the fingerprint of someone sweeping a collection.
 func (s *Store) SweepCandidates(ctx context.Context, since time.Time, minSales int) ([]SweepRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT name, model, COUNT(*) AS n, MIN(price), MAX(price), COUNT(DISTINCT buyer)
+SELECT name, model, COUNT(*) AS n, MIN(price), MAX(price), COUNT(DISTINCT gift_num)
 FROM sales
 WHERE ts >= ?
 GROUP BY name, model
@@ -318,7 +316,7 @@ LIMIT 20`, unix(since), minSales)
 	var out []SweepRow
 	for rows.Next() {
 		var r SweepRow
-		if err := rows.Scan(&r.Key.Name, &r.Key.Model, &r.Count, &r.MinPrice, &r.MaxPrice, &r.Buyers); err != nil {
+		if err := rows.Scan(&r.Key.Name, &r.Key.Model, &r.Count, &r.MinPrice, &r.MaxPrice, &r.Gifts); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -332,7 +330,9 @@ type SweepRow struct {
 	Count    int
 	MinPrice float64
 	MaxPrice float64
-	Buyers   int
+	// Gifts is the number of distinct physical gifts involved. One gift traded
+	// five times is not a sweep.
+	Gifts int
 }
 
 // ---- model stats --------------------------------------------------------

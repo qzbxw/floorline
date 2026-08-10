@@ -76,17 +76,31 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 			return fmt.Sprintf("%d models across %d collections", len(stats), len(names)), nil
 		}},
 
+		// Deliberately filtered by collection. Unfiltered, this endpoint ignores
+		// its sort argument and returns an arbitrary slice of year-old rows —
+		// checking it that way would report success while proving nothing about
+		// the data the pricing engine actually runs on.
 		{"trade history (saleHistory)", func(ctx context.Context) (string, error) {
-			sales, err := a.api.SaleHistory(ctx, tonnel.SaleHistoryQuery{Limit: 10, Type: "SALE"})
+			sales, err := a.api.SaleHistory(ctx, tonnel.SaleHistoryQuery{
+				Limit: 10, Type: "SALE", Name: probeCollection,
+			})
 			if err != nil {
 				return "", err
 			}
 			if len(sales) == 0 {
-				return "", fmt.Errorf("no trades returned")
+				return "", fmt.Errorf("no trades returned for %s", probeCollection)
 			}
-			s := sales[0]
-			return fmt.Sprintf("%d trades; newest %s at %s (%s)",
-				len(sales), s.Name, num(s.Price.Float()), s.When().Format(time.RFC3339)), nil
+			newest := sales[0].When()
+			for i := range sales {
+				if t := sales[i].When(); t.After(newest) {
+					newest = t
+				}
+			}
+			if sales[0].Name() == "" {
+				return "", fmt.Errorf("trades decoded without a collection name — the payload shape changed")
+			}
+			return fmt.Sprintf("%d %s trades; newest %s ago at %s",
+				len(sales), sales[0].Name(), dur(time.Since(newest)), num(sales[0].Price.Float())), nil
 		}},
 
 		{"balance", func(ctx context.Context) (string, error) {

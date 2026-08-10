@@ -257,8 +257,10 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	if v.Liq.Sales < a.MinSales {
 		fails = append(fails, fmt.Sprintf("%d trades in %dd, auto needs %d", v.Liq.Sales, d.cfg.LookbackDays, a.MinSales))
 	}
-	if v.Liq.Sellers < a.MinSellers {
-		fails = append(fails, fmt.Sprintf("only %d distinct sellers, auto needs %d (wash-trade guard)", v.Liq.Sellers, a.MinSellers))
+	if v.Liq.Turnover < a.MinTurnover {
+		fails = append(fails, fmt.Sprintf(
+			"only %d distinct gifts across %d trades (turnover %.2f, auto needs %.2f) — looks self-dealt",
+			v.Liq.DistinctGifts, v.Liq.Sales, v.Liq.Turnover, a.MinTurnover))
 	}
 	if v.Liq.MADRatio > a.MaxMADRatio {
 		fails = append(fails, fmt.Sprintf("price dispersion %.0f%% above auto max %.0f%%", v.Liq.MADRatio*100, a.MaxMADRatio*100))

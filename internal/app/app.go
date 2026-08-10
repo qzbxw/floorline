@@ -45,9 +45,18 @@ type App struct {
 	coverage    time.Duration
 	backfillDon bool
 	collections map[string]struct{}
+	rotation    collectionRotation
 	// alertCooldown throttles the non-trade alerts (undercut, stale, sweep)
 	// which have no natural dedupe key in the database.
 	alertCooldown map[string]time.Time
+}
+
+// collectionRotation walks the collection list a few at a time, because trade
+// history can only be read per collection.
+type collectionRotation struct {
+	names  []string
+	idx    int
+	cycles int
 }
 
 type pollerState struct {

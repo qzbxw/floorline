@@ -25,7 +25,7 @@ func bookOf(candidateID int64, prices ...float64) *Book {
 
 func liqOf(median float64, sales int) Liquidity {
 	return Liquidity{
-		Sales: sales, Sellers: sales, Buyers: sales,
+		Sales: sales, DistinctGifts: sales, Turnover: 1,
 		Median: median, Median7: median, Trend: 1,
 		Velocity: float64(sales) / 14,
 		LastSale: time.Now(),

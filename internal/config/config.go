@@ -31,7 +31,10 @@ type AutoGates struct {
 	MinEdge     float64
 	MinVelocity float64
 	MinSales    int
-	MinSellers  int // distinct sellers — a wash-trading guard
+	// MinTurnover is distinct gifts divided by trades. The endpoint exposes no
+	// counterparties, so this is the wash-trading guard: a tape made of one
+	// gift changing hands repeatedly must not qualify for unattended buying.
+	MinTurnover float64
 	MaxMADRatio float64
 	MinTrend    float64
 	MaxDataAge  time.Duration // refuse to act on stale market data
@@ -71,6 +74,15 @@ type Config struct {
 	SalesInterval     time.Duration
 	InventoryInterval time.Duration
 	BookCacheTTL      time.Duration
+
+	// SalesBatch is how many collections the trade poller refreshes per tick.
+	// Trade history is only readable per collection, so the whole market is
+	// covered by rotation rather than by one global query.
+	SalesBatch int
+	// SalesWindow is how far back the incremental trade poller looks. It only
+	// has to comfortably exceed the time for one full rotation of the
+	// collection list; the deep history comes from the backfill.
+	SalesWindow time.Duration
 
 	ReadRPS   float64
 	ReadBurst int
@@ -146,7 +158,7 @@ func Load() (*Config, error) {
 			MinEdge:     envFloat("AUTOBUY_MIN_EDGE", 0.10),
 			MinVelocity: envFloat("AUTOBUY_MIN_VELOCITY", 2.0),
 			MinSales:    envInt("AUTOBUY_MIN_SALES", 20),
-			MinSellers:  envInt("AUTOBUY_MIN_SELLERS", 4),
+			MinTurnover: envFloat("AUTOBUY_MIN_TURNOVER", 0.6),
 			MaxMADRatio: envFloat("AUTOBUY_MAX_MAD_RATIO", 0.25),
 			MinTrend:    envFloat("AUTOBUY_MIN_TREND", 0.95),
 			MaxDataAge:  envDur("AUTOBUY_MAX_DATA_AGE", 5*time.Minute),
@@ -159,6 +171,9 @@ func Load() (*Config, error) {
 		SalesInterval:     envDur("POLL_SALES", 25*time.Second),
 		InventoryInterval: envDur("POLL_INVENTORY", 60*time.Second),
 		BookCacheTTL:      envDur("BOOK_CACHE_TTL", 15*time.Second),
+
+		SalesBatch:  envInt("SALES_BATCH", 4),
+		SalesWindow: envDur("SALES_WINDOW", 45*time.Minute),
 
 		ReadRPS:   envFloat("READ_RPS", 2),
 		ReadBurst: envInt("READ_BURST", 5),

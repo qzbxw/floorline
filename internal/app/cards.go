@@ -39,8 +39,8 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 	fmt.Fprintf(&b, "Exit <b>%s</b>  <i>(%s)</i>\n", num(v.Exit), bot.Esc(exitExplain(v)))
 	fmt.Fprintf(&b, "Net <b>%s</b> (%+.1f%%) after %.1f%% fee\n", num(v.Net), v.Edge*100, a.cfg.TonnelFee*100)
 
-	fmt.Fprintf(&b, "Liquidity %.1f trades/day · %d in %dd · %d sellers\n",
-		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.Sellers)
+	fmt.Fprintf(&b, "Liquidity %.1f trades/day · %d trades in %dd · %d different gifts\n",
+		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.DistinctGifts)
 	fmt.Fprintf(&b, "Median %s · dispersion %.0f%% · trend %+.0f%%\n",
 		num(v.Liq.Median), v.Liq.MADRatio*100, (v.Liq.Trend-1)*100)
 
@@ -105,8 +105,8 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 	fmt.Fprintf(&b, "→ net <b>%s</b> (%+.1f%%)\n", num(v.Net), v.Edge*100)
 
 	b.WriteString("\n<b>Liquidity</b>\n")
-	fmt.Fprintf(&b, "%.2f trades/day · %d trades in %dd · %d sellers / %d buyers\n",
-		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.Sellers, v.Liq.Buyers)
+	fmt.Fprintf(&b, "%.2f trades/day · %d trades in %dd · %d different gifts (turnover %.2f)\n",
+		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.DistinctGifts, v.Liq.Turnover)
 	fmt.Fprintf(&b, "Dispersion %.0f%% · trend %+.0f%% · last trade %s\n",
 		v.Liq.MADRatio*100, (v.Liq.Trend-1)*100, ago(v.Liq.LastSale))
 	fmt.Fprintf(&b, "Supply %d (%s of inventory) · %d sellers within 5%% of exit\n",

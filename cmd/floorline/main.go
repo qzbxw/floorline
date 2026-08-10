@@ -58,7 +58,7 @@ func main() {
 
 func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	switch cmd {
-	case "run", "smoke", "backfill":
+	case "run", "smoke", "backfill", "dump":
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -85,6 +85,13 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 		fmt.Println("All endpoints reachable.")
 		return nil
 
+	case "dump":
+		target := "sales"
+		if flag.NArg() > 1 {
+			target = flag.Arg(1)
+		}
+		return a.Dump(ctx, os.Stdout, target)
+
 	case "backfill":
 		if days <= 0 {
 			days = cfg.LookbackDays
@@ -92,13 +99,14 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 		fmt.Printf("Downloading %d days of trade history…\n", days)
 		start := time.Now()
 		err := a.Backfill(ctx, days, func(p app.BackfillProgress) {
-			if p.Done {
-				fmt.Printf("done: %d new trades, oldest %s, took %s\n",
-					p.Inserted, p.Oldest.Format(time.RFC3339), time.Since(start).Round(time.Second))
+			if p.Finished {
+				fmt.Printf("\ndone: %d trades stored, oldest %s, %d requests in %s\n",
+					p.Inserted, p.Oldest.Format("2006-01-02"), p.Requests,
+					time.Since(start).Round(time.Second))
 				return
 			}
-			fmt.Printf("  page %d · %d new · back to %s\n",
-				p.Pages, p.Inserted, p.Oldest.Format("2006-01-02 15:04"))
+			fmt.Printf("\r  %3d/%d collections · %6d trades · %-28s",
+				p.Done, p.Total, p.Inserted, truncateName(p.Collection))
 		})
 		return err
 
@@ -108,6 +116,14 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 		}
 		return a.Run(ctx)
 	}
+}
+
+// truncateName keeps the progress line from wrapping in a narrow terminal.
+func truncateName(s string) string {
+	if len(s) <= 28 {
+		return s
+	}
+	return s[:27] + "…"
 }
 
 func usage() {
@@ -120,6 +136,7 @@ Commands:
   run        start the pollers and the Telegram bot (default)
   smoke      probe every read endpoint and exit
   backfill   download trade history and exit
+  dump <x>   print one endpoint's raw JSON (feed, sales, sales-all, balance, mygifts)
 
 Flags:
   -env path   env file to load (default ".env")

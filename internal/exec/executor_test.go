@@ -150,8 +150,8 @@ func (h *harness) seedSales(t *testing.T, price float64, count int) {
 	sales := make([]tonnel.Sale, 0, count)
 	for i := 0; i < count; i++ {
 		sales = append(sales, tonnel.Sale{
-			GiftID: tonnel.FlexInt(9000 + i), Name: key.Name, Model: key.Model + " (0.4%)",
-			Price: tonnel.Flex64(price), Seller: tonnel.FlexInt(int64(i) + 1),
+			GiftID: tonnel.FlexInt(9000 + i), GiftName: key.Name, Model: key.Model + " (0.4%)",
+			Price: tonnel.Flex64(price), GiftNum: tonnel.FlexInt(int64(i) + 1),
 			Timestamp: tonnel.FlexTime{Time: now.Add(-time.Duration(i) * 6 * time.Hour)},
 		})
 	}

@@ -8,28 +8,24 @@ import (
 	"floorline/internal/store"
 )
 
-func salesAt(now time.Time, entries ...struct {
-	agoDays float64
-	price   float64
-	seller  int64
-}) []store.SaleRow {
+func salesAt(now time.Time, entries ...entry) []store.SaleRow {
 	out := make([]store.SaleRow, 0, len(entries))
 	for i, e := range entries {
 		out = append(out, store.SaleRow{
-			GiftID: int64(i + 1),
-			TS:     now.Add(-time.Duration(e.agoDays * float64(24*time.Hour))),
-			Price:  e.price,
-			Seller: e.seller,
-			Buyer:  e.seller + 500,
+			GiftID:  int64(i + 1),
+			GiftNum: e.gift,
+			TS:      now.Add(-time.Duration(e.agoDays * float64(24*time.Hour))),
+			Price:   e.price,
 		})
 	}
 	return out
 }
 
+// entry is one synthetic trade: how long ago, at what price, of which gift.
 type entry = struct {
 	agoDays float64
 	price   float64
-	seller  int64
+	gift    int64
 }
 
 func TestComputeLiquidityBasics(t *testing.T) {
@@ -49,8 +45,8 @@ func TestComputeLiquidityBasics(t *testing.T) {
 	if l.Sales7 != 3 {
 		t.Errorf("sales in the last 7 days = %d, want 3", l.Sales7)
 	}
-	if l.Sellers != 5 {
-		t.Errorf("distinct sellers = %d, want 5", l.Sellers)
+	if l.DistinctGifts != 5 {
+		t.Errorf("distinct gifts = %d, want 5", l.DistinctGifts)
 	}
 	if l.Median != 100 {
 		t.Errorf("median = %v, want 100", l.Median)

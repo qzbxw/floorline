@@ -30,9 +30,14 @@ CREATE INDEX IF NOT EXISTS idx_listings_seen  ON listings(first_seen);
 
 -- Real executed trades. This is the only honest evidence of what a model is
 -- worth and how fast it moves.
+--
+-- There are no counterparty ids in the payload, so gift_num carries the
+-- wash-trading signal instead: many "trades" that are all the same physical
+-- gift is one item being passed around, not a liquid market.
 CREATE TABLE IF NOT EXISTS sales (
     gift_id  INTEGER NOT NULL,
     ts       INTEGER NOT NULL,
+    gift_num INTEGER,
     name     TEXT    NOT NULL,
     model    TEXT    NOT NULL,
     backdrop TEXT,
@@ -40,8 +45,6 @@ CREATE TABLE IF NOT EXISTS sales (
     price    REAL    NOT NULL,
     asset    TEXT,
     type     TEXT,
-    seller   INTEGER,
-    buyer    INTEGER,
     PRIMARY KEY (gift_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_sales_model ON sales(name, model, ts DESC);

@@ -235,8 +235,8 @@ func (a *App) histText(ctx context.Context, collection, model string) string {
 		b.WriteString("\nNo recorded trades. This model is not liquid enough to flip.")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%d trades · %.2f/day · %d sellers / %d buyers\n",
-		liq.Sales, liq.Velocity, liq.Sellers, liq.Buyers)
+	fmt.Fprintf(&b, "%d trades · %.2f/day · %d different gifts (turnover %.2f)\n",
+		liq.Sales, liq.Velocity, liq.DistinctGifts, liq.Turnover)
 	fmt.Fprintf(&b, "Median %s · 7d median %s · trend %+.0f%%\n",
 		num(liq.Median), num(liq.Median7), (liq.Trend-1)*100)
 	fmt.Fprintf(&b, "Dispersion %.0f%% · last trade %s\n", liq.MADRatio*100, ago(liq.LastSale))
