@@ -83,6 +83,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 
 	a.api, err = tonnel.New(tonnel.Options{
 		AuthData:      auth,
+		Origin:        cfg.TonnelOrigin,
 		Timeout:       cfg.HTTPTimeout,
 		ReadRPS:       cfg.ReadRPS,
 		ReadBurst:     cfg.ReadBurst,

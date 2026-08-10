@@ -123,6 +123,8 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 		}},
 	}
 
+	fmt.Fprintf(w, "  origin  %s\n\n", a.api.Origin())
+
 	var failed, blocked, authFailed int
 	for _, c := range checks {
 		start := time.Now()

@@ -43,6 +43,9 @@ type Config struct {
 	OwnerID  int64
 
 	AuthData string
+	// TonnelOrigin is the front-end origin sent with every Tonnel request.
+	// Empty means the client's default.
+	TonnelOrigin string
 
 	// Cross-market comparison credentials. Each venue is independent: with
 	// none of them set, cards simply omit the comparison line.
@@ -114,12 +117,13 @@ func LoadDotEnv(path string) error {
 // Load builds a Config from the environment, applying the documented defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		BotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
-		OwnerID:     envInt64("TELEGRAM_OWNER_ID", 0),
-		AuthData:    os.Getenv("TONNEL_AUTH_DATA"),
-		PortalsAuth: os.Getenv("PORTALS_AUTH_DATA"),
-		MrktInit:    os.Getenv("MRKT_INIT_DATA"),
-		MrktToken:   os.Getenv("MRKT_TOKEN"),
+		BotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
+		OwnerID:      envInt64("TELEGRAM_OWNER_ID", 0),
+		AuthData:     os.Getenv("TONNEL_AUTH_DATA"),
+		TonnelOrigin: os.Getenv("TONNEL_ORIGIN"),
+		PortalsAuth:  os.Getenv("PORTALS_AUTH_DATA"),
+		MrktInit:     os.Getenv("MRKT_INIT_DATA"),
+		MrktToken:    os.Getenv("MRKT_TOKEN"),
 
 		DBPath:   envStr("DB_PATH", "./floorline.db"),
 		LogLevel: envStr("LOG_LEVEL", "info"),
@@ -193,7 +197,10 @@ func (c *Config) RequireBot() error {
 // RequireAuth reports whether a Tonnel authData is available.
 func (c *Config) RequireAuth() error {
 	if strings.TrimSpace(c.AuthData) == "" {
-		return errors.New("TONNEL_AUTH_DATA is empty (grab it from LocalStorage of market.tonnel.network, or send /auth <data> to the bot)")
+		return errors.New("TONNEL_AUTH_DATA is empty. It is the Telegram WebApp initData string, " +
+			"which the current Tonnel front end keeps in memory rather than Local Storage: open the " +
+			"mini app with DevTools, run `copy(Telegram.WebApp.initData)` in the console, or copy the " +
+			"user_auth field out of any request to gifts2.tonnel.network in the Network tab")
 	}
 	return nil
 }

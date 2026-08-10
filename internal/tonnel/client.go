@@ -22,10 +22,17 @@ import (
 
 // Hosts. Reads and writes live on different domains.
 const (
-	HostRead     = "gifts2.tonnel.network"
-	HostReadAlt  = "gifts3.tonnel.network"
-	HostWrite    = "gifts.coffin.meme"
-	originHeader = "https://market.tonnel.network"
+	HostRead    = "gifts2.tonnel.network"
+	HostReadAlt = "gifts3.tonnel.network"
+	HostWrite   = "gifts.coffin.meme"
+
+	// DefaultOrigin is the front end a real browser sends these requests from.
+	// Tonnel moved from market.tonnel.network to marketplace.tonnel.network;
+	// both still resolve, and the older one is what the public Python wrappers
+	// still send. If the backend ever starts checking this strictly, the
+	// alternative is one env var away.
+	DefaultOrigin = "https://marketplace.tonnel.network"
+	LegacyOrigin  = "https://market.tonnel.network"
 )
 
 // userAgent is deliberately fixed for the lifetime of the process and matched to
@@ -41,6 +48,8 @@ type Options struct {
 	ReadRPS   float64
 	ReadBurst int
 	Proxy     string
+	// Origin overrides the front-end origin sent with every request.
+	Origin string
 
 	// OnBlocked fires when the anti-bot layer starts refusing requests, so the
 	// caller can quiesce pollers and disarm auto-buy.
@@ -58,6 +67,8 @@ type Client struct {
 
 	auth   atomic.Pointer[string]
 	userID atomic.Int64
+
+	origin string
 
 	blockedStreak atomic.Int32
 	lastOK        atomic.Int64 // unix nanos of the last successful call
@@ -79,6 +90,9 @@ func New(o Options) (*Client, error) {
 	if o.ReadBurst <= 0 {
 		o.ReadBurst = 5
 	}
+	if o.Origin == "" {
+		o.Origin = DefaultOrigin
+	}
 
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithTimeout(int(o.Timeout.Seconds())),
@@ -97,6 +111,7 @@ func New(o Options) (*Client, error) {
 
 	c := &Client{
 		http:     hc,
+		origin:   strings.TrimSuffix(o.Origin, "/"),
 		readLim:  rate.NewLimiter(rate.Limit(o.ReadRPS), o.ReadBurst),
 		writeLim: rate.NewLimiter(rate.Limit(1), 2),
 
@@ -116,6 +131,9 @@ func (c *Client) SetAuth(auth string) {
 		c.userID.Store(id)
 	}
 }
+
+// Origin returns the front-end origin sent with every request.
+func (c *Client) Origin() string { return c.origin }
 
 // Auth returns the current authData.
 func (c *Client) Auth() string {
@@ -254,8 +272,8 @@ func (c *Client) do(ctx context.Context, o callOpts, payload []byte) error {
 		"accept":             {"*/*"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"content-type":       {"application/json"},
-		"origin":             {originHeader},
-		"referer":            {originHeader + "/"},
+		"origin":             {c.origin},
+		"referer":            {c.origin + "/"},
 		"sec-ch-ua":          {`"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`},
 		"sec-ch-ua-mobile":   {"?0"},
 		"sec-ch-ua-platform": {`"Windows"`},

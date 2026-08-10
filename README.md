@@ -54,9 +54,24 @@ edge     = (proceeds − P) / P
 
 ### 2. Tonnel authData
 
-Открой `market.tonnel.network` в десктопном браузере → DevTools → Application →
-Local Storage → скопируй значение `authData`. Это query-строка, начинающаяся с
-`query_id=` или `user=`.
+⚠️ **В Local Storage её нет** — вопреки всем публичным гайдам. Текущий фронт
+(`marketplace.tonnel.network`) держит `initData` в памяти и подставляет в каждый
+запрос. В Local Storage лежит только `profile-data`, `server-ru` и тема.
+
+Два способа достать:
+
+**Через консоль** (быстрее). Открой мини-апп Тоннеля с DevTools, в Console
+переключи селектор фрейма с `top` на `marketplace.tonnel.network` и выполни:
+
+```js
+copy(Telegram.WebApp.initData)
+```
+
+**Через Network** (надёжнее, работает независимо от фреймов). Вкладка Network →
+фильтр `gifts` → любой POST на `gifts2.tonnel.network` → Payload → скопируй
+значение поля `user_auth` (в других эндпоинтах оно называется `authData`).
+
+Строка выглядит так: `query_id=...&user=%7B%22id%22...&auth_date=...&hash=...`
 
 Она протухает. Когда это случится, бот пришлёт уведомление — отправь ему
 `/auth <новая строка>`, редактировать `.env` не нужно. Новое значение
