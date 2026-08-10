@@ -1,0 +1,18 @@
+# Credentials. Never commit these.
+.env
+.env.*
+!.env.example
+
+# Database and its WAL sidecars.
+*.db
+*.db-shm
+*.db-wal
+
+# Build output.
+/floorline
+/dist/
+
+# Editors and OS noise.
+.idea/
+.vscode/
+.DS_Store

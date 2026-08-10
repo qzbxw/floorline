@@ -1,0 +1,239 @@
+// Package config loads Floorline settings from the environment (and an optional .env file).
+//
+// Everything that is a *policy* threshold lives here. Everything that is a *money*
+// limit lives in package risk, because those are mutable at runtime via /limits set
+// and are persisted so a restart cannot silently reset a spent daily budget.
+package config
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// SignalGates decides what gets pushed to Telegram as an actionable card.
+type SignalGates struct {
+	MinEdge     float64 // net profit / entry price, after the exit price is modelled honestly
+	MinVelocity float64 // sales per day over the lookback window
+	MinSales    int     // absolute number of sales over the lookback window
+	MaxMADRatio float64 // median absolute deviation / median — price stability
+	MinTrend    float64 // median(7d) / median(14d) — reject falling knives
+	MinPrice    float64 // ignore dust
+	MaxPrice    float64 // 0 = unlimited
+}
+
+// AutoGates is layered strictly on top of SignalGates for unattended buying.
+type AutoGates struct {
+	MinEdge     float64
+	MinVelocity float64
+	MinSales    int
+	MinSellers  int // distinct sellers — a wash-trading guard
+	MaxMADRatio float64
+	MinTrend    float64
+	MaxDataAge  time.Duration // refuse to act on stale market data
+}
+
+// Config is immutable for the lifetime of the process.
+type Config struct {
+	BotToken string
+	OwnerID  int64
+
+	AuthData    string
+	PortalsAuth string
+
+	DBPath   string
+	LogLevel string
+
+	TonnelFee  float64 // 0.005 — referral fee only; Tonnel takes no commission
+	PortalsFee float64 // cross-market comparison only
+	MrktFee    float64 // cross-market comparison only
+	Undercut   float64 // how far below the best competing ask we model our exit
+
+	Sig  SignalGates
+	Auto AutoGates
+
+	LookbackDays int
+
+	FeedInterval      time.Duration
+	StatsInterval     time.Duration
+	SalesInterval     time.Duration
+	InventoryInterval time.Duration
+	BookCacheTTL      time.Duration
+
+	ReadRPS   float64
+	ReadBurst int
+
+	HTTPTimeout time.Duration
+}
+
+// LoadDotEnv reads KEY=VALUE lines from path into the environment.
+// Existing environment variables always win, so `FOO=1 ./floorline` overrides the file.
+func LoadDotEnv(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		if _, exists := os.LookupEnv(k); !exists {
+			_ = os.Setenv(k, v)
+		}
+	}
+	return sc.Err()
+}
+
+// Load builds a Config from the environment, applying the documented defaults.
+func Load() (*Config, error) {
+	c := &Config{
+		BotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
+		OwnerID:     envInt64("TELEGRAM_OWNER_ID", 0),
+		AuthData:    os.Getenv("TONNEL_AUTH_DATA"),
+		PortalsAuth: os.Getenv("PORTALS_AUTH_DATA"),
+
+		DBPath:   envStr("DB_PATH", "./floorline.db"),
+		LogLevel: envStr("LOG_LEVEL", "info"),
+
+		TonnelFee:  envFloat("TONNEL_FEE", 0.005),
+		PortalsFee: envFloat("PORTALS_FEE", 0.02),
+		MrktFee:    envFloat("MRKT_FEE", 0.02),
+		Undercut:   envFloat("UNDERCUT", 0.01),
+
+		Sig: SignalGates{
+			MinEdge:     envFloat("SIG_MIN_EDGE", 0.05),
+			MinVelocity: envFloat("SIG_MIN_VELOCITY", 1.0),
+			MinSales:    envInt("SIG_MIN_SALES", 10),
+			MaxMADRatio: envFloat("SIG_MAX_MAD_RATIO", 0.35),
+			MinTrend:    envFloat("SIG_MIN_TREND", 0.90),
+			MinPrice:    envFloat("SIG_MIN_PRICE", 1),
+			MaxPrice:    envFloat("SIG_MAX_PRICE", 0),
+		},
+		Auto: AutoGates{
+			MinEdge:     envFloat("AUTOBUY_MIN_EDGE", 0.10),
+			MinVelocity: envFloat("AUTOBUY_MIN_VELOCITY", 2.0),
+			MinSales:    envInt("AUTOBUY_MIN_SALES", 20),
+			MinSellers:  envInt("AUTOBUY_MIN_SELLERS", 4),
+			MaxMADRatio: envFloat("AUTOBUY_MAX_MAD_RATIO", 0.25),
+			MinTrend:    envFloat("AUTOBUY_MIN_TREND", 0.95),
+			MaxDataAge:  envDur("AUTOBUY_MAX_DATA_AGE", 5*time.Minute),
+		},
+
+		LookbackDays: envInt("LOOKBACK_DAYS", 14),
+
+		FeedInterval:      envDur("POLL_FEED", 2*time.Second),
+		StatsInterval:     envDur("POLL_STATS", 60*time.Second),
+		SalesInterval:     envDur("POLL_SALES", 25*time.Second),
+		InventoryInterval: envDur("POLL_INVENTORY", 60*time.Second),
+		BookCacheTTL:      envDur("BOOK_CACHE_TTL", 15*time.Second),
+
+		ReadRPS:   envFloat("READ_RPS", 2),
+		ReadBurst: envInt("READ_BURST", 5),
+
+		HTTPTimeout: envDur("HTTP_TIMEOUT", 20*time.Second),
+	}
+
+	if c.Undercut < 0 || c.Undercut >= 0.5 {
+		return nil, fmt.Errorf("UNDERCUT must be in [0, 0.5), got %v", c.Undercut)
+	}
+	if c.LookbackDays < 1 {
+		return nil, fmt.Errorf("LOOKBACK_DAYS must be >= 1")
+	}
+	if c.ReadRPS <= 0 {
+		return nil, fmt.Errorf("READ_RPS must be > 0")
+	}
+	return c, nil
+}
+
+// RequireBot reports whether the settings needed to actually run the bot are present.
+func (c *Config) RequireBot() error {
+	var missing []string
+	if c.BotToken == "" {
+		missing = append(missing, "TELEGRAM_BOT_TOKEN")
+	}
+	if c.OwnerID == 0 {
+		missing = append(missing, "TELEGRAM_OWNER_ID")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required settings: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// RequireAuth reports whether a Tonnel authData is available.
+func (c *Config) RequireAuth() error {
+	if strings.TrimSpace(c.AuthData) == "" {
+		return errors.New("TONNEL_AUTH_DATA is empty (grab it from LocalStorage of market.tonnel.network, or send /auth <data> to the bot)")
+	}
+	return nil
+}
+
+func envStr(k, def string) string {
+	if v, ok := os.LookupEnv(k); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+func envFloat(k string, def float64) float64 {
+	if v, ok := os.LookupEnv(k); ok && v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v, ok := os.LookupEnv(k); ok && v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v, ok := os.LookupEnv(k); ok && v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
+// envDur accepts either a Go duration ("2s", "1m30s") or a bare number of seconds.
+func envDur(k string, def time.Duration) time.Duration {
+	v, ok := os.LookupEnv(k)
+	if !ok || v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return time.Duration(f * float64(time.Second))
+	}
+	return def
+}
