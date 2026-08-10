@@ -58,11 +58,8 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 			bot.Esc(attrWithRarity(tonnel.BaseAttr(g.Symbol), g.SymbolRarity.Float())))
 	}
 
-	if a.pt.Enabled() {
-		if pf, ok := a.pt.ModelFloor(ctx, v.Key.Name, v.Key.Model); ok {
-			fmt.Fprintf(&b, "Portals model floor %s (net of %.0f%% there: %s)\n",
-				num(pf), a.cfg.PortalsFee*100, num(pf*(1-a.cfg.PortalsFee)))
-		}
+	for _, line := range a.crossMarketLines(ctx, v) {
+		b.WriteString(line + "\n")
 	}
 
 	if dec.Age > 0 {
@@ -116,9 +113,10 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 		v.Supply, days(v.DaysOfSupply), v.CompetitorsNear)
 	fmt.Fprintf(&b, "Expected time to sell ≈ %s\n", days(v.ExpectedDays))
 
-	if a.pt.Enabled() {
-		if pf, ok := a.pt.ModelFloor(ctx, v.Key.Name, v.Key.Model); ok {
-			fmt.Fprintf(&b, "\nPortals model floor %s (reference only)\n", num(pf))
+	if lines := a.crossMarketLines(ctx, v); len(lines) > 0 {
+		b.WriteString("\n<b>Other venues</b> <i>(reference only — no arbitrage)</i>\n")
+		for _, line := range lines {
+			b.WriteString(line + "\n")
 		}
 	}
 
@@ -245,6 +243,37 @@ func ago(t time.Time) string {
 		return "never"
 	}
 	return dur(time.Since(t)) + " ago"
+}
+
+// crossMarketLines renders one line per other venue: its model floor, what that
+// floor would net after that venue's fee, and how it compares to what we are
+// paying here.
+//
+// This is never a trade instruction. Getting a gift out of Tonnel's off-chain
+// engine takes minutes to hours, so no spread shown here is executable. It is a
+// sanity check: a Tonnel floor far away from every other venue means one of the
+// numbers is wrong.
+func (a *App) crossMarketLines(ctx context.Context, v pricing.Valuation) []string {
+	if !a.cross.Enabled() {
+		return nil
+	}
+	// Bound the wait: a slow venue must not hold up a time-sensitive card.
+	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	quotes := a.cross.Quotes(qctx, v.Key.Name, v.Key.Model)
+	lines := make([]string, 0, len(quotes))
+	for _, q := range quotes {
+		line := fmt.Sprintf("%s floor %s", bot.Esc(q.Venue), num(q.Floor))
+		if q.Fee > 0 {
+			line += fmt.Sprintf(" (net of %.0f%% there: %s)", q.Fee*100, num(q.Net()))
+		}
+		if v.Price > 0 {
+			line += fmt.Sprintf(" · %+.0f%% vs our entry", (q.Floor/v.Price-1)*100)
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // exitExplain says in one clause where the exit price came from, so the number

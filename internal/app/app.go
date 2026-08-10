@@ -13,7 +13,7 @@ import (
 	"floorline/internal/bot"
 	"floorline/internal/config"
 	"floorline/internal/exec"
-	"floorline/internal/portals"
+	"floorline/internal/market"
 	"floorline/internal/pricing"
 	"floorline/internal/risk"
 	"floorline/internal/signal"
@@ -31,7 +31,7 @@ type App struct {
 	det   *signal.Detector
 	rm    *risk.Manager
 	ex    *exec.Executor
-	pt    *portals.Client
+	cross *market.Comparison
 	tg    *bot.Bot
 
 	startedAt time.Time
@@ -106,10 +106,21 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 
 	a.ex = exec.New(a.api, st, a.books, a.rm, cfg)
 
-	a.pt, err = portals.New(cfg.PortalsAuth, 5*time.Minute)
-	if err != nil {
+	// Cross-market venues are read-only price references. A venue that fails to
+	// build is dropped with a warning rather than taking the process down —
+	// none of them is required to trade.
+	var sources []market.Source
+	if p, err := market.NewPortals(cfg.PortalsAuth, cfg.PortalsFee, cfg.CrossMarkTTL); err != nil {
 		log.Warn().Err(err).Msg("portals comparison unavailable")
+	} else {
+		sources = append(sources, p)
 	}
+	if mk, err := market.NewMRKT(cfg.MrktInit, cfg.MrktToken, cfg.MrktFee, cfg.CrossMarkTTL); err != nil {
+		log.Warn().Err(err).Msg("mrkt comparison unavailable")
+	} else {
+		sources = append(sources, mk)
+	}
+	a.cross = market.NewComparison(sources...)
 
 	// The Telegram client is created in Run, not here: `smoke` and `backfill`
 	// must work with nothing but a Tonnel session, and connecting to Telegram

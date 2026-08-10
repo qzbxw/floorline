@@ -5,9 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"floorline/internal/tonnel"
+)
+
+// probeCollection and probeModel are a widely listed pair used only to check
+// that the other venues answer at all, when there is no live Tonnel listing to
+// probe with. A "nothing listed" result here is informative, not a failure —
+// what matters is whether the venue answered.
+const (
+	probeCollection = "Plush Pepe"
+	probeModel      = "Aqua Plush"
 )
 
 // Smoke exercises every read endpoint and prints what happened.
@@ -135,19 +145,32 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 		fmt.Fprintf(w, "  ok    %-30s %8s  %s\n", c.name, took, msg)
 	}
 
-	if a.pt.Enabled() {
-		fmt.Fprintln(w, "\nCross-market reference:")
-		gifts, err := a.api.Feed(ctx, 1)
-		if err == nil && len(gifts) > 0 {
-			key := gifts[0].Key()
-			if f, ok := a.pt.ModelFloor(ctx, key.Name, key.Model); ok {
-				fmt.Fprintf(w, "  ok    portals floor for %s: %s\n", key, num(f))
-			} else {
-				fmt.Fprintf(w, "  warn  portals returned no floor for %s\n", key)
+	fmt.Fprintln(w)
+	if !a.cross.Enabled() {
+		fmt.Fprintln(w, "Cross-market comparison disabled (set PORTALS_AUTH_DATA and/or MRKT_INIT_DATA).")
+	} else {
+		fmt.Fprintf(w, "Cross-market venues: %s\n", strings.Join(a.cross.Venues(), ", "))
+
+		// Probe with a live Tonnel listing when we have one, but fall back to a
+		// known-liquid model otherwise: the other venues' credentials must be
+		// verifiable even when the Tonnel session is the thing that is broken.
+		probe := tonnel.ModelKey{Name: probeCollection, Model: probeModel}
+		if gifts, err := a.api.Feed(ctx, 1); err == nil && len(gifts) > 0 {
+			probe = gifts[0].Key()
+		} else {
+			fmt.Fprintf(w, "  note  no Tonnel listing to probe with; falling back to %s\n", probe)
+		}
+
+		for _, r := range a.cross.Probe(ctx, probe.Name, probe.Model) {
+			switch {
+			case r.Err != nil:
+				fmt.Fprintf(w, "  FAIL  %-8s %v\n", r.Venue, r.Err)
+			case r.Floor == 0:
+				fmt.Fprintf(w, "  warn  %-8s reachable, but nothing listed for %s\n", r.Venue, probe)
+			default:
+				fmt.Fprintf(w, "  ok    %-8s floor for %s: %s\n", r.Venue, probe, num(r.Floor))
 			}
 		}
-	} else {
-		fmt.Fprintln(w, "\nPortals comparison disabled (PORTALS_AUTH_DATA is unset).")
 	}
 
 	if failed == 0 {

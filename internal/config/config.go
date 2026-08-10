@@ -42,8 +42,13 @@ type Config struct {
 	BotToken string
 	OwnerID  int64
 
-	AuthData    string
+	AuthData string
+
+	// Cross-market comparison credentials. Each venue is independent: with
+	// none of them set, cards simply omit the comparison line.
 	PortalsAuth string
+	MrktInit    string // Telegram WebApp initData, exchanged for a token that self-renews
+	MrktToken   string // a ready bearer token, if you would rather paste that
 
 	DBPath   string
 	LogLevel string
@@ -67,7 +72,8 @@ type Config struct {
 	ReadRPS   float64
 	ReadBurst int
 
-	HTTPTimeout time.Duration
+	HTTPTimeout  time.Duration
+	CrossMarkTTL time.Duration
 }
 
 // LoadDotEnv reads KEY=VALUE lines from path into the environment.
@@ -112,6 +118,8 @@ func Load() (*Config, error) {
 		OwnerID:     envInt64("TELEGRAM_OWNER_ID", 0),
 		AuthData:    os.Getenv("TONNEL_AUTH_DATA"),
 		PortalsAuth: os.Getenv("PORTALS_AUTH_DATA"),
+		MrktInit:    os.Getenv("MRKT_INIT_DATA"),
+		MrktToken:   os.Getenv("MRKT_TOKEN"),
 
 		DBPath:   envStr("DB_PATH", "./floorline.db"),
 		LogLevel: envStr("LOG_LEVEL", "info"),
@@ -151,7 +159,8 @@ func Load() (*Config, error) {
 		ReadRPS:   envFloat("READ_RPS", 2),
 		ReadBurst: envInt("READ_BURST", 5),
 
-		HTTPTimeout: envDur("HTTP_TIMEOUT", 20*time.Second),
+		HTTPTimeout:  envDur("HTTP_TIMEOUT", 20*time.Second),
+		CrossMarkTTL: envDur("CROSS_MARKET_TTL", 5*time.Minute),
 	}
 
 	if c.Undercut < 0 || c.Undercut >= 0.5 {

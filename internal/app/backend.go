@@ -95,6 +95,11 @@ func (a *App) Status(ctx context.Context) string {
 	if n := a.api.BlockedStreak(); n > 0 {
 		fmt.Fprintf(&b, "⚠️ %d consecutive anti-bot rejections\n", n)
 	}
+	if venues := a.cross.Venues(); len(venues) > 0 {
+		fmt.Fprintf(&b, "Cross-market reference: %s\n", strings.Join(venues, ", "))
+	} else {
+		b.WriteString("Cross-market reference: none configured\n")
+	}
 
 	b.WriteString("\n<b>Pollers</b>\n")
 	a.mu.RLock()
