@@ -113,8 +113,11 @@ func New(token string, ownerID int64, back Backend) (*Bot, error) {
 	})
 
 	b.register()
-	if err := tb.SetCommands(commandMenu); err != nil {
-		// A missing menu is cosmetic; it must not stop the desk from running.
+	// Minimal menu: just the entry point. Everything else is buttons.
+	if err := tb.SetCommands([]tele.Command{
+		{Text: "start", Description: "Главное меню"},
+		{Text: "help", Description: "Справка"},
+	}); err != nil {
 		log.Warn().Err(err).Msg("could not publish the command menu")
 	}
 	return b, nil
@@ -202,8 +205,8 @@ func markup(rows [][]Button) *tele.ReplyMarkup {
 func (b *Bot) register() {
 	tb := b.tb
 
-	tb.Handle("/start", b.reply(func(ctx context.Context, c tele.Context) Reply { return Text(helpText) }))
-	tb.Handle("/help", b.reply(func(ctx context.Context, c tele.Context) Reply { return Text(helpText) }))
+	tb.Handle("/start", b.reply(func(ctx context.Context, c tele.Context) Reply { return mainMenu() }))
+	tb.Handle("/help", b.reply(func(ctx context.Context, c tele.Context) Reply { return helpMenuReply() }))
 
 	tb.Handle("/status", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Status(ctx)
@@ -463,10 +466,56 @@ func (b *Bot) registerCallbacks() {
 			r = b.back.Portfolio(ctx)
 		case "gram":
 			r = b.back.Gram(ctx)
+		case "balance":
+			r = b.back.BalanceText(ctx)
+		case "limits":
+			r = b.back.LimitsText(ctx)
+		case "arm":
+			r = b.back.Arm(ctx)
+		case "disarm":
+			r = b.back.Disarm(ctx)
+		case "watchlist":
+			r = b.back.Watchlist(ctx)
 		default:
 			return nil
 		}
 		return b.editWith(c, r)
+	})
+
+	// Menu navigation
+	tb.Handle(&tele.Btn{Unique: cbMenu}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "main menu"})
+		return b.editWith(c, mainMenu())
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbMarket}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "market"})
+		return b.editWith(c, marketMenu())
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbPortfolio}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "portfolio"})
+		return b.editWith(c, portfolioMenu())
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbAlerts}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "alerts"})
+		return b.editWith(c, alertsMenu())
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbSettings}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "settings"})
+		return b.editWith(c, settingsMenu())
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbAuto}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "auto-buy"})
+		return b.editWith(c, autoMenu())
+	})
+
+	tb.Handle(&tele.Btn{Unique: cbHelp}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "help"})
+		return b.editWith(c, helpMenuReply())
 	})
 }
 
@@ -641,42 +690,3 @@ var commandMenu = []tele.Command{
 	{Text: "help", Description: "command reference"},
 }
 
-const helpText = `<b>Floorline</b> — Tonnel gift trading desk.
-
-<b>Market</b>
-/gram — GRAM/USDT volatility and tracked gift-floor lag
-/floor <i>Collection [/ Model]</i> — floor, supply, rarity, cheapest asks
-/book <i>Collection / Model</i> — the ask ladder
-/hist <i>Collection / Model</i> — real trades, median, velocity
-/val <i>gift_id</i> — full valuation of one listing
-
-<b>Book</b>
-/pos — open positions, each with a Relist button
-/portfolio — hold/relist/exit recommendations and conservative NAV
-/advice <i>gift_id</i> — fast and patient exits for one position
-/history <i>gift_id</i> — purchase, listings, market marks and final PnL
-/cost <i>gift_id price</i> — set a missing acquisition cost
-/exit <i>gift_id price</i> — prepare a manually confirmed exit, including below cost
-/pnl — realised and unrealised, net of fees
-/balance — account balance
-/relist <i>gift_id</i> — reprice an owned gift against the current book
-
-<b>Alerts</b>
-/watch <i>Collection / Model [max price]</i>
-/unwatch <i>Collection / Model</i>
-/watchlist
-/mute <i>Collection [/ Model] [hours]</i>
-/unmute <i>Collection [/ Model]</i>
-
-<b>Auto-buy</b>
-/arm — enable unattended buying (needs limits first)
-/disarm — stop it
-/limits — show limits and today's usage
-/limits set <i>key value</i> — e.g. <code>/limits set max_ticket 50</code>
-
-<b>Ops</b>
-/status — pollers, data freshness, warm-up
-/auth <i>authData</i> — replace an expired Tonnel session
-/help — this reference
-
-<i>Collection and model are separated by a slash: </i><code>/book Plush Pepe / Pink Diamond</code><i>. Partial names in any case work when they match one thing.</i>`
