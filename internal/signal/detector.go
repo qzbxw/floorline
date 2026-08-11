@@ -283,7 +283,9 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	g := d.cfg.Sig
 	var fails []string
 
-	if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
+	if v.Edge <= 0 {
+		fails = append(fails, fmt.Sprintf("реальный вход %.3f выше быстрого выхода %.3f — сделка уже %.1f%% в минусе до риск-буфера", v.Cost, v.FastExit, -v.Edge*100))
+	} else if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
 		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
 	}
 	if v.Liq.Velocity < g.MinVelocity {

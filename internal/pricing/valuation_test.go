@@ -306,6 +306,18 @@ func TestPatientExitRequiresEvidenceAndCanWinOnProfitPerDay(t *testing.T) {
 	}
 }
 
+func TestPatientAskPaysForWaitingAndBearCaseStaysSeparate(t *testing.T) {
+	liq := liqOf(3.20, 20)
+	liq.Trend = .95
+	v := evalPrice(t, 3.10, bookOf(42, 3.10, 3.24, 3.25, 3.30), liq, 3.10, 10)
+	if v.PatientAsk <= v.FairValue {
+		t.Fatalf("patient %.3f must carry a wait premium over fair %.3f", v.PatientAsk, v.FairValue)
+	}
+	if v.BearCase <= 0 || v.BearCase >= v.PatientAsk {
+		t.Fatalf("bear %.3f must be a separate downside scenario below patient %.3f", v.BearCase, v.PatientAsk)
+	}
+}
+
 // The three positions the desk actually held when it advised REDUCE/EXIT on all
 // of them at targets below the live floor. Every number below is the one the
 // operator read off the market, so a regression here is a regression that costs

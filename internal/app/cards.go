@@ -138,6 +138,9 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 	if v.MarketDisagreement {
 		fmt.Fprintf(&b, "⚠️ Рынок спорит сам с собой на %.0f%% — только руками\n", v.MarketDivergence*100)
 	}
+	if len(fails) > 0 {
+		fmt.Fprintf(&b, "\n<b>%s</b>\n", bot.Esc(passLine(v, fails)))
+	}
 	fmt.Fprintf(&b, "Конфа %.0f%% · скор %.1f · эдж с риском %.1f%%\n", v.Confidence*100, v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100)
 	if v.FX.Valid {
 		fmt.Fprintf(&b, "GRAM/USD %s · 15м %+.1f%% · 1ч %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100, v.FX.Move1h*100)
@@ -359,6 +362,31 @@ func askPreview(asks []float64, fallback float64) string {
 func exitExplain(v pricing.Valuation) string {
 	return fmt.Sprintf("микс: стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%",
 		v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
+}
+
+// passLine states the actual economic reason to skip a listing. The detailed
+// gates stay below it for debugging, but the operator should not have to infer
+// "entry is above exit" from a clamped risk-adjusted zero.
+func passLine(v pricing.Valuation, fails []string) string {
+	parts := make([]string, 0, 4)
+	if v.Cost >= v.FastExit && v.FastExit > 0 {
+		parts = append(parts, fmt.Sprintf("реальный вход %s выше быстрого выхода %s", num(v.Cost), num(v.FastExit)))
+	}
+	if !v.HasCompetingAsk || v.AskGap1 < .05 {
+		parts = append(parts, "после первого аска нормального гэпа нет")
+	}
+	if v.CrossMarketSupport > 0 && v.CrossMarketSupport <= v.Cost {
+		parts = append(parts, "другие площадки эджа не дают")
+	} else if v.CrossDivergence > .15 {
+		parts = append(parts, "Tonnel и другие площадки спорят")
+	}
+	if v.MarketDisagreement {
+		parts = append(parts, "история и живой стакан разъехались")
+	}
+	if len(parts) == 0 && len(fails) > 0 {
+		parts = append(parts, fails[0])
+	}
+	return "PASS: " + strings.Join(parts, "; ") + "."
 }
 
 func attrWithRarity(name string, rarity float64) string {

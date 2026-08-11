@@ -1,10 +1,29 @@
 package app
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"floorline/internal/pricing"
+)
 
 func TestNumKeepsReferralPrecisionForSmallGRAMAmounts(t *testing.T) {
 	if got := num(3.80895); got != "3.809" {
 		t.Errorf("num(3.80895) = %q, want 3.809", got)
+	}
+}
+
+func TestPassLineNamesTheEconomicReason(t *testing.T) {
+	v := pricing.Valuation{
+		Cost: 3.316, FastExit: 3.228,
+		HasCompetingAsk: true, AskGap1: .01,
+		CrossMarketSupport: 3.20,
+	}
+	got := passLine(v, []string{"some detailed gate"})
+	for _, want := range []string{"PASS:", "реальный вход 3.316 выше быстрого выхода 3.228", "гэпа нет", "площадки эджа не дают"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("pass line %q does not contain %q", got, want)
+		}
 	}
 }
 

@@ -8,7 +8,13 @@ import (
 	"floorline/internal/tonnel"
 )
 
-const marketDisagreementLimit = 0.10
+const (
+	marketDisagreementLimit = 0.10
+	// Waiting has to buy us something. A patient ask equal to fair value is
+	// just the same exit with a slower fill, so it carries a modest 1.5% wait
+	// premium and is still capped by a genuinely comparable live ask.
+	patientWaitPremium = 0.015
+)
 
 // Params are the economics of a round trip.
 type Params struct {
@@ -267,10 +273,10 @@ func recompute(v *Valuation) {
 	if v.Liquidation > 0 && v.FastExit < v.Liquidation {
 		v.FastExit = v.Liquidation
 	}
-	v.PatientAsk = math.Max(v.FastExit, v.FairValue)
+	v.PatientAsk = math.Max(v.FastExit, v.FairValue*(1+patientWaitPremium))
 	if in.Attribute.Valid && in.Attribute.ExactSamples >= MinAttributeSamples && in.Book != nil {
 		if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.OwnerID, in.Backdrop, in.Symbol); ok {
-			v.PatientAsk = math.Max(v.FastExit, math.Min(v.PatientAsk, ask*(1-undercut)))
+			v.PatientAsk = math.Max(math.Max(v.FastExit, v.FairValue), math.Min(v.PatientAsk, ask*(1-undercut)))
 		}
 	}
 	v.PatientExit = v.PatientAsk
