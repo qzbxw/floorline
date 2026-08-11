@@ -26,6 +26,19 @@ type Book struct {
 	FetchedAt time.Time
 }
 
+// ExternalAsks returns the live depth that belongs to the market, not to us.
+// The slice is a copy so callers can safely keep it while the cache refreshes.
+func (b *Book) ExternalAsks(giftID, ownerID int64) []Ask {
+	out := make([]Ask, 0, len(b.Asks))
+	for _, a := range b.Asks {
+		if a.GiftID == giftID || (ownerID != 0 && a.Seller == ownerID) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 // NewBook builds a Book from raw API rows, dropping everything that would
 // corrupt the price picture: bundles price a whole pack, premarket rows are not
 // deliverable gifts, and Telegram-marketplace rows settle differently.
@@ -52,14 +65,16 @@ func NewBook(key tonnel.ModelKey, gifts []tonnel.Gift, at time.Time) *Book {
 	return b
 }
 
-// BestExcluding returns the cheapest ask that is not the given gift.
+// BestExcluding returns the cheapest genuinely competing ask. The listing
+// being evaluated and every ask owned by ownerID are excluded: undercutting
+// our own inventory is not market depth and must never justify a purchase.
 //
 // This is the number that actually matters when buying the floor: once you own
 // the cheapest lot, the price you must beat to sell is the *next* one, not the
 // floor you just bought.
-func (b *Book) BestExcluding(giftID int64) (float64, bool) {
+func (b *Book) BestExcluding(giftID, ownerID int64) (float64, bool) {
 	for _, a := range b.Asks {
-		if a.GiftID == giftID {
+		if a.GiftID == giftID || (ownerID != 0 && a.Seller == ownerID) {
 			continue
 		}
 		return a.Price, true
@@ -70,9 +85,9 @@ func (b *Book) BestExcluding(giftID int64) (float64, bool) {
 // BestAttributesExcluding returns the cheapest ask matching every non-empty
 // attribute. It powers the patient, collector-facing exit without confusing a
 // generic model floor with a genuinely comparable gift.
-func (b *Book) BestAttributesExcluding(giftID int64, backdrop, symbol string) (float64, bool) {
+func (b *Book) BestAttributesExcluding(giftID, ownerID int64, backdrop, symbol string) (float64, bool) {
 	for _, a := range b.Asks {
-		if a.GiftID == giftID {
+		if a.GiftID == giftID || (ownerID != 0 && a.Seller == ownerID) {
 			continue
 		}
 		if backdrop != "" && a.Backdrop != backdrop {
@@ -86,10 +101,10 @@ func (b *Book) BestAttributesExcluding(giftID int64, backdrop, symbol string) (f
 	return 0, false
 }
 
-func (b *Book) CountAttributesBetween(lo, hi float64, excludeID int64, backdrop, symbol string) int {
+func (b *Book) CountAttributesBetween(lo, hi float64, excludeID, ownerID int64, backdrop, symbol string) int {
 	n := 0
 	for _, a := range b.Asks {
-		if a.GiftID == excludeID || a.Price < lo || a.Price > hi {
+		if a.GiftID == excludeID || (ownerID != 0 && a.Seller == ownerID) || a.Price < lo || a.Price > hi {
 			continue
 		}
 		if backdrop != "" && a.Backdrop != backdrop {
@@ -104,10 +119,10 @@ func (b *Book) CountAttributesBetween(lo, hi float64, excludeID int64, backdrop,
 }
 
 // CountBetween counts asks in [lo, hi], excluding one gift.
-func (b *Book) CountBetween(lo, hi float64, excludeID int64) int {
+func (b *Book) CountBetween(lo, hi float64, excludeID, ownerID int64) int {
 	n := 0
 	for _, a := range b.Asks {
-		if a.GiftID == excludeID {
+		if a.GiftID == excludeID || (ownerID != 0 && a.Seller == ownerID) {
 			continue
 		}
 		if a.Price >= lo && a.Price <= hi {

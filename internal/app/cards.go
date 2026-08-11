@@ -30,17 +30,19 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 	}
 	fmt.Fprintf(&b, "⚡️ <b>%s</b> · %s\n", title, bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
 
-	fmt.Fprintf(&b, "<b>%s GRAM</b>", num(v.Price))
+	fmt.Fprintf(&b, "Листинг <b>%s</b> · реально спишется <b>%s</b>", num(v.Price), num(v.Cost))
 	if v.Floor > 0 {
 		fmt.Fprintf(&b, "  ·  флор модели %s  ·  <b>%+.0f%%</b>", num(v.Floor), -v.DiscountToFloor*100)
 	}
 	b.WriteString("\n\n")
 
-	fmt.Fprintf(&b, "Выход <b>%s</b>  <i>(%s)</i>\n", num(v.Exit), bot.Esc(exitExplain(v)))
-	fmt.Fprintf(&b, "Нет <b>%s</b> (%+.1f%%) после %.1f%% комиссии\n", num(v.Net), v.Edge*100, a.cfg.TonnelFee*100)
-	if v.PatientExit > 0 {
-		fmt.Fprintf(&b, "Быстро %s / %s · терпеливо %s / %s · выбрано <b>%s</b>\n", num(v.FastExit), days(v.FastExpectedDays), num(v.PatientExit), days(v.PatientExpectedDays), v.ChosenExit)
+	fmt.Fprintf(&b, "Слить сейчас %s · быстрый выход <b>%s</b> за ~%s\n", num(v.Liquidation), num(v.FastExit), days(v.FastExpectedDays))
+	fmt.Fprintf(&b, "Фэйр %s · терпеливый аск %s за ~%s\n", num(v.FairValue), num(v.PatientAsk), days(v.PatientExpectedDays))
+	if v.BearCase > 0 {
+		fmt.Fprintf(&b, "Если рынок поплывёт: %s\n", num(v.BearCase))
 	}
+	fmt.Fprintf(&b, "Ожидаемая продажа <b>%s</b> · нет <b>%s</b> (%+.1f%%)\n", num(v.FastExit), num(v.Net), v.Edge*100)
+	fmt.Fprintf(&b, "<i>%s</i>\n", bot.Esc(exitExplain(v)))
 	fmt.Fprintf(&b, "Скор %.1f · эдж с риском %.1f%% · конфа %.0f%%\n", v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100, v.Confidence*100)
 	if v.FX.Valid {
 		fmt.Fprintf(&b, "GRAM/USDT %s · 15м %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100)
@@ -54,6 +56,12 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.DistinctGifts)
 	fmt.Fprintf(&b, "Медиана %s · разброс %.0f%% · тренд %+.0f%%\n",
 		num(v.Liq.Median), v.Liq.MADRatio*100, (v.Liq.Trend-1)*100)
+	if v.HasCompetingAsk {
+		fmt.Fprintf(&b, "Стакан: следующий %s · глубина-3 %s · гэп %.1f%% / %.1f%%\n", num(v.CompetingAsk), num(v.DepthPrice3), v.AskGap1*100, v.AskGap3*100)
+	}
+	if v.MarketDisagreement {
+		fmt.Fprintf(&b, "⚠️ История и живой стакан разъехались на %.0f%% — только руками\n", v.MarketDivergence*100)
+	}
 
 	if v.CompetitorsNear == 0 {
 		b.WriteString("В 5% от твоего выхода никого → ты лучший аск\n")
@@ -68,8 +76,10 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 			bot.Esc(attrWithRarity(bd, g.BackdropRarity.Float())),
 			bot.Esc(attrWithRarity(tonnel.BaseAttr(g.Symbol), g.SymbolRarity.Float())))
 	}
-	if v.Attribute.Valid {
+	if v.Attribute.Valid && v.Attribute.ExactSamples >= pricing.MinAttributeSamples {
 		fmt.Fprintf(&b, "Премия за атрибуты %+.1f%% · выборка фон %d / символ %d / точных %d\n", v.Attribute.Premium*100, v.Attribute.BackdropSamples, v.Attribute.SymbolSamples, v.Attribute.ExactSamples)
+	} else if v.Attribute.ExactSamples > 0 {
+		fmt.Fprintf(&b, "Трейты: данных мало (%d точных), в цену не лезут\n", v.Attribute.ExactSamples)
 	}
 
 	for _, line := range a.crossMarketLines(ctx, v) {
@@ -103,22 +113,30 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "Цена <b>%s</b>", num(v.Price))
+	fmt.Fprintf(&b, "Листинг <b>%s</b> · реально спишется <b>%s</b>", num(v.Price), num(v.Cost))
 	if v.Floor > 0 {
 		fmt.Fprintf(&b, " · флор модели %s (%+.0f%%)", num(v.Floor), -v.DiscountToFloor*100)
 	}
-	b.WriteString("\n\n<b>Модель выхода</b>\n")
+	b.WriteString("\n\n<b>Четыре цены без каши</b>\n")
 	if v.HasCompetingAsk {
 		fmt.Fprintf(&b, "Лучший чужой аск %s → андеркат %s\n", num(v.CompetingAsk), num(v.CompetingAsk*(1-a.cfg.Undercut)))
 	} else {
 		b.WriteString("Конкурентов нет — ты был бы единственным продавцом\n")
 	}
-	fmt.Fprintf(&b, "Медиана %d сделок: %s\n", v.Liq.Sales, num(v.Liq.Median))
-	fmt.Fprintf(&b, "→ выход <b>%s</b> (%s)\n", num(v.Exit), bot.Esc(v.ExitBasis))
-	fmt.Fprintf(&b, "→ на руки %s после %.1f%% комиссии\n", num(v.Proceeds), a.cfg.TonnelFee*100)
-	fmt.Fprintf(&b, "→ нет <b>%s</b> (%+.1f%%)\n", num(v.Net), v.Edge*100)
-	if v.PatientExit > 0 {
-		fmt.Fprintf(&b, "Быстро %s за %s · терпеливо %s за %s · выбрано %s\n", num(v.FastExit), days(v.FastExpectedDays), num(v.PatientExit), days(v.PatientExpectedDays), v.ChosenExit)
+	fmt.Fprintf(&b, "Слить почти сейчас: %s\n", num(v.Liquidation))
+	fmt.Fprintf(&b, "Быстрый выход 24–72ч: <b>%s</b> · по нему решаем BUY\n", num(v.FastExit))
+	fmt.Fprintf(&b, "Фэйр рынка: %s\nТерпеливый аск: %s\n", num(v.FairValue), num(v.PatientAsk))
+	if v.BearCase > 0 {
+		fmt.Fprintf(&b, "Медвежий сценарий: %s\n", num(v.BearCase))
+	}
+	fmt.Fprintf(&b, "На руки %s · себестоимость %s · нет <b>%s</b> (%+.1f%%)\n", num(v.Proceeds), num(v.Cost), num(v.Net), v.Edge*100)
+	fmt.Fprintf(&b, "Вес: живой стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%\n", v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
+	fmt.Fprintf(&b, "История после шринка %s · живая глубина %s · внешняя опора %s\n", num(v.HistoryReference), num(v.LiveDepth), num(v.CrossMarketSupport))
+	if v.HasCompetingAsk {
+		fmt.Fprintf(&b, "Гэпы: до следующего %.1f%% · до глубины-3 %.1f%%\n", v.AskGap1*100, v.AskGap3*100)
+	}
+	if v.MarketDisagreement {
+		fmt.Fprintf(&b, "⚠️ Рынок спорит сам с собой на %.0f%% — только руками\n", v.MarketDivergence*100)
 	}
 	fmt.Fprintf(&b, "Конфа %.0f%% · скор %.1f · эдж с риском %.1f%%\n", v.Confidence*100, v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100)
 	if v.FX.Valid {
@@ -142,7 +160,7 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 	fmt.Fprintf(&b, "Ожидаемая продажа ≈ %s\n", days(v.ExpectedDays))
 
 	if lines := a.crossMarketLines(ctx, v); len(lines) > 0 {
-		b.WriteString("\n<b>Другие площадки</b> <i>(только справка — арбитража нет)</i>\n")
+		b.WriteString("\n<b>Другие площадки · участвуют в оценке</b>\n")
 		for _, line := range lines {
 			b.WriteString(line + "\n")
 		}
@@ -201,7 +219,7 @@ func num(v float64) string {
 	case v >= 10:
 		s = trimZeros(strconv.FormatFloat(v, 'f', 1, 64))
 	default:
-		s = trimZeros(strconv.FormatFloat(v, 'f', 2, 64))
+		s = trimZeros(strconv.FormatFloat(v, 'f', 3, 64))
 	}
 	if neg {
 		return "−" + s
@@ -313,8 +331,8 @@ func (a *App) crossMarketLines(ctx context.Context, v pricing.Valuation) []strin
 		if q.Fee > 0 {
 			line += fmt.Sprintf(" (нет %s)", num(q.NetReference()))
 		}
-		if v.Price > 0 {
-			line += fmt.Sprintf(" · %+.0f%% к входу", (q.Reference()/v.Price-1)*100)
+		if v.Cost > 0 {
+			line += fmt.Sprintf(" · %+.0f%% к входу", (q.Reference()/v.Cost-1)*100)
 		}
 		lines = append(lines, line)
 	}
@@ -339,16 +357,8 @@ func askPreview(asks []float64, fallback float64) string {
 // exitExplain says in one clause where the exit price came from, so the number
 // is never an opaque model output.
 func exitExplain(v pricing.Valuation) string {
-	switch v.ExitBasis {
-	case "attribute fair value":
-		return "сопоставимые сделки с поправкой на атрибуты"
-	case "undercut":
-		return fmt.Sprintf("андеркат следующего аска на %s", num(v.CompetingAsk))
-	case "median":
-		return fmt.Sprintf("медиана %d сделок — дешевле, чем андеркатить %s", v.Liq.Sales, num(v.CompetingAsk))
-	default:
-		return fmt.Sprintf("медиана %d сделок, конкурентов нет", v.Liq.Sales)
-	}
+	return fmt.Sprintf("микс: стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%",
+		v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
 }
 
 func attrWithRarity(name string, rarity float64) string {

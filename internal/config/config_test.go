@@ -60,7 +60,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	// Tonnel takes no commission; the default is the referral cut alone.
+	// Tonnel adds the referral charge to the buyer's displayed ask.
 	if c.TonnelFee != 0.005 {
 		t.Errorf("TonnelFee = %v, want 0.005", c.TonnelFee)
 	}

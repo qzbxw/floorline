@@ -18,10 +18,10 @@ const MinAttributeSamples = 5
 const (
 	// marginalPrior is the empirical-Bayes prior weight for the single-attribute
 	// (backdrop-only, symbol-only) premiums.
-	marginalPrior = 10.0
+	marginalPrior = 20.0
 	// interactionPrior is heavier because the exact backdrop+symbol combination
 	// is always the sparsest bucket and the easiest one to overfit.
-	interactionPrior = 20.0
+	interactionPrior = 40.0
 )
 
 // AttributeValue is an empirical-Bayes premium for backdrop, symbol and their
@@ -102,11 +102,12 @@ type ScoreBreakdown struct {
 	DailyROI         float64 `json:"daily_roi"`
 	FillProbability  float64 `json:"fill_probability"`
 	FXFactor         float64 `json:"fx_factor"`
+	DepthFactor      float64 `json:"depth_factor"`
 }
 
 func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 	portfolioFit = clamp(portfolioFit, 0, 1)
-	b := ScoreBreakdown{NetProfit: v.Net, ExpectedDays: v.ExpectedDays, Confidence: v.Confidence, PortfolioFit: portfolioFit, FXFactor: 1}
+	b := ScoreBreakdown{NetProfit: v.Net, ExpectedDays: v.ExpectedDays, Confidence: v.Confidence, PortfolioFit: portfolioFit, FXFactor: 1, DepthFactor: 1}
 	b.SafetyBuffer = .005 + math.Min(.03, v.Liq.MADRatio*.15/math.Sqrt(math.Max(float64(v.Liq.Sales), 1))) + math.Min(.01, float64(v.CompetitorsNear)*.001)
 	b.RiskAdjustedEdge = math.Max(v.Edge-b.SafetyBuffer, 0)
 	b.FillProbability = 1 / (1 + math.Max(v.ExpectedDays, 0)/3)
@@ -116,10 +117,20 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 			b.FXFactor *= .85
 		}
 	}
+	switch {
+	case v.AskGap1 >= .05 || v.AskGap3 >= .08:
+		b.DepthFactor = 1.18
+	case v.AskGap1 > 0 && v.AskGap1 < .02 && v.AskGap3 > 0 && v.AskGap3 < .04:
+		b.DepthFactor = .72
+		b.SafetyBuffer += .01
+	}
+	if v.MarketDisagreement {
+		b.DepthFactor *= .45
+	}
 	if v.Valid && b.RiskAdjustedEdge > 0 && !math.IsInf(v.ExpectedDays, 1) {
 		b.ProfitPerDay = v.Net / math.Max(v.ExpectedDays, .25)
 		b.DailyROI = b.RiskAdjustedEdge / math.Max(v.ExpectedDays, .25)
-		b.Total = b.DailyROI * 10000 * v.Confidence * portfolioFit * b.FillProbability * b.FXFactor
+		b.Total = b.DailyROI * 10000 * v.Confidence * portfolioFit * b.FillProbability * b.FXFactor * b.DepthFactor
 	}
 	return b
 }

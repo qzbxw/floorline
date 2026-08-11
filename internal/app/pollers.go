@@ -66,8 +66,7 @@ func (a *App) pollFeed(ctx context.Context) error {
 			continue
 		}
 		if dec != nil && dec.Signal {
-			a.applyCrossMarketDecision(ctx, dec)
-			if fit, _, err := a.rm.PortfolioFit(ctx, dec.Val.Key, dec.Val.Price); err == nil {
+			if fit, _, err := a.rm.PortfolioFit(ctx, dec.Val.Key, dec.Val.Cost); err == nil {
 				dec.Val.ScoreBreakdown = pricing.BuildScore(dec.Val, fit)
 				dec.Score = dec.Val.ScoreBreakdown.Total
 			}
@@ -85,41 +84,27 @@ func (a *App) pollFeed(ctx context.Context) error {
 	return nil
 }
 
-// applyCrossMarketDecision treats other venues as a sanity check, never as an
-// executable arbitrage quote. A large disagreement makes unattended spending
-// unsafe; a moderate one reduces ranking confidence.
-func (a *App) applyCrossMarketDecision(ctx context.Context, dec *signal.Decision) {
-	if dec == nil || !a.cross.Enabled() || dec.Val.Exit <= 0 {
-		return
+// crossMarketSupport is robust price discovery: each venue contributes the
+// middle of its first three asks, then venues are combined by their median.
+// Gross asks are used because selling on Tonnel has no second referral fee.
+func (a *App) crossMarketSupport(ctx context.Context, v pricing.Valuation) float64 {
+	if !a.cross.Enabled() {
+		return 0
 	}
 	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	quotes := a.cross.QuotesForGift(qctx, dec.Val.Key.Name, dec.Val.Key.Model, dec.Val.Backdrop, dec.Val.Symbol)
-	if len(quotes) == 0 {
-		return
-	}
-	var nets []float64
+	quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
+	var refs []float64
 	for _, q := range quotes {
-		if q.NetReference() > 0 {
-			nets = append(nets, q.NetReference())
+		if ref := q.Reference(); ref > 0 {
+			refs = append(refs, ref)
 		}
 	}
-	if len(nets) == 0 {
-		return
+	if len(refs) == 0 {
+		return 0
 	}
-	sort.Float64s(nets)
-	ext := nets[len(nets)/2]
-	diff := math.Abs(ext/dec.Val.Exit - 1)
-	switch {
-	case diff > .30:
-		dec.Auto = false
-		dec.AutoFails = append(dec.AutoFails, fmt.Sprintf("внешние стаканы расходятся на %.0f%% (вето автобая)", diff*100))
-		dec.Val.Confidence *= .5
-	case diff > .15:
-		dec.Val.Confidence *= .75
-	}
-	dec.Val.ScoreBreakdown = pricing.BuildScore(dec.Val, 1)
-	dec.Score = dec.Val.ScoreBreakdown.Total
+	sort.Float64s(refs)
+	return refs[len(refs)/2]
 }
 
 // handleDecision records a signal, buys it if it clears every unattended gate,
@@ -152,14 +137,26 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 
 	var note string
 	if dec.Auto {
-		allowed, why := a.rm.Allow(ctx, v.Key, v.Price, now)
-		if allowed {
-			// Buy first, explain afterwards — the listing is a race.
-			out, buyErr := a.ex.Buy(ctx, v, dec.Gift, "auto", now)
-			a.notify(a.renderPurchase(ctx, sigID, out, buyErr, true))
-			return nil
+		// Reserve against the worst known referral treatment. The executor later
+		// replaces this estimate with the exact balance debit.
+		permit, why := a.rm.ReservePurchase(ctx, v.Key, v.Cost, now)
+		if permit != nil {
+			defer permit.Release()
+			fresh, freshWhy := a.revalidateAuto(ctx, dec)
+			if freshWhy == "" {
+				costCeiling := fresh.Val.Cost
+				if allowed, riskWhy := a.rm.Allow(ctx, fresh.Val.Key, costCeiling, time.Now()); allowed {
+					out, buyErr := a.ex.Buy(ctx, fresh.Val, fresh.Gift, "auto", time.Now())
+					a.notify(a.renderPurchase(ctx, sigID, out, buyErr, true))
+					return nil
+				} else {
+					freshWhy = riskWhy
+				}
+			}
+			note = "автобай заблокирован после перепроверки: " + freshWhy
+		} else {
+			note = "автобай заблокирован: " + why
 		}
-		note = "автобай заблокирован: " + why
 	} else if len(dec.AutoFails) > 0 {
 		note = "только вручную — " + dec.AutoFails[0]
 	}
@@ -173,6 +170,37 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 	}
 	a.tg.NotifySignal(a.renderCard(ctx, dec, note), sigID, dec.Gift.GiftID.Int(), v.Price)
 	return a.st.MarkSignalSent(ctx, sigID, time.Now())
+}
+
+// revalidateAuto re-reads the listing and every executable market input. A
+// signal is only an invitation to check; no valuation object crosses into the
+// write path without passing all gates again against a forced-fresh book.
+func (a *App) revalidateAuto(ctx context.Context, old *signal.Decision) (*signal.Decision, string) {
+	if old == nil {
+		return nil, "пустое решение"
+	}
+	g, err := a.api.GiftData(ctx, old.Gift.GiftID.Int())
+	if err != nil {
+		return nil, "не удалось перечитать лот: " + err.Error()
+	}
+	if g == nil {
+		return nil, "перепроверка вернула пустой лот"
+	}
+	a.books.Invalidate(old.Val.Key)
+	fresh, err := a.det.EvaluateFresh(ctx, *g, a.rm.Limits(), time.Now())
+	if err != nil {
+		return nil, "не удалось повторить оценку: " + err.Error()
+	}
+	if fresh == nil || !fresh.Signal || !fresh.Auto {
+		if fresh != nil && len(fresh.AutoFails) > 0 {
+			return nil, fresh.AutoFails[0]
+		}
+		if fresh != nil && len(fresh.SignalFails) > 0 {
+			return nil, fresh.SignalFails[0]
+		}
+		return nil, "лот больше не проходит фильтры"
+	}
+	return fresh, ""
 }
 
 // pollStats refreshes the whole-market snapshot. One request covers every model
@@ -438,6 +466,7 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 		costSource, costConfidence := "unknown", 0.0
 		note := "импортирован из инвентаря; цена входа неизвестна — задай через /cost"
 		if found {
+			buyPrice *= 1 + math.Max(a.cfg.TonnelFee, 0)
 			costSource, costConfidence, note = "sale_history", .85, "импортирован из инвентаря; цену входа восстановил по истории сделок"
 		} else {
 			boughtAt = now
@@ -489,6 +518,7 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 		if price, boughtAt, found, err := a.st.AcquisitionForGiftAfter(ctx, id, after); err != nil {
 			return err
 		} else if found {
+			price *= 1 + math.Max(a.cfg.TonnelFee, 0)
 			if err := a.st.SetRecoveredCostBasis(ctx, id, price, boughtAt, "sale_history", .85); err != nil {
 				return err
 			}
@@ -561,9 +591,9 @@ func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time
 	msg := fmt.Sprintf("💰 <b>Продано</b> — %s\nВход %s → выход %s",
 		bot.Esc(p.Key.String()), num(p.BuyPrice), num(price))
 	if p.BuyPrice > 0 && price > 0 {
-		net := price*(1-a.cfg.TonnelFee) - p.BuyPrice
-		msg += fmt.Sprintf("\nНет %s (%+.1f%%) после %.1f%% комиссии, держали %s",
-			num(net), net/p.BuyPrice*100, a.cfg.TonnelFee*100, dur(soldAt.Sub(p.BoughtAt)))
+		net := price - p.BuyPrice
+		msg += fmt.Sprintf("\nНет %s (%+.1f%%), держали %s",
+			num(net), net/p.BuyPrice*100, dur(soldAt.Sub(p.BoughtAt)))
 	}
 	a.notify(msg)
 }
@@ -625,7 +655,7 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 		last, _ := a.st.LastReprice(ctx, p.GiftID)
 		if last.IsZero() || now.Sub(last) >= 6*time.Hour {
 			ad := a.advisePosition(ctx, p, now)
-			if preview := ad.Val; preview.Valid && ad.CrossDivergence <= .30 {
+			if preview := ad.Val; preview.Valid && ad.Action == actRelist && !preview.MarketDisagreement && ad.CrossDivergence <= .15 {
 				target := math.Floor(preview.Exit*100) / 100
 				change := math.Abs(target/p.ListPrice - 1)
 				if target >= p.BuyPrice*(1+a.rm.Limits().MinMarkup) && change >= .02 && change <= .15 {
@@ -742,7 +772,7 @@ func (a *App) maintenance(ctx context.Context) error {
 			if f, ok, _ := a.st.FloorAt(ctx, s.Key, s.TS.Add(time.Duration(h)*time.Hour)); ok {
 				floor = f
 			}
-			profitable := sold && price*(1-a.cfg.TonnelFee) > s.Price
+			profitable := sold && price > s.Price*(1+math.Max(a.cfg.TonnelFee, 0))
 			_ = a.st.PutSignalOutcome(ctx, s.ID, h, now, sold, price, floor, profitable)
 		}
 	}

@@ -193,7 +193,7 @@ func TestNoSignalWhenTheNextAskKillsTheEdge(t *testing.T) {
 // discount on something that trades twice a month is inventory, not profit.
 func TestIlliquidModelIsNotAutoBought(t *testing.T) {
 	h := newHarness(t, 500, 1200)
-	h.seedSales(t, 1200, 16, 6) // clears the signal gate, not the auto gate
+	h.seedSales(t, 1200, 16, 14) // unique gifts clear signal, not the auto gate
 	h.seedStat(t, 500, 5)
 
 	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 500), defaultLimits(), time.Now())
@@ -206,12 +206,12 @@ func TestIlliquidModelIsNotAutoBought(t *testing.T) {
 	if dec.Auto {
 		t.Error("a model with 16 trades in 14 days must not be bought unattended")
 	}
-	if !containsSubstring(dec.AutoFails, "trades") {
+	if !containsSubstring(dec.AutoFails, "сделок") {
 		t.Errorf("auto failures = %v, want one about the trade count", dec.AutoFails)
 	}
 }
 
-// Few distinct sellers is the shape of a self-dealt tape.
+// Repeated flips of a few physical gifts must not manufacture a signal at all.
 func TestWashTradeGuardBlocksAutoBuy(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
 	h.seedSales(t, 1200, 40, 2) // 40 trades, but only two different gifts
@@ -221,14 +221,8 @@ func TestWashTradeGuardBlocksAutoBuy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
-	if dec == nil || !dec.Signal {
-		t.Fatalf("expected a signal, got %+v", dec)
-	}
-	if dec.Auto {
-		t.Error("two gifts behind forty trades must block unattended buying")
-	}
-	if !containsSubstring(dec.AutoFails, "self-dealt") {
-		t.Errorf("auto failures = %v, want the wash-trade guard", dec.AutoFails)
+	if dec != nil && dec.Signal {
+		t.Fatalf("two gifts behind forty prints manufactured a signal: %+v", dec)
 	}
 }
 
@@ -293,28 +287,28 @@ func TestSlowExitBlocksAutoBuy(t *testing.T) {
 	if dec2.Auto {
 		t.Errorf("expected the exit-time limit to block auto-buy, expected days %.2f", dec2.Val.ExpectedDays)
 	}
-	if !containsSubstring(dec2.AutoFails, "max_exit_days") {
+	if !containsSubstring(dec2.AutoFails, "дольше лимита") {
 		t.Errorf("auto failures = %v, want the exit-time limit", dec2.AutoFails)
 	}
 }
 
-// The cheap pre-filter must reject the bulk of the feed without a network call.
-func TestNoBookLookupForHopelessListings(t *testing.T) {
+// A low historical median must not short-circuit live price discovery. That
+// optimisation used to hide exactly the stale-history opportunities the exit
+// model is meant to identify.
+func TestLowMedianStillChecksTheLiveBook(t *testing.T) {
 	h := newHarness(t, 1000, 1100)
 	h.seedSales(t, 1000, 40, 10)
 	h.seedStat(t, 1000, 12)
 
-	// Priced at the median: the exit can never exceed the median, so no edge
-	// is arithmetically possible and the book is irrelevant.
 	dec, err := h.det.Evaluate(context.Background(), gift(1, 1000), defaultLimits(), time.Now())
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
-	if dec != nil {
-		t.Errorf("expected no decision, got signal=%v edge=%.3f", dec.Signal, dec.Val.Edge)
+	if dec == nil {
+		t.Fatal("the live book was never allowed to challenge stale history")
 	}
-	if h.book.calls != 0 {
-		t.Errorf("book was fetched %d times for a hopeless candidate; the pre-filter is not working", h.book.calls)
+	if h.book.calls != 1 {
+		t.Errorf("book was fetched %d times, want one price-discovery read", h.book.calls)
 	}
 }
 
@@ -346,6 +340,21 @@ func TestUntradableRowsAreSkippedEntirely(t *testing.T) {
 	}
 	if h.book.calls != 0 {
 		t.Errorf("untradable rows triggered %d book lookups", h.book.calls)
+	}
+}
+
+func TestOwnListingIsSkippedBeforeBookLookup(t *testing.T) {
+	h := newHarness(t, 800, 1200)
+	h.det.OwnerID = func() int64 { return 777 }
+	g := gift(candidateID, 800)
+	g.Seller = 777
+
+	dec, err := h.det.Evaluate(context.Background(), g, defaultLimits(), time.Now())
+	if err != nil || dec != nil {
+		t.Fatalf("own listing produced decision=%+v err=%v", dec, err)
+	}
+	if h.book.calls != 0 {
+		t.Fatalf("own listing reached the order book: %d calls", h.book.calls)
 	}
 }
 

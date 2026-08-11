@@ -150,7 +150,34 @@ func (c *Client) Feed(ctx context.Context, limit int) ([]Gift, error) {
 func (c *Client) ModelBook(ctx context.Context, key ModelKey, limit int) ([]Gift, error) {
 	f := BaseFilter().WithCollection(key.Name)
 	f.WithAttr("model", key.Model)
-	return c.PageGifts(ctx, PageQuery{Filter: f, Sort: SortPriceAsc, Limit: limit})
+	if limit <= 0 || limit > maxPageLimit {
+		limit = maxPageLimit
+	}
+
+	// Tonnel rejects a seller $ne predicate on pageGifts, so exclusion has to
+	// happen client-side. Keep paging until we have `limit` external asks; this
+	// prevents our inventory from occupying the cheap-page budget.
+	uid := c.UserID()
+	out := make([]Gift, 0, limit)
+	for page := 1; page <= 4 && len(out) < limit; page++ {
+		rows, err := c.PageGifts(ctx, PageQuery{Filter: f, Sort: SortPriceAsc, Page: page, Limit: maxPageLimit})
+		if err != nil {
+			return nil, err
+		}
+		for i := range rows {
+			if uid != 0 && rows[i].Seller.Int() == uid {
+				continue
+			}
+			out = append(out, rows[i])
+			if len(out) == limit {
+				break
+			}
+		}
+		if len(rows) < maxPageLimit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // CollectionBook returns the cheapest asks across a whole collection.
@@ -413,7 +440,38 @@ type Result struct {
 
 // OK reports whether the operation succeeded.
 func (r *Result) OK() bool {
-	return r != nil && !strings.EqualFold(r.Status, "error")
+	if r == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Status)) {
+	case "success", "ok":
+		return true
+	}
+	if ok, exists := r.Raw["ok"].(bool); exists {
+		return ok
+	}
+	if ok, exists := r.Raw["success"].(bool); exists {
+		return ok
+	}
+	return false // an ambiguous write response is never proof of ownership
+}
+
+// Rejected reports an explicit business rejection. Anything else that is not
+// OK is ambiguous and must be reconciled against inventory after a money write.
+func (r *Result) Rejected() bool {
+	if r == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Status), "error") || strings.EqualFold(strings.TrimSpace(r.Status), "failed") {
+		return true
+	}
+	if ok, exists := r.Raw["ok"].(bool); exists {
+		return !ok
+	}
+	if ok, exists := r.Raw["success"].(bool); exists {
+		return !ok
+	}
+	return false
 }
 
 // BuyGift purchases a listing at an exact price.

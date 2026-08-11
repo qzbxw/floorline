@@ -50,6 +50,11 @@ type Detector struct {
 	// Warm reports whether the history is deep enough to trust for auto-buying.
 	Warm             func() bool
 	CalibrationReady func() bool
+	// CrossSupport supplies robust external ask depth before any gate runs.
+	// Leaving it nil simply disables that component.
+	CrossSupport func(context.Context, pricing.Valuation) float64
+	// OwnerID is resolved dynamically because /auth can replace the session.
+	OwnerID func() int64
 }
 
 // New builds a Detector.
@@ -84,6 +89,19 @@ func (d *Detector) params() pricing.Params {
 // can be answered from local data, because the feed produces candidates far
 // faster than the rate limiter permits requests.
 func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time) (*Decision, error) {
+	return d.evaluate(ctx, g, limits, now, true)
+}
+
+// EvaluateFresh repeats every gate without signal deduplication. It is used in
+// the money path after a direct GiftData quote and a forced book refresh.
+func (d *Detector) EvaluateFresh(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time) (*Decision, error) {
+	return d.evaluate(ctx, g, limits, now, false)
+}
+
+func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time, dedupe bool) (*Decision, error) {
+	if d.OwnerID != nil && d.OwnerID() != 0 && g.Seller.Int() == d.OwnerID() {
+		return nil, nil
+	}
 	if !d.tradable(g) {
 		return nil, nil
 	}
@@ -93,12 +111,14 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	}
 	price := g.Price.Float()
 
-	already, err := d.st.AlreadySignalled(ctx, g.GiftID.Int(), KindBuy, price)
-	if err != nil {
-		return nil, fmt.Errorf("dedupe check: %w", err)
-	}
-	if already {
-		return nil, nil
+	if dedupe {
+		already, err := d.st.AlreadySignalled(ctx, g.GiftID.Int(), KindBuy, price)
+		if err != nil {
+			return nil, fmt.Errorf("dedupe check: %w", err)
+		}
+		if already {
+			return nil, nil
+		}
 	}
 
 	attrDays := d.cfg.AttributeLookbackDays
@@ -124,15 +144,10 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	liq := pricing.ComputeLiquidity(fxSales, now, d.window(), d.Coverage())
 	liq.RawMedian, liq.FXCoverage = rawLiq.Median, fxCoverage
 
-	// Cheap pre-filter. The exit price can never exceed the median of recent
-	// trades, so this ceiling on the achievable edge is exact — and it rejects
-	// almost the entire feed without spending a single request.
-	if liq.Median > 0 {
-		best := (liq.Median*(1-d.cfg.TonnelFee) - price) / price
-		if best < d.cfg.Sig.MinEdge {
-			return nil, nil
-		}
-	} else if liq.Sales < d.cfg.Sig.MinSales {
+	// Without enough history the signal gate is guaranteed to fail. A low
+	// median is not a valid early reject: live and cross-market depth may prove
+	// that the old prints are stale.
+	if liq.Median <= 0 && liq.Sales < d.cfg.Sig.MinSales {
 		return nil, nil // no trade history and no chance of clearing the gate
 	}
 
@@ -162,6 +177,7 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 
 	val := pricing.Evaluate(pricing.Input{
 		GiftID:     g.GiftID.Int(),
+		OwnerID:    ownerID(d.OwnerID),
 		Key:        key,
 		Price:      price,
 		Book:       book,
@@ -177,6 +193,11 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		FX:         fxContext,
 		Params:     d.params(),
 	})
+	if d.CrossSupport != nil {
+		if ref := d.CrossSupport(ctx, val); ref > 0 {
+			val = pricing.WithCrossMarket(val, ref)
+		}
+	}
 
 	dec := &Decision{Gift: g, Val: val}
 	if firstSeen, err := d.st.ListingFirstSeen(ctx, g.GiftID.Int()); err == nil && !firstSeen.IsZero() {
@@ -208,6 +229,13 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	}
 
 	return dec, nil
+}
+
+func ownerID(fn func() int64) int64 {
+	if fn == nil {
+		return 0
+	}
+	return fn()
 }
 
 // GatesFor applies the gates to a valuation produced elsewhere. /val uses it to
@@ -298,8 +326,14 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	}
 	if v.Liq.Turnover < a.MinTurnover {
 		fails = append(fails, fmt.Sprintf(
-			"only %d distinct gifts across %d trades (turnover %.2f, auto needs %.2f) — looks self-dealt",
+			"в истории всего %d разных гифтов на %d сделок (оборот %.2f, автобаю надо %.2f) — похоже на гон одного NFT",
 			v.Liq.DistinctGifts, v.Liq.Sales, v.Liq.Turnover, a.MinTurnover))
+	}
+	if v.MarketDisagreement {
+		fails = append(fails, fmt.Sprintf("рынок спорит сам с собой: история и живой стакан разъехались на %.0f%% — только руками", v.MarketDivergence*100))
+	}
+	if v.CrossDivergence > .15 {
+		fails = append(fails, fmt.Sprintf("Tonnel и другие площадки разъехались на %.0f%% — только руками", v.CrossDivergence*100))
 	}
 	if v.Liq.MADRatio > a.MaxMADRatio {
 		fails = append(fails, fmt.Sprintf("разброс цен %.0f%% выше максимума автобая %.0f%%", v.Liq.MADRatio*100, a.MaxMADRatio*100))
@@ -308,7 +342,7 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 		fails = append(fails, fmt.Sprintf("тренд %.2f ниже минимума автобая %.2f", v.Liq.Trend, a.MinTrend))
 	}
 	if limits.MaxExitDays > 0 && v.ExpectedDays > limits.MaxExitDays {
-		fails = append(fails, fmt.Sprintf("ожидаемая продажа %s дольше max_exit_days %.1f",
+		fails = append(fails, fmt.Sprintf("ожидаемая продажа %s дольше лимита %.1fд",
 			days(v.ExpectedDays), limits.MaxExitDays))
 	}
 	if a.MaxDataAge > 0 && v.DataAge > a.MaxDataAge {
@@ -319,8 +353,10 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	} else if a.MaxGramMove15m > 0 && math.Abs(v.FX.Move15m) > a.MaxGramMove15m {
 		fails = append(fails, fmt.Sprintf("GRAM сходил на %+.1f%% за 15м; лимит автобая %.1f%%", v.FX.Move15m*100, a.MaxGramMove15m*100))
 	}
-	if v.ExitBasis == "median (sole ask)" {
+	if !v.HasCompetingAsk {
 		fails = append(fails, "не от чего отталкиваться — конкурентов в стакане нет")
+	} else if v.LiveDepthCount < 2 {
+		fails = append(fails, "в стакане только один чужой аск — для автобая это не глубина")
 	}
 	return fails
 }
@@ -336,10 +372,10 @@ func Score(v pricing.Valuation) float64 {
 
 func days(d float64) string {
 	if math.IsInf(d, 1) {
-		return "never"
+		return "непонятно"
 	}
 	if d < 1 {
-		return fmt.Sprintf("%.0fh", d*24)
+		return fmt.Sprintf("%.0fч", d*24)
 	}
-	return fmt.Sprintf("%.1fd", d)
+	return fmt.Sprintf("%.1fд", d)
 }

@@ -56,18 +56,32 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 	cut := now.Add(-window)
 	cut7 := now.Add(-7 * 24 * time.Hour)
 
-	prices := make([]float64, 0, len(sales))
-	prices7 := make([]float64, 0, len(sales))
-	gifts := make(map[int64]struct{}, len(sales))
+	// A physical gift may be flipped repeatedly. Treating every hop as an
+	// independent print lets one item manufacture velocity and move the median.
+	// Keep only its newest sale in the window; gift_num is the stable physical
+	// identity, with gift_id as a conservative fallback for older rows.
+	latest := make(map[int64]store.SaleRow, len(sales))
 
 	for _, s := range sales {
 		if s.Price <= 0 || s.TS.Before(cut) {
 			continue
 		}
-		prices = append(prices, s.Price)
-		if s.GiftNum != 0 {
-			gifts[s.GiftNum] = struct{}{}
+		physicalID := s.GiftNum
+		if physicalID == 0 {
+			physicalID = s.GiftID
 		}
+		if physicalID == 0 {
+			continue // unverifiable identity must not support unattended trading
+		}
+		if prev, ok := latest[physicalID]; !ok || s.TS.After(prev.TS) {
+			latest[physicalID] = s
+		}
+	}
+
+	prices := make([]float64, 0, len(latest))
+	prices7 := make([]float64, 0, len(latest))
+	for _, s := range latest {
+		prices = append(prices, s.Price)
 		if s.TS.After(l.LastSale) {
 			l.LastSale = s.TS
 		}
@@ -78,7 +92,7 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 
 	l.Sales = len(prices)
 	l.Sales7 = len(prices7)
-	l.DistinctGifts = len(gifts)
+	l.DistinctGifts = len(latest)
 	if l.Sales == 0 {
 		return l
 	}

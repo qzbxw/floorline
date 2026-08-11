@@ -110,6 +110,10 @@ func (c ExitCheck) ContradictsMarket() (bool, string) {
 type Manager struct {
 	st *store.Store
 
+	// purchaseMu turns the read-check-write purchase sequence into one process
+	// critical section. Per-gift idempotency lives in SQLite; this lock protects
+	// portfolio, cooldown and budget limits across different gift ids.
+	purchaseMu    sync.Mutex
 	mu            sync.RWMutex
 	limits        Limits
 	armed         bool
@@ -122,6 +126,39 @@ type Manager struct {
 	// OnDisarm is called whenever the bot disarms itself, so the operator finds
 	// out immediately rather than by noticing nothing is happening.
 	OnDisarm func(reason string)
+}
+
+// PurchasePermit serializes an unattended purchase through its final commit.
+// Release must be called on every path.
+type PurchasePermit struct {
+	m    *Manager
+	once sync.Once
+}
+
+func (p *PurchasePermit) Release() {
+	if p == nil || p.m == nil {
+		return
+	}
+	p.once.Do(p.m.purchaseMu.Unlock)
+}
+
+// LockPurchase serializes an explicit/manual purchase with unattended ones.
+// It deliberately applies no limits; the human confirmation remains the
+// override, but it cannot race an auto purchase through stale portfolio state.
+func (m *Manager) LockPurchase() *PurchasePermit {
+	m.purchaseMu.Lock()
+	return &PurchasePermit{m: m}
+}
+
+// ReservePurchase holds the process-wide money permit after checking limits.
+// A second candidate cannot observe the same uncommitted budget or portfolio.
+func (m *Manager) ReservePurchase(ctx context.Context, key tonnel.ModelKey, price float64, now time.Time) (*PurchasePermit, string) {
+	permit := m.LockPurchase()
+	if ok, why := m.Allow(ctx, key, price, now); !ok {
+		permit.Release()
+		return nil, why
+	}
+	return permit, ""
 }
 
 // New builds a Manager and restores persisted state.

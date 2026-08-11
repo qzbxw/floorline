@@ -23,9 +23,9 @@ type FXContext struct {
 	Valid         bool
 }
 
-// NormalizeSalesForRate expresses historical GRAM prices in today's GRAM by
-// preserving their approximate USD value. A sale without a nearby rate stays
-// raw and reduces coverage rather than being guessed.
+// NormalizeSalesForRate keeps FX as a mild reference, not as the owner of the
+// gift price. Gifts trade in GRAM and collections do not instantly track USD,
+// so a single historical print may move by at most five percent.
 func NormalizeSalesForRate(sales []store.SaleRow, rates []RatePoint, currentUSD float64) ([]store.SaleRow, float64) {
 	out := append([]store.SaleRow(nil), sales...)
 	if currentUSD <= 0 || len(rates) == 0 || len(sales) == 0 {
@@ -38,7 +38,13 @@ func NormalizeSalesForRate(sales []store.SaleRow, rates []RatePoint, currentUSD 
 		if idx < 0 || rates[idx].USD <= 0 || out[i].TS.Sub(rates[idx].TS) > 2*time.Hour {
 			continue
 		}
-		out[i].Price = out[i].Price * rates[idx].USD / currentUSD
+		factor := rates[idx].USD / currentUSD
+		if factor < .95 {
+			factor = .95
+		} else if factor > 1.05 {
+			factor = 1.05
+		}
+		out[i].Price *= factor
 		matched++
 	}
 	return out, float64(matched) / float64(len(out))
@@ -61,7 +67,13 @@ func ComputeFXContext(now time.Time, currentFloor float64, current, at15, at1h R
 		f.Move1h = current.USD/at1h.USD - 1
 	}
 	if currentFloor > 0 && floor1h > 0 && valid1h {
-		f.ExpectedFloor = floor1h * at1h.USD / current.USD
+		factor := at1h.USD / current.USD
+		if factor < .95 {
+			factor = .95
+		} else if factor > 1.05 {
+			factor = 1.05
+		}
+		f.ExpectedFloor = floor1h * factor
 		if f.ExpectedFloor > 0 {
 			f.FloorLag = currentFloor/f.ExpectedFloor - 1
 		}

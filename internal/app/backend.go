@@ -17,6 +17,10 @@ import (
 // data it needs. Shared by /val and the Buy button so both see the same numbers
 // the detector saw.
 func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pricing.Valuation, error) {
+	return a.priceGiftWithCost(ctx, g, 0, now)
+}
+
+func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64, now time.Time) (pricing.Valuation, error) {
 	key := g.Key()
 	if key.Name == "" || key.Model == "" {
 		return pricing.Valuation{Reason: "у лота нет коллекции или модели"}, nil
@@ -29,7 +33,7 @@ func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pric
 	since := now.Add(-time.Duration(attrDays) * 24 * time.Hour)
 	sales, err := a.st.SalesSince(ctx, key, since)
 	if err != nil {
-		return pricing.Valuation{}, fmt.Errorf("load trade history: %w", err)
+		return pricing.Valuation{}, fmt.Errorf("не прочитал историю сделок: %w", err)
 	}
 	rawLiq := pricing.ComputeLiquidity(sales, now, a.window(), a.Coverage())
 	fxSales, fxCoverage, _ := a.normalizeGramSales(ctx, sales, since)
@@ -48,13 +52,14 @@ func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pric
 
 	book, err := a.books.Get(ctx, key)
 	if err != nil {
-		return pricing.Valuation{}, fmt.Errorf("load order book: %w", err)
+		return pricing.Valuation{}, fmt.Errorf("не прочитал стакан: %w", err)
 	}
 
-	return pricing.Evaluate(pricing.Input{
-		GiftID:   g.GiftID.Int(),
+	v := pricing.Evaluate(pricing.Input{
+		GiftID: g.GiftID.Int(), OwnerID: a.api.UserID(),
 		Key:      key,
 		Price:    g.Price.Float(),
+		Cost:     cost,
 		Book:     book,
 		Liq:      liq,
 		Floor:    floor,
@@ -64,7 +69,11 @@ func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pric
 		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
 		SnapshotAt: snapshotAt, Now: now, FX: fxContext,
 		Params: pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut, Window: a.window()},
-	}), nil
+	})
+	if ref := a.crossMarketSupport(ctx, v); ref > 0 {
+		v = pricing.WithCrossMarket(v, ref)
+	}
+	return v, nil
 }
 
 // Status reports the health of every moving part.
@@ -242,7 +251,7 @@ func (a *App) bookText(ctx context.Context, collection, model string) string {
 	}
 	b.WriteString("<pre>" + rows.String() + "</pre>")
 
-	within10 := book.CountBetween(best, best*1.1, 0)
+	within10 := book.CountBetween(best, best*1.1, 0, 0)
 	fmt.Fprintf(&b, "\n%d асков в пределах 10%% от флора.", within10)
 	if a.cross.Enabled() {
 		qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
@@ -386,7 +395,7 @@ func (a *App) pnlText(ctx context.Context) string {
 			unknown++
 			continue
 		}
-		net := p.SellPrice*(1-a.cfg.TonnelFee) - p.BuyPrice
+		net := p.SellPrice - p.BuyPrice
 		realised += net
 		invested += p.BuyPrice
 		if net >= 0 {
@@ -409,7 +418,7 @@ func (a *App) pnlText(ctx context.Context) string {
 			unmarked++
 			continue
 		}
-		unrealised += ad.Val.FastExit*(1-a.cfg.TonnelFee) - p.BuyPrice
+		unrealised += ad.Val.FastExit - p.BuyPrice
 	}
 	tracked, _ := a.st.TrackedPositions(ctx)
 	missing, missingCost := 0, 0.0
@@ -444,7 +453,7 @@ func (a *App) pnlText(ctx context.Context) string {
 		}
 		b.WriteString("Они выше не учтены.</i>\n")
 	}
-	fmt.Fprintf(&b, "\n<i>Открытые считаем по реальному быстрому выходу из живого стакана и комиссии %.1f%%, а не по витринному флору.</i>", a.cfg.TonnelFee*100)
+	fmt.Fprintf(&b, "\n<i>Открытые считаем по быстрому выходу из живого стакана; во входе уже сидит %.1f%% комиссии покупателя.</i>", a.cfg.TonnelFee*100)
 	return b.String()
 }
 
@@ -494,7 +503,7 @@ func (a *App) relistText(ctx context.Context, giftID int64) string {
 	}
 	_ = a.st.RecordReprice(ctx, giftID, p.ListPrice, price, "manual portfolio recommendation", now)
 	_ = a.st.RecordPositionEvent(ctx, giftID, "repriced", p.ListPrice, price, "manual portfolio recommendation", now)
-	net := price*(1-a.cfg.TonnelFee) - p.BuyPrice
+	net := price - p.BuyPrice
 	return fmt.Sprintf("✅ Выставил <b>%s</b> по <b>%s</b>\nВход %s → нет %s если заберут (%+.1f%%)",
 		bot.Esc(p.Key.String()), num(price), num(p.BuyPrice), num(net), net/p.BuyPrice*100)
 }
@@ -642,6 +651,9 @@ func (a *App) setAuthText(ctx context.Context, authData string) string {
 // switch do not apply — but the listing is re-read first, because the card may
 // have been sitting in the chat for a while.
 func (a *App) buySignal(ctx context.Context, signalID int64) (string, int64) {
+	permit := a.rm.LockPurchase()
+	defer permit.Release()
+
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil {
 		return "Не смог прочитать сигнал: " + bot.Esc(err.Error()), 0

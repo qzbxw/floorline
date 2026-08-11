@@ -28,6 +28,47 @@ func newManager(t *testing.T) (*Manager, *store.Store) {
 	return m, st
 }
 
+func TestPurchasePermitSerializesBudgetCheckAndCommit(t *testing.T) {
+	m, _ := armed(t)
+	mustSet(t, m, "daily_budget", "15")
+	mustSet(t, m, "model_cooldown_min", "0")
+	ctx := context.Background()
+	now := time.Now()
+
+	first, why := m.ReservePurchase(ctx, key, 10, now)
+	if first == nil {
+		t.Fatalf("first permit refused: %s", why)
+	}
+	type result struct {
+		permit *PurchasePermit
+		why    string
+	}
+	done := make(chan result, 1)
+	go func() {
+		p, reason := m.ReservePurchase(ctx, tonnel.ModelKey{Name: "Other", Model: "X"}, 10, now)
+		done <- result{p, reason}
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("second permit passed the uncommitted first purchase")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := m.Commit(ctx, 10, now); err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+
+	r := <-done
+	if r.permit != nil {
+		r.permit.Release()
+		t.Fatal("second permit ignored the committed daily budget")
+	}
+	if !strings.Contains(r.why, "бюджет") {
+		t.Fatalf("second refusal = %q, want budget reason", r.why)
+	}
+}
+
 // armed returns a manager with workable limits already configured.
 func armed(t *testing.T) (*Manager, *store.Store) {
 	t.Helper()

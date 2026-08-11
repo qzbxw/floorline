@@ -39,8 +39,8 @@ func TestComputeLiquidityBasics(t *testing.T) {
 
 	l := ComputeLiquidity(sales, now, window, window)
 
-	if l.Sales != 6 {
-		t.Errorf("sales = %d, want 6", l.Sales)
+	if l.Sales != 5 {
+		t.Errorf("sales = %d, want 5 unique physical gifts", l.Sales)
 	}
 	if l.Sales7 != 3 {
 		t.Errorf("sales in the last 7 days = %d, want 3", l.Sales7)
@@ -51,11 +51,26 @@ func TestComputeLiquidityBasics(t *testing.T) {
 	if l.Median != 100 {
 		t.Errorf("median = %v, want 100", l.Median)
 	}
-	if math.Abs(l.Velocity-6.0/14) > 1e-9 {
-		t.Errorf("velocity = %v, want %v", l.Velocity, 6.0/14)
+	if math.Abs(l.Velocity-5.0/14) > 1e-9 {
+		t.Errorf("velocity = %v, want %v", l.Velocity, 5.0/14)
 	}
 	if !l.Traded() {
 		t.Error("a model with six trades must count as traded")
+	}
+}
+
+func TestRepeatedSalesOfOnePhysicalGiftCountOnce(t *testing.T) {
+	now := time.Now()
+	l := ComputeLiquidity(salesAt(now,
+		entry{0.1, 70, 7}, entry{1, 100, 7}, entry{2, 100, 7},
+		entry{3, 120, 8},
+	), now, 14*24*time.Hour, 14*24*time.Hour)
+
+	if l.Sales != 2 || l.DistinctGifts != 2 {
+		t.Fatalf("liquidity = %+v, want two independent physical gifts", l)
+	}
+	if l.Median != 95 {
+		t.Errorf("median = %v, want newest sale of gift 7 (70) and gift 8 (120)", l.Median)
 	}
 }
 

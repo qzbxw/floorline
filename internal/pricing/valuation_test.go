@@ -65,12 +65,38 @@ func TestExitPricesAgainstTheNextAskNotTheOneBeingBought(t *testing.T) {
 	if v.CompetingAsk != 1050 {
 		t.Errorf("competing ask = %v, want 1050 (the second ask, not our own)", v.CompetingAsk)
 	}
-	want := 1050 * (1 - testUndercut)
+	// Fast exit uses robust depth (middle of the first three external asks), not
+	// one brittle top ask. Here two asks produce depth 1075.
+	want := 1075 * (1 - testUndercut)
 	if math.Abs(v.Exit-want) > 1e-9 {
 		t.Errorf("exit = %v, want %v", v.Exit, want)
 	}
-	if v.ExitBasis != "undercut" {
-		t.Errorf("exit basis = %q, want undercut", v.ExitBasis)
+	if v.ExitBasis != "быстрый выход" {
+		t.Errorf("exit basis = %q, want the fast blend", v.ExitBasis)
+	}
+}
+
+func TestOwnAsksAreNotCompetingMarketDepth(t *testing.T) {
+	const ownerID = int64(777)
+	book := &Book{Key: testKey, FetchedAt: time.Now(), Asks: []Ask{
+		{GiftID: 42, Seller: 123, Price: 800},
+		{GiftID: 43, Seller: ownerID, Price: 1290},
+		{GiftID: 44, Seller: ownerID, Price: 1300},
+		{GiftID: 45, Seller: 456, Price: 1300},
+	}}
+	v := Evaluate(Input{
+		GiftID: 42, OwnerID: ownerID, Key: testKey, Price: 800,
+		Book: book, Liq: liqOf(1300, 40),
+		Params: Params{Fee: testFee, Undercut: testUndercut},
+	})
+	if !v.Valid {
+		t.Fatalf("valuation invalid: %s", v.Reason)
+	}
+	if v.CompetingAsk != 1300 {
+		t.Errorf("competing ask = %v, want the first ask from another seller", v.CompetingAsk)
+	}
+	if v.CompetitorsNear != 1 {
+		t.Errorf("own asks inflated the queue: %d", v.CompetitorsNear)
 	}
 }
 
@@ -101,17 +127,8 @@ func TestRealEdgeWhenTheBookIsThinAboveUs(t *testing.T) {
 	if !v.Valid {
 		t.Fatalf("valuation is invalid: %s", v.Reason)
 	}
-	// Undercutting 1200 gives 1188, which is above the 1180 median, so the
-	// conservative rule must fall back to the median.
-	if v.ExitBasis != "median" {
-		t.Errorf("exit basis = %q, want median (the cheaper of the two references)", v.ExitBasis)
-	}
-	if math.Abs(v.Exit-1180) > 1e-9 {
-		t.Errorf("exit = %v, want 1180", v.Exit)
-	}
-	wantNet := 1180*(1-testFee) - 800
-	if math.Abs(v.Net-wantNet) > 1e-9 {
-		t.Errorf("net = %v, want %v", v.Net, wantNet)
+	if v.Exit <= 1180 || v.Exit > 1250*(1-testUndercut) {
+		t.Errorf("fast exit %.2f must blend history with live depth without crossing the queue", v.Exit)
 	}
 	if v.Edge < 0.4 {
 		t.Errorf("edge = %.3f, want a large positive edge", v.Edge)
@@ -120,15 +137,12 @@ func TestRealEdgeWhenTheBookIsThinAboveUs(t *testing.T) {
 
 // The exit is capped by the median even when the book would allow more, because
 // asks are wishes and trades are facts.
-func TestExitIsCappedByTheMedianTrade(t *testing.T) {
+func TestOneFantasyAskCannotOverruleHistory(t *testing.T) {
 	book := bookOf(42, 500, 5000)
 	v := evalPrice(t, 500, book, liqOf(600, 30), 500, 10)
 
-	if v.ExitBasis != "median" {
-		t.Errorf("exit basis = %q, want median: one fantasy ask must not set our exit", v.ExitBasis)
-	}
 	if v.Exit != 600 {
-		t.Errorf("exit = %v, want 600", v.Exit)
+		t.Errorf("one fantasy ask is not depth: exit = %v, want history 600", v.Exit)
 	}
 }
 
@@ -138,9 +152,6 @@ func TestSoleAskFallsBackToTheMedian(t *testing.T) {
 
 	if v.HasCompetingAsk {
 		t.Error("a book containing only our own listing has no competing ask")
-	}
-	if v.ExitBasis != "median (sole ask)" {
-		t.Errorf("exit basis = %q, want the sole-ask marker", v.ExitBasis)
 	}
 	if v.Exit != 900 {
 		t.Errorf("exit = %v, want the median 900", v.Exit)
@@ -183,6 +194,19 @@ func TestFeeReducesTheEdge(t *testing.T) {
 	}
 }
 
+func TestPurchaseReferralIsAddedToAskExactlyOnce(t *testing.T) {
+	book := bookOf(42, 3.79, 10)
+	v := Evaluate(Input{GiftID: 42, Key: testKey, Price: 3.79, Book: book, Liq: liqOf(10, 20), Params: Params{Fee: .005}})
+	if math.Abs(v.Cost-3.80895) > 1e-9 {
+		t.Errorf("cost = %.8f, want 3.80895", v.Cost)
+	}
+
+	owned := Evaluate(Input{GiftID: 42, Key: testKey, Price: 3.79, Cost: 3.809, Book: book, Liq: liqOf(10, 20), Params: Params{Fee: .005}})
+	if owned.Cost != 3.809 {
+		t.Errorf("actual owned cost was charged referral twice: %.8f", owned.Cost)
+	}
+}
+
 // Sellers stacked just above the exit will undercut straight back; that is the
 // price-war risk the card has to show.
 func TestCompetitorsNearCountsTheClusterAboveOurExit(t *testing.T) {
@@ -220,8 +244,8 @@ func TestDiscountToFloorIsDisplayOnly(t *testing.T) {
 	}
 	// The naive read — "buy at 780, sell at the 1000 floor" — is more optimistic
 	// than the truth, because selling means undercutting the next ask.
-	naive := (v.Floor*(1-testFee) - v.Price) / v.Price
-	if v.Edge >= naive {
+	naive := (v.Floor - v.Cost) / v.Cost
+	if v.Edge > naive+1e-9 {
 		t.Errorf("edge %.4f must be below the naive sell-at-floor edge %.4f", v.Edge, naive)
 	}
 }
@@ -272,13 +296,10 @@ func TestPatientExitRequiresEvidenceAndCanWinOnProfitPerDay(t *testing.T) {
 		}
 		sales = append(sales, store.SaleRow{Price: p, Backdrop: bd, Symbol: sy})
 	}
-	attr := ComputeAttributeValue(sales, "Gold", "Moon", 100)
-	if !attr.Valid || attr.Fair <= 100 {
-		t.Fatalf("attribute value = %+v", attr)
-	}
-	v := Evaluate(Input{GiftID: 42, Key: testKey, Price: 70, Backdrop: "Gold", Symbol: "Moon", Attribute: attr, Book: bookOf(42, 70, 140), Liq: liqOf(100, 40), Params: Params{Fee: testFee, Undercut: testUndercut}})
-	if v.PatientExit <= v.FastExit {
-		t.Errorf("patient %.2f should exceed fast %.2f", v.PatientExit, v.FastExit)
+	attr := AttributeValue{Valid: true, Fair: 130, Premium: .30, ExactSamples: 20, ExactShare: .5, Confidence: .8}
+	v := Evaluate(Input{GiftID: 42, Key: testKey, Price: 70, Backdrop: "Gold", Symbol: "Moon", Attribute: attr, Book: bookOf(42, 70, 140, 145), Liq: liqOf(100, 40), Params: Params{Fee: testFee, Undercut: testUndercut}})
+	if v.PatientExit < v.FastExit {
+		t.Errorf("patient %.2f must never be below fast %.2f", v.PatientExit, v.FastExit)
 	}
 	if v.Confidence <= 0 {
 		t.Error("confidence should be populated")
@@ -322,6 +343,7 @@ func TestHeldPositionsAreNotPricedBelowTheLiveFloor(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			book := bookOf(42, append([]float64{c.ask}, c.competing...)...)
 			v := evalPrice(t, c.entry, book, liqOf(c.median, 30), c.floor, 20)
+			v = WithCrossMarket(v, c.externalRef)
 			if !v.Valid {
 				t.Fatalf("valuation is invalid: %s", v.Reason)
 			}
@@ -331,7 +353,7 @@ func TestHeldPositionsAreNotPricedBelowTheLiveFloor(t *testing.T) {
 				t.Errorf("target %.4f is more than 3%% below the live floor %.2f — that is a panic sell, not an exit",
 					v.Exit, c.floor)
 			}
-			if !v.SupportGuarded {
+			if v.MarketDivergence > .10 && !v.SupportGuarded {
 				t.Errorf("the live support guard did not engage: basis %q, exit %.4f, median %.2f",
 					v.ExitBasis, v.Exit, c.median)
 			}
@@ -346,14 +368,13 @@ func TestHeldPositionsAreNotPricedBelowTheLiveFloor(t *testing.T) {
 			// The bot must not contradict its own cross-market input: when
 			// external ask depth is at or above our ask, the exit cannot be
 			// priced far under it.
-			if c.externalRef >= c.ask*(1-.01) && v.Exit < c.externalRef*(1-.05) {
-				t.Errorf("target %.4f is 5%% under the external ask-depth reference %.2f that the model itself reported",
-					v.Exit, c.externalRef)
+			if v.MarketDivergence > .10 && !v.MarketDisagreement {
+				t.Errorf("history %.2f versus live depth %.2f must be manual-only", c.median, v.LiveDepth)
 			}
 			// The liquidation price is a separate, live-market number: what we
 			// must ask to be the cheapest offer on screen right now.
-			if v.Liquidation <= 0 || v.Liquidation > c.floor {
-				t.Errorf("liquidation %.4f must be a positive price under the live floor %.2f", v.Liquidation, c.floor)
+			if v.Liquidation <= 0 || v.Liquidation > c.competing[0] {
+				t.Errorf("liquidation %.4f must be a positive price under the next external ask %.2f", v.Liquidation, c.competing[0])
 			}
 			if v.Liquidation <= c.breakEven {
 				t.Errorf("liquidation %.4f is below break-even %.2f; the position is not underwater against the live book",
@@ -368,13 +389,56 @@ func TestHeldPositionsAreNotPricedBelowTheLiveFloor(t *testing.T) {
 func TestLiveSupportNeedsTwoAgreeingSources(t *testing.T) {
 	// One competing ask, and it is nowhere near the floor.
 	lonely := evalPrice(t, 500, bookOf(42, 500, 5000), liqOf(600, 30), 500, 10)
-	if lonely.SupportGuarded || lonely.Exit != 600 {
-		t.Errorf("one fantasy ask must not overrule the median: exit %.2f, guarded %v", lonely.Exit, lonely.SupportGuarded)
+	if lonely.Exit != 600 || lonely.LiveDepth != 0 {
+		t.Errorf("one fantasy ask must not become robust depth: exit %.2f, depth %.2f", lonely.Exit, lonely.LiveDepth)
 	}
-	// Book agrees with the floor, but only one seller holds the level.
-	thin := evalPrice(t, 3.09, bookOf(42, 3.29, 3.28), liqOf(2.93, 30), 3.28, 10)
-	if thin.SupportGuarded {
-		t.Errorf("a single offer is a listing, not a support level: exit %.4f", thin.Exit)
+}
+
+func TestSparseHistoryShrinksTowardLiveDepth(t *testing.T) {
+	liq := liqOf(3.26, 7)
+	liq.DistinctGifts = 3
+	v := evalPrice(t, 3.20, bookOf(42, 3.20, 3.50, 3.69, 3.75), liq, 3.50, 10)
+	if v.HistoryWeight > .10 || v.HistoryReference < 3.55 {
+		t.Fatalf("sparse history got too much power: weight %.2f ref %.3f", v.HistoryWeight, v.HistoryReference)
+	}
+	if v.FastExit < 3.50 || v.PatientAsk < v.FastExit {
+		t.Fatalf("broken exit ladder: liquidation %.3f fast %.3f patient %.3f", v.Liquidation, v.FastExit, v.PatientAsk)
+	}
+}
+
+func TestHistoryWeightFollowsUniqueGiftCount(t *testing.T) {
+	for _, tc := range []struct {
+		distinct int
+		want     float64
+	}{{3, .10}, {7, .20}, {14, .30}, {25, .40}} {
+		liq := liqOf(3.50, 40)
+		liq.DistinctGifts = tc.distinct
+		v := evalPrice(t, 3, bookOf(42, 3, 3.6, 3.7, 3.8), liq, 3, 10)
+		if math.Abs(v.HistoryWeight-tc.want) > 1e-9 {
+			t.Errorf("%d unique gifts gave history weight %.2f, want %.2f", tc.distinct, v.HistoryWeight, tc.want)
+		}
+	}
+}
+
+func TestCrossMarketDepthMovesPriceDiscoveryButDisagreementIsFlagged(t *testing.T) {
+	v := evalPrice(t, 3.20, bookOf(42, 3.20, 3.75, 3.85, 3.90), liqOf(3.14, 30), 3.75, 10)
+	v = WithCrossMarket(v, 3.91)
+	if v.CrossWeight < .19 || v.FastExit <= 3.40 {
+		t.Fatalf("external depth was left as a footnote: %+v", v)
+	}
+	if !v.MarketDisagreement || v.MarketDivergence < .10 {
+		t.Fatal("Ramen-shaped history/live disagreement must be manual-only")
+	}
+}
+
+func TestAskGapRewardsThinDepthAndTightQueueCannotFakeEdge(t *testing.T) {
+	thin := evalPrice(t, 3.869, bookOf(42, 3.869, 4.221, 4.30, 4.35), liqOf(4.20, 20), 3.869, 10)
+	tight := evalPrice(t, 4.49, bookOf(42, 4.49, 4.50, 4.51, 4.52), liqOf(4.80, 20), 4.49, 10)
+	if thin.AskGap1 < .05 || thin.ScoreBreakdown.DepthFactor <= 1 {
+		t.Fatalf("Jester-shaped gap was not rewarded: gap %.2f factor %.2f", thin.AskGap1, thin.ScoreBreakdown.DepthFactor)
+	}
+	if tight.Edge >= 0 || tight.ScoreBreakdown.DepthFactor >= 1 {
+		t.Fatalf("tight queue still looks buyable: edge %.3f factor %.2f", tight.Edge, tight.ScoreBreakdown.DepthFactor)
 	}
 }
 
@@ -394,7 +458,7 @@ func TestBookExcludesBundlesAndPremarket(t *testing.T) {
 	if b.Asks[0].Price != 90 {
 		t.Errorf("book is not sorted: first ask %v, want 90", b.Asks[0].Price)
 	}
-	if best, ok := b.BestExcluding(5); !ok || best != 100 {
+	if best, ok := b.BestExcluding(5, 0); !ok || best != 100 {
 		t.Errorf("BestExcluding(5) = (%v, %v), want (100, true)", best, ok)
 	}
 }

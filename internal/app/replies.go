@@ -429,11 +429,11 @@ func (a *App) renderPurchase(ctx context.Context, sigID int64, out *exec.Outcome
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "✅ <b>%s</b> — %s\nКупил по %s", kind, bot.Esc(out.Key.String()), num(out.BuyPrice))
+	fmt.Fprintf(&b, "✅ <b>%s</b> — %s\nЛистинг %s · реально списалось %s", kind, bot.Esc(out.Key.String()), num(out.AskPrice), num(out.BuyPrice))
 	if out.Listed {
-		gain := out.ListPrice*(1-a.cfg.TonnelFee) - out.BuyPrice
-		fmt.Fprintf(&b, "\nВыставил по %s → нет %s если заберут (%+.1f%%)",
-			num(out.ListPrice), num(gain), gain/out.BuyPrice*100)
+		gain := out.ListPrice - out.BuyPrice
+		fmt.Fprintf(&b, "\nОжидаемая продажа %s · на руки %s\nНет %s (%+.1f%%)",
+			num(out.ListPrice), num(out.ListPrice), num(gain), gain/out.BuyPrice*100)
 	} else {
 		b.WriteString("\n⚠️ <b>Не выставил.</b>")
 	}

@@ -2,66 +2,35 @@ package pricing
 
 import (
 	"math"
+	"sort"
 	"time"
 
 	"floorline/internal/tonnel"
 )
 
-const (
-	// supportAgreement is how far above the snapshot floor the live book may
-	// sit and still be describing the same market. A book far above the floor
-	// means the floor is stale or was filtered out, so the two do not
-	// corroborate each other.
-	supportAgreement = 0.15
-	// supportBand is the width of the shelf we look for at the support level.
-	supportBand = 0.10
-	// supportSellers is how many live offers must hold that shelf before it may
-	// overrule the trade history. One offer is a listing; two is a market.
-	supportSellers = 2
-)
-
-// liveSupport is the cheapest price the market is currently offering, returned
-// only when the order book and the market snapshot independently agree on it.
-// Two sources are required because this number is allowed to overrule realised
-// trades, and a single stale ask must never be able to do that.
-func liveSupport(in Input, v Valuation) (float64, bool) {
-	if in.Book == nil || !v.HasCompetingAsk || in.Floor <= 0 {
-		return 0, false
-	}
-	if v.CompetingAsk > in.Floor*(1+supportAgreement) {
-		return 0, false
-	}
-	support := math.Min(in.Floor, v.CompetingAsk)
-	if in.Book.CountBetween(support, support*(1+supportBand), in.GiftID) < supportSellers {
-		return 0, false
-	}
-	return support, true
-}
+const marketDisagreementLimit = 0.10
 
 // Params are the economics of a round trip.
 type Params struct {
-	// Fee is the fraction of the sale price that does not reach you. Tonnel
-	// charges no commission, so this is the referral cut only (~0.5%) — which
-	// is exactly why the entry bar here is set by liquidity and not by fees.
-	Fee float64
-	// Undercut is how far below the best competing ask we assume we must list
-	// in order to be the one that sells.
+	// Fee is paid only on purchase. The seller receives the displayed ask and
+	// Tonnel does not take the same fee from our sale a second time.
+	Fee      float64
 	Undercut float64
-	// Window is the trade-history lookback.
-	Window time.Duration
+	Window   time.Duration
 }
 
-// Input is everything needed to price one listing.
 type Input struct {
-	GiftID int64
-	Key    tonnel.ModelKey
-	Price  float64
+	GiftID  int64
+	OwnerID int64
+	Key     tonnel.ModelKey
+	Price   float64
+	Cost    float64
 
 	Book *Book
 	Liq  Liquidity
 
-	Floor      float64 // model floor from the full-market snapshot
-	Supply     int     // listed count for the model
+	Floor      float64
+	Supply     int
 	Rarity     float64
 	Backdrop   string
 	Symbol     string
@@ -69,225 +38,88 @@ type Input struct {
 	SnapshotAt time.Time
 	Now        time.Time
 	FX         FXContext
-
-	Params Params
+	Params     Params
 }
 
-// Valuation is the full opinion on a single listing.
+// Valuation keeps four different questions separate. Liquidation is an
+// emergency price, FastExit is the only price used for BUY, FairValue is price
+// discovery, and PatientAsk is what can reasonably be listed and waited for.
 type Valuation struct {
 	Key    tonnel.ModelKey
 	GiftID int64
 
-	Price     float64
-	Floor     float64
-	Supply    int
-	Rarity    float64
-	Backdrop  string
-	Symbol    string
-	Attribute AttributeValue
+	Price, Cost, Floor float64
+	Supply             int
+	Rarity             float64
+	Backdrop, Symbol   string
+	Attribute          AttributeValue
 
-	// CompetingAsk is the cheapest ask that is NOT this listing.
 	CompetingAsk    float64
 	HasCompetingAsk bool
+	LiveDepth       float64
+	LiveDepthCount  int
+	DepthPrice3     float64
+	AskGap1         float64
+	AskGap3         float64
 
-	Exit      float64 // the price we expect to actually sell at
-	ExitBasis string  // which reference set the exit price
-	Proceeds  float64 // exit net of fees
-	Net       float64 // proceeds minus entry
-	Edge      float64 // net / entry
+	HistoryReference   float64
+	CrossMarketSupport float64
+	HistoryWeight      float64
+	LiveWeight         float64
+	CrossWeight        float64
+	TraitWeight        float64
 
-	// Liquidation is the "out today" price: undercut everything the market is
-	// currently showing, the visible book and the snapshot floor alike. It is a
-	// fact about live offers and is deliberately kept separate from Exit, which
-	// is a modelled opinion built partly on trade history.
-	Liquidation      float64
-	LiquidationBasis string
+	Exit, Proceeds, Net, Edge float64
+	ExitBasis                 string
+	Liquidation               float64
+	LiquidationBasis          string
+	FastExit                  float64
+	FairValue                 float64
+	PatientAsk                float64
+	PatientExit               float64 // compatibility alias for older callers
+	BearCase                  float64
 
-	// Support is the cheapest price the live market is actually offering, and
-	// is only populated when two independent readings agree on it: the
-	// market-snapshot floor and a book with more than one seller holding that
-	// shelf. SupportGuarded records that it had to overrule the trade history.
-	Support        float64
-	SupportGuarded bool
+	Support            float64
+	SupportGuarded     bool
+	MarketDisagreement bool
+	MarketDivergence   float64
+	CrossDivergence    float64
 
-	DiscountToFloor float64 // headline "-22%", for display only
-
-	Liq             Liquidity
-	CompetitorsNear int     // asks clustered just above our exit
-	DaysOfSupply    float64 // listed supply divided by trade rate
-	ExpectedDays    float64 // rough time to actually get filled
-
-	FastExit            float64
+	DiscountToFloor     float64
+	Liq                 Liquidity
+	CompetitorsNear     int
+	DaysOfSupply        float64
+	ExpectedDays        float64
 	FastExpectedDays    float64
-	PatientExit         float64
 	PatientExpectedDays float64
-	ChosenExit          string // fast | patient
+	ChosenExit          string
 	Confidence          float64
 	DataAge             time.Duration
 	ScoreBreakdown      ScoreBreakdown
 	FX                  FXContext
 
 	Valid  bool
-	Reason string // why the valuation is unusable, when it is
+	Reason string
+	input  Input
 }
 
-// Evaluate prices a single listing.
-//
-// The trigger every other tool gets wrong is the exit price. "20% below floor"
-// is meaningless when the listing you are buying *is* the floor: the moment you
-// own it, the price you have to beat is the next ask up. So the exit is modelled
-// as undercutting the best *competing* ask, and then capped by what the model
-// has actually been trading at — whichever is worse.
 func Evaluate(in Input) Valuation {
-	v := Valuation{
-		Key:       in.Key,
-		GiftID:    in.GiftID,
-		Price:     in.Price,
-		Floor:     in.Floor,
-		Supply:    in.Supply,
-		Rarity:    in.Rarity,
-		Backdrop:  in.Backdrop,
-		Symbol:    in.Symbol,
-		Attribute: in.Attribute,
-		Liq:       in.Liq,
-		FX:        in.FX,
+	cost := in.Cost
+	if cost <= 0 {
+		cost = in.Price * (1 + math.Max(in.Params.Fee, 0))
 	}
-
+	v := Valuation{
+		Key: in.Key, GiftID: in.GiftID, Price: in.Price, Cost: cost,
+		Floor: in.Floor, Supply: in.Supply, Rarity: in.Rarity,
+		Backdrop: in.Backdrop, Symbol: in.Symbol, Attribute: in.Attribute,
+		Liq: in.Liq, FX: in.FX, input: in,
+	}
 	if in.Price <= 0 {
-		v.Reason = "listing has no price"
+		v.Reason = "у листинга нет цены"
 		return v
 	}
 	if in.Floor > 0 {
 		v.DiscountToFloor = (in.Floor - in.Price) / in.Floor
-	}
-
-	undercut := in.Params.Undercut
-	if undercut < 0 || undercut >= 1 {
-		undercut = 0
-	}
-
-	if in.Book != nil {
-		v.CompetingAsk, v.HasCompetingAsk = in.Book.BestExcluding(in.GiftID)
-	}
-	med := in.Liq.Median
-
-	undercutPrice := 0.0
-	if v.HasCompetingAsk {
-		undercutPrice = v.CompetingAsk * (1 - undercut)
-	}
-	// The liquidation price answers a different question from the exit: not
-	// "what is this worth" but "what do I have to ask to be the cheapest offer
-	// on screen right now". It undercuts every live reference we hold.
-	switch {
-	case v.HasCompetingAsk && in.Floor > 0:
-		v.Liquidation = math.Min(v.CompetingAsk, in.Floor) * (1 - undercut)
-		v.LiquidationBasis = "undercut of live ask depth"
-	case v.HasCompetingAsk:
-		v.Liquidation, v.LiquidationBasis = undercutPrice, "undercut of best competing ask"
-	case in.Floor > 0:
-		v.Liquidation, v.LiquidationBasis = in.Floor*(1-undercut), "undercut of the model floor"
-	}
-
-	switch {
-	case v.HasCompetingAsk && med > 0:
-		if undercutPrice <= med {
-			v.Exit, v.ExitBasis = undercutPrice, "undercut"
-		} else {
-			v.Exit, v.ExitBasis = med, "median"
-		}
-	case v.HasCompetingAsk:
-		v.Exit, v.ExitBasis = undercutPrice, "undercut"
-	case med > 0:
-		// Nobody else is offering this model. We would be the only ask, so the
-		// trade history is the only defensible reference.
-		v.Exit, v.ExitBasis = med, "median (sole ask)"
-	default:
-		v.Reason = "no exit reference: neither a competing ask nor any trade history"
-		return v
-	}
-
-	// The median is a statistic about the past. When every live offer sits
-	// above it — the order book and the snapshot floor both — the median is
-	// stale rather than conservative, and pricing off it means listing under a
-	// market that never actually dropped. That is how a held position gets a
-	// "target" 11% below the floor it could sell at today.
-	if support, ok := liveSupport(in, v); ok {
-		v.Support = support
-		if guard := math.Min(undercutPrice, support); v.Exit < guard {
-			v.Exit, v.ExitBasis, v.SupportGuarded = guard, "live support", true
-		}
-	}
-
-	if v.Exit <= 0 {
-		v.Reason = "computed exit price is not positive"
-		return v
-	}
-
-	v.Proceeds = v.Exit * (1 - in.Params.Fee)
-	v.Net = v.Proceeds - in.Price
-	v.Edge = v.Net / in.Price
-
-	// Sellers clustered just above our exit will undercut us straight back, so
-	// this is the price-war risk, not the "wall to climb".
-	if in.Book != nil {
-		v.CompetitorsNear = in.Book.CountBetween(v.Exit, v.Exit*1.05, in.GiftID)
-	}
-
-	if in.Liq.Velocity > 0 {
-		v.DaysOfSupply = float64(in.Supply) / in.Liq.Velocity
-		v.ExpectedDays = float64(1+v.CompetitorsNear) / in.Liq.Velocity
-	} else {
-		v.DaysOfSupply = math.Inf(1)
-		v.ExpectedDays = math.Inf(1)
-	}
-	// A fast exit means "priced to be lifted against the book that is on screen
-	// right now", i.e. just under live ask depth — not "the low end of a sparse
-	// sale history". Without a corroborated support level there is no live depth
-	// to anchor to and the modelled exit is all there is.
-	v.FastExit = v.Exit
-	if v.Support > 0 && undercutPrice > 0 {
-		if anchored := math.Min(undercutPrice, v.Support); anchored > v.FastExit {
-			v.FastExit = anchored
-		}
-	}
-	v.FastExpectedDays = v.ExpectedDays
-	if v.FastExit != v.Exit && in.Book != nil && in.Liq.Velocity > 0 {
-		queue := in.Book.CountBetween(v.FastExit, v.FastExit*1.05, in.GiftID)
-		v.FastExpectedDays = float64(1+queue) / in.Liq.Velocity
-	}
-	v.ChosenExit = "fast"
-	v.Confidence = confidence(in.Liq, in.Attribute)
-
-	// A patient exit is allowed only when attributes have evidence. It is
-	// independently capped by the next genuinely comparable ask.
-	if in.Attribute.Valid && in.Attribute.Fair > 0 {
-		patient := in.Attribute.Fair
-		if in.Book != nil {
-			if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.Backdrop, in.Symbol); ok {
-				patient = math.Min(patient, ask*(1-undercut))
-			}
-		}
-		share := math.Max(in.Attribute.ExactShare, 0.05)
-		velocity := in.Liq.Velocity * share
-		queue := 0
-		if in.Book != nil {
-			queue = in.Book.CountAttributesBetween(patient, patient*1.05, in.GiftID, in.Backdrop, in.Symbol)
-		}
-		if velocity > 0 {
-			v.PatientExpectedDays = float64(1+queue) / velocity
-		} else {
-			v.PatientExpectedDays = math.Inf(1)
-		}
-		v.PatientExit = patient
-		fastProfitDay := (v.FastExit*(1-in.Params.Fee) - in.Price) / math.Max(v.FastExpectedDays, .25)
-		patientProfitDay := (patient*(1-in.Params.Fee) - in.Price) / math.Max(v.PatientExpectedDays, .25)
-		if in.Attribute.Confidence >= .55 && patientProfitDay > fastProfitDay {
-			v.Exit, v.ExpectedDays, v.ChosenExit = patient, v.PatientExpectedDays, "patient"
-			v.ExitBasis = "attribute fair value"
-			v.Proceeds = v.Exit * (1 - in.Params.Fee)
-			v.Net = v.Proceeds - in.Price
-			v.Edge = v.Net / in.Price
-		}
 	}
 	if !in.Now.IsZero() {
 		bookAt := time.Time{}
@@ -298,13 +130,239 @@ func Evaluate(in Input) Valuation {
 			if at.IsZero() {
 				continue
 			}
-			age := in.Now.Sub(at)
-			if age > v.DataAge {
+			if age := in.Now.Sub(at); age > v.DataAge {
 				v.DataAge = age
 			}
 		}
 	}
-	v.Valid = true
-	v.ScoreBreakdown = BuildScore(v, 1)
+	recompute(&v)
 	return v
+}
+
+// WithCrossMarket promotes external depth from a footnote to a pricing input.
+// It intentionally recomputes every dependent number, including BUY edge.
+func WithCrossMarket(v Valuation, support float64) Valuation {
+	if support <= 0 {
+		return v
+	}
+	v.CrossMarketSupport = support
+	recompute(&v)
+	return v
+}
+
+func recompute(v *Valuation) {
+	in := v.input
+	undercut := in.Params.Undercut
+	if undercut < 0 || undercut >= 1 {
+		undercut = 0
+	}
+
+	v.Valid, v.Reason = false, ""
+	v.CompetingAsk, v.HasCompetingAsk = 0, false
+	v.LiveDepth, v.DepthPrice3, v.AskGap1, v.AskGap3, v.LiveDepthCount = 0, 0, 0, 0, 0
+	var external []Ask
+	if in.Book != nil {
+		external = in.Book.ExternalAsks(in.GiftID, in.OwnerID)
+	}
+	if len(external) > 0 {
+		v.CompetingAsk, v.HasCompetingAsk = external[0].Price, true
+		v.LiveDepthCount = minInt(3, len(external))
+		if len(external) >= 2 {
+			v.LiveDepth = medianFirst(external, 3)
+		}
+		v.DepthPrice3 = external[minInt(2, len(external)-1)].Price
+		if v.Price > 0 {
+			v.AskGap1 = math.Max(0, external[0].Price/v.Price-1)
+			v.AskGap3 = math.Max(0, v.DepthPrice3/v.Price-1)
+		}
+	}
+
+	// The snapshot floor may still be the candidate we are about to remove.
+	// Liquidation therefore follows the next external ask; floor is only a
+	// fallback when no book depth is available.
+	liveFloor := v.CompetingAsk
+	if liveFloor <= 0 {
+		liveFloor = in.Floor
+	}
+	if liveFloor > 0 {
+		v.Liquidation = liveFloor * (1 - undercut)
+		v.LiquidationBasis = "живой стакан"
+		if v.LiveDepthCount < 2 && in.Liq.Median > 0 && in.Liq.Median < v.Liquidation {
+			v.Liquidation = in.Liq.Median
+			v.LiquidationBasis = "история при тонком стакане"
+		}
+	}
+
+	hw := historyWeight(in.Liq.DistinctGifts)
+	if in.Liq.Median <= 0 {
+		hw = 0
+	}
+	tw := 0.0
+	if in.Attribute.Valid && in.Attribute.ExactSamples >= MinAttributeSamples && in.Attribute.Fair > 0 {
+		tw = .05
+	}
+	cw := 0.0
+	if v.CrossMarketSupport > 0 {
+		cw = .20
+	}
+	lw := 0.0
+	if v.LiveDepth > 0 {
+		lw = math.Max(0, 1-hw-cw-tw)
+	}
+	if lw == 0 && hw+cw+tw == 0 {
+		v.Reason = "нет нормальной опоры для выхода"
+		return
+	}
+
+	// Sparse history is first pulled towards the live market and only then
+	// allowed into the blend. Seven trades over three gifts cannot drag a live
+	// 3.70 book down to a stale 3.26 median.
+	v.HistoryReference = in.Liq.Median
+	if in.Liq.Median > 0 && v.LiveDepth > 0 {
+		trust := hw / .40
+		v.HistoryReference = v.LiveDepth + (in.Liq.Median-v.LiveDepth)*trust
+		v.MarketDivergence = math.Abs(in.Liq.Median/v.LiveDepth - 1)
+		v.MarketDisagreement = v.MarketDivergence > marketDisagreementLimit
+	}
+	if v.CrossMarketSupport > 0 && v.LiveDepth > 0 {
+		v.CrossDivergence = math.Abs(v.CrossMarketSupport/v.LiveDepth - 1)
+	}
+
+	// If the live source is missing, redistribute its weight rather than
+	// silently losing part of the estimate.
+	total := lw + hw + cw + tw
+	if total <= 0 {
+		v.Reason = "не из чего собрать цену выхода"
+		return
+	}
+	lw, hw, cw, tw = lw/total, hw/total, cw/total, tw/total
+	v.LiveWeight, v.HistoryWeight, v.CrossWeight, v.TraitWeight = lw, hw, cw, tw
+
+	liveFast := v.LiveDepth
+	if liveFast > 0 {
+		liveFast *= 1 - undercut
+	}
+	v.FastExit = weighted(
+		component{liveFast, lw}, component{v.HistoryReference, hw},
+		component{v.CrossMarketSupport, cw}, component{in.Attribute.Fair, tw},
+	)
+	// History can pull a live price down, but cannot lift a fast exit through
+	// the visible queue. External depth may raise that ceiling only when an
+	// independent venue confirms it.
+	ceiling := liveFast
+	if v.CrossMarketSupport > 0 {
+		ceiling = math.Max(ceiling, v.CrossMarketSupport*(1-undercut))
+	}
+	if ceiling > 0 && v.FastExit > ceiling {
+		v.FastExit = ceiling
+	}
+	v.FairValue = weighted(
+		component{v.LiveDepth, lw}, component{v.HistoryReference, hw},
+		component{v.CrossMarketSupport, cw}, component{in.Attribute.Fair, tw},
+	)
+	if v.FastExit <= 0 {
+		v.Reason = "быстрый выход не посчитался"
+		return
+	}
+	if v.Liquidation > 0 && v.FastExit < v.Liquidation {
+		v.FastExit = v.Liquidation
+	}
+	v.PatientAsk = math.Max(v.FastExit, v.FairValue)
+	if in.Attribute.Valid && in.Attribute.ExactSamples >= MinAttributeSamples && in.Book != nil {
+		if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.OwnerID, in.Backdrop, in.Symbol); ok {
+			v.PatientAsk = math.Max(v.FastExit, math.Min(v.PatientAsk, ask*(1-undercut)))
+		}
+	}
+	v.PatientExit = v.PatientAsk
+	if in.Liq.Trend > 0 && in.Liq.Trend < .98 {
+		v.BearCase = math.Min(v.FastExit, v.FairValue*in.Liq.Trend)
+	}
+
+	v.Support = v.LiveDepth
+	v.SupportGuarded = in.Liq.Median > 0 && v.LiveDepth > in.Liq.Median*(1+marketDisagreementLimit) && v.FastExit > in.Liq.Median
+	v.Exit, v.ExitBasis, v.ChosenExit = v.FastExit, "быстрый выход", "быстрый"
+	v.Proceeds = v.FastExit
+	v.Net = v.Proceeds - v.Cost
+	v.Edge = v.Net / v.Cost
+
+	if in.Book != nil {
+		v.CompetitorsNear = in.Book.CountBetween(v.FastExit, v.FastExit*1.05, in.GiftID, in.OwnerID)
+	}
+	if in.Liq.Velocity > 0 {
+		v.DaysOfSupply = float64(in.Supply) / in.Liq.Velocity
+		v.FastExpectedDays = float64(1+v.CompetitorsNear) / in.Liq.Velocity
+		v.ExpectedDays = v.FastExpectedDays
+		share := math.Max(in.Attribute.ExactShare, .05)
+		if !in.Attribute.Valid {
+			share = .25
+		}
+		queue := 0
+		if in.Book != nil {
+			queue = in.Book.CountAttributesBetween(v.PatientAsk, v.PatientAsk*1.05, in.GiftID, in.OwnerID, in.Backdrop, in.Symbol)
+		}
+		v.PatientExpectedDays = float64(1+queue) / (in.Liq.Velocity * share)
+	} else {
+		v.DaysOfSupply, v.ExpectedDays, v.FastExpectedDays, v.PatientExpectedDays = math.Inf(1), math.Inf(1), math.Inf(1), math.Inf(1)
+	}
+	v.Confidence = confidence(in.Liq, in.Attribute)
+	if v.MarketDisagreement {
+		v.Confidence *= .65
+	}
+	v.Valid = true
+	v.ScoreBreakdown = BuildScore(*v, 1)
+}
+
+type component struct{ value, weight float64 }
+
+func weighted(cs ...component) float64 {
+	sum, weight := 0.0, 0.0
+	for _, c := range cs {
+		if c.value <= 0 || c.weight <= 0 {
+			continue
+		}
+		sum += c.value * c.weight
+		weight += c.weight
+	}
+	if weight == 0 {
+		return 0
+	}
+	return sum / weight
+}
+
+func historyWeight(distinct int) float64 {
+	switch {
+	case distinct < 5:
+		return .10
+	case distinct < 10:
+		return .20
+	case distinct < 20:
+		return .30
+	default:
+		return .40
+	}
+}
+
+func medianFirst(asks []Ask, n int) float64 {
+	if len(asks) == 0 {
+		return 0
+	}
+	if n > len(asks) {
+		n = len(asks)
+	}
+	prices := make([]float64, n)
+	for i := 0; i < n; i++ {
+		prices[i] = asks[i].Price
+	}
+	sort.Float64s(prices)
+	if n%2 == 1 {
+		return prices[n/2]
+	}
+	return (prices[n/2-1] + prices[n/2]) / 2
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

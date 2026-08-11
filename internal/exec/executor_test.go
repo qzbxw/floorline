@@ -3,6 +3,7 @@ package exec
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,6 +25,11 @@ type fakeAPI struct {
 
 	bookPrices []float64
 	owned      []int64
+	quote      tonnel.Gift
+	apiOwner   int64
+	balance    float64
+	buyFee     float64
+	balanceErr error
 
 	buyCalls  []buyCall
 	listCalls []listCall
@@ -43,6 +49,27 @@ type listCall struct {
 	price  float64
 }
 
+func (f *fakeAPI) UserID() int64 { return f.apiOwner }
+
+func (f *fakeAPI) GiftData(_ context.Context, giftID int64) (*tonnel.Gift, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g := f.quote
+	if g.GiftID.Int() == 0 {
+		g.GiftID = tonnel.FlexInt(giftID)
+	}
+	return &g, nil
+}
+
+func (f *fakeAPI) Balance(context.Context) (*tonnel.Balance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.balanceErr != nil {
+		return nil, f.balanceErr
+	}
+	return &tonnel.Balance{GRAM: f.balance}, nil
+}
+
 func (f *fakeAPI) BuyGift(ctx context.Context, giftID int64, price float64) (*tonnel.Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -50,6 +77,7 @@ func (f *fakeAPI) BuyGift(ctx context.Context, giftID int64, price float64) (*to
 	if f.buyResult != nil || f.buyErr != nil {
 		return f.buyResult, f.buyErr
 	}
+	f.balance -= price * (1 + f.buyFee)
 	// A successful purchase takes the lot off the market, so the relist that
 	// follows must price against a book that no longer contains it.
 	for i, p := range f.bookPrices {
@@ -138,7 +166,13 @@ func newHarness(t *testing.T, bookPrices ...float64) *harness {
 	}
 
 	cfg := &config.Config{TonnelFee: 0.005, Undercut: 0.01, LookbackDays: 14, BookCacheTTL: time.Nanosecond}
-	api := &fakeAPI{bookPrices: bookPrices}
+	api := &fakeAPI{
+		bookPrices: bookPrices,
+		balance:    10000,
+		buyFee:     cfg.TonnelFee,
+		quote: tonnel.Gift{GiftID: 1, Name: key.Name, Model: key.Model + " (0.4%)",
+			Price: tonnel.Flex64(bookPrices[0]), Asset: tonnel.AssetGRAM, Seller: 999},
+	}
 	books := pricing.NewBookCache(api, cfg.BookCacheTTL, 10)
 
 	return &harness{ex: New(api, st, books, rm, cfg), api: api, st: st, rm: rm}
@@ -184,23 +218,22 @@ func TestBuyThenRelistAtTheUndercutPrice(t *testing.T) {
 		t.Fatalf("the gift was bought but never relisted: %s", out.Note)
 	}
 
-	// The book has no ask below 1200 apart from ours, so the exit is 1200×0.99,
-	// capped by the 1200 median — 1188 either way.
-	if len(h.api.lists()) != 1 || h.api.lists()[0].price != 1188 {
-		t.Errorf("list calls = %+v, want one at 1188", h.api.lists())
+	// Fast exit blends the robust first-three depth with the sale history.
+	if len(h.api.lists()) != 1 || h.api.lists()[0].price != 1207.65 {
+		t.Errorf("list calls = %+v, want one at 1207.65", h.api.lists())
 	}
 
 	pos, err := h.st.GetPosition(ctx, 1)
 	if err != nil || pos == nil {
 		t.Fatalf("position not recorded: %v", err)
 	}
-	if pos.Status != store.StatusListed || pos.BuyPrice != 800 || pos.ListPrice != 1188 {
-		t.Errorf("position = %+v, want listed at 1188 with an entry of 800", pos)
+	if pos.Status != store.StatusListed || pos.BuyPrice != 804 || pos.ListPrice != 1207.65 {
+		t.Errorf("position = %+v, want listed at 1207.65 with an actual debit of 804", pos)
 	}
 
 	spend, _ := h.st.SpendToday(ctx, time.Now().UTC().Format("2006-01-02"))
-	if spend.Spent != 800 || spend.Buys != 1 {
-		t.Errorf("ledger = %+v, want 800 across one buy", spend)
+	if spend.Spent != 804 || spend.Buys != 1 {
+		t.Errorf("ledger = %+v, want actual debit 804 across one buy", spend)
 	}
 }
 
@@ -220,6 +253,58 @@ func TestSecondAttemptOnTheSameListingIsRefused(t *testing.T) {
 	}
 	if len(h.api.buys()) != 1 {
 		t.Errorf("the marketplace was asked to buy %d times, want 1", len(h.api.buys()))
+	}
+}
+
+func TestFinalQuoteChangeAbortsBeforeMoneyMoves(t *testing.T) {
+	h := newHarness(t, 800, 1200)
+	h.api.quote.Price = 801
+
+	out, err := h.ex.Buy(context.Background(), valuation(800), candidate(800), "auto", time.Now())
+	if err == nil || out.Bought {
+		t.Fatalf("changed final quote was bought: out=%+v err=%v", out, err)
+	}
+	if len(h.api.buys()) != 0 {
+		t.Fatal("BuyGift was called after the final quote changed")
+	}
+}
+
+func TestFinalQuoteRejectsOwnListing(t *testing.T) {
+	h := newHarness(t, 800, 1200)
+	h.api.quote.Seller = 77
+	h.api.apiOwner = 77
+
+	out, err := h.ex.Buy(context.Background(), valuation(800), candidate(800), "auto", time.Now())
+	if err == nil || out.Bought || len(h.api.buys()) != 0 {
+		t.Fatalf("own listing reached buy: out=%+v err=%v calls=%v", out, err, h.api.buys())
+	}
+}
+
+func TestPurchaseCostIncludesReferralButWireQuoteDoesNot(t *testing.T) {
+	h := newHarness(t, 3.79, 10)
+	h.seedSales(t, 10, 30)
+
+	out, err := h.ex.Buy(context.Background(), valuation(3.79), candidate(3.79), "auto", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(out.BuyPrice-3.80895) > 1e-9 {
+		t.Errorf("actual cost = %.8f, want 3.80895", out.BuyPrice)
+	}
+	if calls := h.api.buys(); len(calls) != 1 || calls[0].price != 3.79 {
+		t.Errorf("wire buy calls = %+v, want exact ask 3.79", calls)
+	}
+}
+
+func TestAmbiguousSuccessResponseRequiresOwnershipReconciliation(t *testing.T) {
+	h := newHarness(t, 800, 1200)
+	h.seedSales(t, 1200, 30)
+	h.api.buyResult = &tonnel.Result{}
+	h.api.owned = []int64{1}
+
+	out, err := h.ex.Buy(context.Background(), valuation(800), candidate(800), "auto", time.Now())
+	if err != nil || !out.Bought {
+		t.Fatalf("owned gift was not reconciled: out=%+v err=%v", out, err)
 	}
 }
 
@@ -243,7 +328,7 @@ func TestNoRelistWhenTheMarketMovedBelowTheFloorPrice(t *testing.T) {
 	if len(h.api.lists()) != 0 {
 		t.Errorf("list was called %d times, want none", len(h.api.lists()))
 	}
-	if !strings.Contains(out.Note, "market moved") {
+	if !strings.Contains(out.Note, "рынок уехал") {
 		t.Errorf("note = %q, want an explanation of the refusal", out.Note)
 	}
 
@@ -367,15 +452,14 @@ func TestRelistPricesAgainstTheLiveBook(t *testing.T) {
 	if note != "" {
 		t.Errorf("unexpected note: %s", note)
 	}
-	// Our own gift is not in the fake book, so the cheapest competing ask is
-	// 1500 and the undercut lands at 1485 — below the 2000 median.
-	if price != 1485 {
-		t.Errorf("list price = %v, want 1485", price)
+	// Two live asks establish depth at 1550; the fast exit sits just under it.
+	if price != 1534.5 {
+		t.Errorf("list price = %v, want 1534.5", price)
 	}
 
 	pos, _ := h.st.GetPosition(ctx, 1)
-	if pos.Status != store.StatusListed || pos.ListPrice != 1485 {
-		t.Errorf("position = %+v, want listed at 1485", pos)
+	if pos.Status != store.StatusListed || pos.ListPrice != 1534.5 {
+		t.Errorf("position = %+v, want listed at 1534.5", pos)
 	}
 }
 

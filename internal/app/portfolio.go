@@ -21,6 +21,7 @@ type positionAdvice struct {
 	Action, Reason  string
 	CrossReference  float64
 	CrossDivergence float64
+	CapitalPressure float64
 	// FloorGuarded records that a sell recommendation was withheld because the
 	// live market contradicted it. It is not a normal hold and says so.
 	FloorGuarded bool
@@ -44,7 +45,7 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		return ad
 	}
 	g := tonnel.Gift{GiftID: tonnel.FlexInt(p.GiftID), Name: p.Key.Name, Model: p.Key.Model, Backdrop: p.Backdrop, Symbol: p.Symbol, Price: tonnel.Flex64(p.BuyPrice), Asset: tonnel.AssetGRAM}
-	v, err := a.priceGift(ctx, g, now)
+	v, err := a.priceGiftWithCost(ctx, g, p.BuyPrice, now)
 	ad.Val = v
 	if err != nil || !v.Valid {
 		if err != nil {
@@ -54,25 +55,8 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		}
 		return ad
 	}
-	// The cross-market reference has to be in hand *before* the action is
-	// decided. A target under the live floor means one thing when external ask
-	// depth has dropped too, and the exact opposite when it has not.
-	if a.cross.Enabled() {
-		qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
-		cancel()
-		var refs []float64
-		for _, q := range quotes {
-			if q.NetReference() > 0 {
-				refs = append(refs, q.NetReference())
-			}
-		}
-		if len(refs) > 0 {
-			sort.Float64s(refs)
-			ad.CrossReference = refs[len(refs)/2]
-			ad.CrossDivergence = math.Abs(ad.CrossReference/v.Exit - 1)
-		}
-	}
+	ad.CrossReference = v.CrossMarketSupport
+	ad.CrossDivergence = v.CrossDivergence
 
 	ask := p.ListPrice
 	if ask <= 0 {
@@ -82,16 +66,28 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 	contradicted, why := check.ContradictsMarket()
 
 	limits := a.rm.Limits()
+	bal, balanceKnown := a.rm.Balance()
+	ad.CapitalPressure = capitalPressure(bal, balanceKnown, limits.MinBalanceReserve)
+	slow := limits.MaxExitDays > 0 && v.ExpectedDays > limits.MaxExitDays
 	switch {
+	case v.MarketDisagreement:
+		ad.Action = actReview
+		ad.Reason = fmt.Sprintf("рынок спорит сам с собой на %.0f%% — аск не трогаем, сначала проверяем руками", v.MarketDivergence*100)
 	case contradicted:
 		// Withhold the sell rather than downgrade it silently: every path out of
 		// here is downward (the target sits under the floor, which sits at or
 		// under our ask), so relisting into it is just a slower panic sell.
 		ad.Action, ad.FloorGuarded = actHold, true
 		ad.Reason = why + "; аск не трогаем — выходить только явным подтверждением /exit"
-	case v.Net < 0 || (limits.MaxExitDays > 0 && v.ExpectedDays > limits.MaxExitDays):
+	case v.Net < 0:
 		ad.Action = actExit
-		ad.Reason = "деньги заморожены или консервативный выход ниже входа; нужно ручное подтверждение"
+		ad.Reason = "быстрый выход ниже входа; минус фиксируем только руками"
+	case slow && ad.CapitalPressure > 0:
+		ad.Action = actExit
+		ad.Reason = fmt.Sprintf("позиция долгая, а запас кэша просел на %.0f%%; выход только с ручным подтверждением", ad.CapitalPressure*100)
+	case slow:
+		ad.Action = actHold
+		ad.Reason = "позиция долгая, но свободного кэша хватает — паниковать и лить во флор незачем"
 	case p.ListPrice <= 0 || math.Abs(p.ListPrice/v.Exit-1) >= .02:
 		ad.Action = actRelist
 		ad.Reason = "текущий аск расходится с лучшим выходом с поправкой на риск"
@@ -99,13 +95,20 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		ad.Action = actHold
 		ad.Reason = "аск в пределах 2% от рекомендованного выхода"
 	}
-	if ad.CrossDivergence > .30 && !ad.FloorGuarded {
+	if ad.CrossDivergence > .15 && !ad.FloorGuarded {
 		ad.Reason += fmt.Sprintf("; расхождение с внешними стаканами %.0f%% — проверь руками", ad.CrossDivergence*100)
 		if ad.Action == actHold || ad.Action == actRelist {
 			ad.Action = actReview
 		}
 	}
 	return ad
+}
+
+func capitalPressure(balance float64, known bool, desiredReserve float64) float64 {
+	if !known || desiredReserve <= 0 {
+		return 0
+	}
+	return math.Max(0, 1-balance/desiredReserve)
 }
 
 func (a *App) adviceText(ctx context.Context, giftID int64) string {
@@ -124,31 +127,28 @@ func (a *App) adviceText(ctx context.Context, giftID int64) string {
 	}
 	fmt.Fprintf(&b, "Вход %s (%s, конфа %.0f%%) · аск %s\n", num(p.BuyPrice), bot.Esc(p.CostSource), p.CostConfidence*100, num(p.ListPrice))
 	if p.BuyPrice > 0 {
-		breakEven := p.BuyPrice / (1 - a.cfg.TonnelFee)
+		breakEven := p.BuyPrice
 		fmt.Fprintf(&b, "Куплено %s · держим %s · безубыток %s\n", dt(p.BoughtAt), dur(time.Since(p.BoughtAt)), num(breakEven))
 		if p.ListPrice > 0 {
-			fmt.Fprintf(&b, "Наценка %+.1f%% · нет если заберут %+.1f%%\n", (p.ListPrice/p.BuyPrice-1)*100, (p.ListPrice*(1-a.cfg.TonnelFee)/p.BuyPrice-1)*100)
+			fmt.Fprintf(&b, "Наценка %+.1f%% · нет если заберут %+.1f%%\n", (p.ListPrice/p.BuyPrice-1)*100, (p.ListPrice/p.BuyPrice-1)*100)
 		}
 	}
 	if ad.Val.Valid {
 		v := ad.Val
-		fmt.Fprintf(&b, "Быстрый выход %s за ~%s", num(v.FastExit), days(v.FastExpectedDays))
-		if v.PatientExit > 0 {
-			fmt.Fprintf(&b, " · терпеливый %s за ~%s", num(v.PatientExit), days(v.PatientExpectedDays))
-		}
-		b.WriteString("\n")
-		if v.Liquidation > 0 {
-			fmt.Fprintf(&b, "Слить прямо сейчас %s (%s)", num(v.Liquidation), bot.Esc(v.LiquidationBasis))
-			if v.Floor > 0 {
-				fmt.Fprintf(&b, " · живой флор %s", num(v.Floor))
-			}
-			b.WriteString("\n")
+		fmt.Fprintf(&b, "Слить сейчас %s · быстрый выход %s за ~%s\n", num(v.Liquidation), num(v.FastExit), days(v.FastExpectedDays))
+		fmt.Fprintf(&b, "Фэйр %s · терпеливый аск %s за ~%s\n", num(v.FairValue), num(v.PatientAsk), days(v.PatientExpectedDays))
+		if v.BearCase > 0 {
+			fmt.Fprintf(&b, "Если рынок поплывёт: %s\n", num(v.BearCase))
 		}
 		fmt.Fprintf(&b, "Рекомендую <b>%s</b> · нет %s (%+.1f%%) · %.2f GRAM/день\n", num(v.Exit), num(v.Net), v.Edge*100, v.ScoreBreakdown.ProfitPerDay)
 		if v.SupportGuarded {
 			fmt.Fprintf(&b, "Выход удержан на живой поддержке %s — история сделок (медиана %s) ниже всех живых офферов\n", num(v.Support), num(v.Liq.Median))
 		}
-		fmt.Fprintf(&b, "Конфа %.0f%% · премия за атрибуты %+.1f%% (%d точных сделок)\n", v.Confidence*100, v.Attribute.Premium*100, v.Attribute.ExactSamples)
+		if v.Attribute.Valid && v.Attribute.ExactSamples >= pricing.MinAttributeSamples {
+			fmt.Fprintf(&b, "Конфа %.0f%% · трейты %+.1f%% (%d точных сделок)\n", v.Confidence*100, v.Attribute.Premium*100, v.Attribute.ExactSamples)
+		} else {
+			fmt.Fprintf(&b, "Конфа %.0f%% · по трейтам данных мало, в цену не лезут\n", v.Confidence*100)
+		}
 		if ad.CrossReference > 0 {
 			fmt.Fprintf(&b, "Внешняя глубина асков %s · расхождение %.0f%%\n", num(ad.CrossReference), ad.CrossDivergence*100)
 		}
@@ -184,13 +184,13 @@ func (a *App) positionHistoryText(ctx context.Context, giftID int64) string {
 		fmt.Fprintf(&b, "⚠️ Пропал из инвентаря с %s, продажу не засчитываю.\n", dt(p.MissingSince))
 	}
 	if p.SellPrice > 0 && p.BuyPrice > 0 {
-		net := p.SellPrice*(1-a.cfg.TonnelFee) - p.BuyPrice
+		net := p.SellPrice - p.BuyPrice
 		fmt.Fprintf(&b, "Продано %s GRAM · зафиксировано %s (%+.1f%%)\n", num(p.SellPrice), num(net), net/p.BuyPrice*100)
 	}
 	if len(cycles) > 0 {
 		b.WriteString("\n<b>Закрытые циклы</b>\n")
 		for _, c := range cycles {
-			net := c.SellPrice*(1-a.cfg.TonnelFee) - c.BuyPrice
+			net := c.SellPrice - c.BuyPrice
 			roi := 0.0
 			if c.BuyPrice > 0 {
 				roi = net / c.BuyPrice * 100
@@ -238,7 +238,7 @@ func (a *App) portfolioText(ctx context.Context) string {
 	}
 	now := time.Now()
 	ads := make([]positionAdvice, 0, len(ps))
-	invested, nav, profitDay := 0.0, 0.0, 0.0
+	invested, nav, expectedNet, evDay, weightedDays, daysCapital := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 	collections := map[string]float64{}
 	models := map[string]float64{}
 	for _, p := range ps {
@@ -247,8 +247,13 @@ func (a *App) portfolioText(ctx context.Context) string {
 		invested += p.BuyPrice
 		mark := p.ListPrice
 		if ad.Val.Valid {
-			mark = ad.Val.FastExit * (1 - a.cfg.TonnelFee)
-			profitDay += math.Max(ad.Val.ScoreBreakdown.ProfitPerDay, 0)
+			mark = ad.Val.FastExit
+			expectedNet += ad.Val.Net
+			evDay += ad.Val.Net / math.Max(ad.Val.ExpectedDays, .25)
+			if !math.IsInf(ad.Val.ExpectedDays, 0) && !math.IsNaN(ad.Val.ExpectedDays) {
+				weightedDays += ad.Val.ExpectedDays * p.BuyPrice
+				daysCapital += p.BuyPrice
+			}
 		}
 		nav += mark
 		collections[p.Key.Name] += mark
@@ -259,7 +264,14 @@ func (a *App) portfolioText(ctx context.Context) string {
 	}
 	sort.Slice(ads, func(i, j int) bool { return ads[i].Val.ScoreBreakdown.Total > ads[j].Val.ScoreBreakdown.Total })
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>Портфель · %d позиций</b>\nКонсервативная оценка %s GRAM · вложено %s · ожидаем %.2f GRAM/день\n", len(ps), num(nav), num(invested), profitDay)
+	avgDays, efficiency := 0.0, 0.0
+	if invested > 0 {
+		efficiency = evDay / invested * 100
+	}
+	if daysCapital > 0 {
+		avgDays = weightedDays / daysCapital
+	}
+	fmt.Fprintf(&b, "<b>Портфель · %d позиций</b>\nКонсервативная оценка %s GRAM · вложено %s\nОжидаемый нет %s · выход в среднем ~%s · EV/день %s · эффективность %+.2f%%/день\n", len(ps), num(nav), num(invested), num(expectedNet), days(avgDays), num(evDay), efficiency)
 	topCollection, topCollectionValue, topModel, topModelValue := "", 0.0, "", 0.0
 	for k, v := range collections {
 		if v > topCollectionValue {

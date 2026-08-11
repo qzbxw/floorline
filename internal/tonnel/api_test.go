@@ -94,6 +94,37 @@ func TestDecodeIntoSurfacesErrorEnvelope(t *testing.T) {
 	}
 }
 
+func TestWriteResultRequiresExplicitSuccess(t *testing.T) {
+	for name, r := range map[string]*Result{
+		"nil":          nil,
+		"empty":        {},
+		"message only": {Message: "done"},
+		"error":        {Status: "error"},
+	} {
+		if r.OK() {
+			t.Errorf("%s result was accepted as a successful money write", name)
+		}
+	}
+	for name, r := range map[string]*Result{
+		"status":   {Status: "success"},
+		"raw ok":   {Raw: map[string]any{"ok": true}},
+		"raw flag": {Raw: map[string]any{"success": true}},
+	} {
+		if !r.OK() {
+			t.Errorf("%s result was not accepted", name)
+		}
+	}
+}
+
+func TestWriteResultDistinguishesRejectionFromAmbiguity(t *testing.T) {
+	if !(&Result{Status: "error"}).Rejected() {
+		t.Fatal("explicit error was not classified as rejection")
+	}
+	if (&Result{}).Rejected() || (*Result)(nil).Rejected() {
+		t.Fatal("empty response was classified as a definite rejection")
+	}
+}
+
 func TestUserIDFromAuth(t *testing.T) {
 	auth := `query_id=AAA&user=%7B%22id%22%3A6083232778%2C%22first_name%22%3A%22A%22%7D&auth_date=1700000000&hash=abc`
 	id, err := userIDFromAuth(auth)

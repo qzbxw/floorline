@@ -60,7 +60,7 @@ type Config struct {
 	DBPath   string
 	LogLevel string
 
-	TonnelFee  float64 // 0.005 — referral fee only; Tonnel takes no commission
+	TonnelFee  float64 // 0.005 purchase referral added on top of the displayed ask
 	PortalsFee float64 // cross-market comparison only
 	MrktFee    float64 // cross-market comparison only
 	Undercut   float64 // how far below the best competing ask we model our exit
