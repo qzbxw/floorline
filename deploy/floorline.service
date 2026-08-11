@@ -1,0 +1,23 @@
+[Unit]
+Description=Floorline Telegram gift trading desk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/floorline
+ExecStart=/root/floorline/floorline run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/root/floorline
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
