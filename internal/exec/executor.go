@@ -303,7 +303,11 @@ func (e *Executor) relist(ctx context.Context, giftID int64, key tonnel.ModelKey
 		Params:    pricing.Params{Fee: e.cfg.TonnelFee, Undercut: e.cfg.Undercut},
 	})
 	if prior.CrossMarketSupport > 0 {
-		val = pricing.WithCrossMarket(val, prior.CrossMarketSupport)
+		// Carry the whole cross-market picture, not just the headline number:
+		// the queue behind it is what caps an over-optimistic exit.
+		cm := prior.Cross
+		cm.Support = prior.CrossMarketSupport
+		val = pricing.WithCrossDepth(val, cm)
 	}
 	if !val.Valid {
 		return 0, "не выставил: " + val.Reason, nil

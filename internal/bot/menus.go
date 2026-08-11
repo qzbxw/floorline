@@ -174,8 +174,8 @@ func marketActionMenu(action string) Reply {
 	}
 	return Reply{
 		Text: "💰 <b>Оценка лота</b>\n\n" +
-			"Пришли <code>/val ID</code> — ID видно в ссылке лота на Tonnel.\n\n" +
-			"Например: <code>/val 10368454</code>",
+			"Самый быстрый путь: в мини-аппе Tonnel жми <b>Share</b> на гифте и кидай ссылку сюда — просто сообщением, без команды. Подпись «Check out this gift!» не мешает.\n\n" +
+			"Можно и вручную: <code>/val 10368454</code> или просто ID числом.",
 		Rows: [][]Button{
 			{Callback("🔙 Назад", cbMarket, ""), Callback("🏠 Меню", cbMenu, "")},
 		},
@@ -191,7 +191,7 @@ func helpMenuReply() Reply {
 			"<code>/floor Коллекция [/Модель]</code> — полы и предложения\n" +
 			"<code>/book Коллекция/Модель</code> — лесенка\n" +
 			"<code>/hist Коллекция/Модель</code> — сделки\n" +
-			"<code>/val ID</code> — оценка лота\n\n" +
+			"<code>/val ID</code> — оценка лота (или просто кинь ссылку из Tonnel)\n\n" +
 			"<b>💼 Портфель:</b>\n" +
 			"<code>/pos</code> — позиции\n" +
 			"<code>/portfolio</code> — советы\n" +

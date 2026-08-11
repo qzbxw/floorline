@@ -70,8 +70,8 @@ func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64
 		SnapshotAt: snapshotAt, Now: now, FX: fxContext,
 		Params: pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut, Window: a.window()},
 	})
-	if ref := a.crossMarketSupport(ctx, v); ref > 0 {
-		v = pricing.WithCrossMarket(v, ref)
+	if cm := a.crossMarketDepth(ctx, v); cm.Support > 0 {
+		v = pricing.WithCrossDepth(v, cm)
 	}
 	return v, nil
 }

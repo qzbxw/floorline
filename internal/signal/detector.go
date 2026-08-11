@@ -52,9 +52,14 @@ type Detector struct {
 	CalibrationReady func() bool
 	// CrossSupport supplies robust external ask depth before any gate runs.
 	// Leaving it nil simply disables that component.
-	CrossSupport func(context.Context, pricing.Valuation) float64
+	CrossSupport func(context.Context, pricing.Valuation) pricing.CrossMarket
 	// OwnerID is resolved dynamically because /auth can replace the session.
 	OwnerID func() int64
+	// Spendable reports the largest single purchase the desk could actually
+	// make right now — the ticket limit against the free balance. Signals for
+	// lots far beyond it are noise: nobody can act on them. A false second
+	// return disables the check.
+	Spendable func() (float64, bool)
 }
 
 // New builds a Detector.
@@ -194,8 +199,8 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		Params:     d.params(),
 	})
 	if d.CrossSupport != nil {
-		if ref := d.CrossSupport(ctx, val); ref > 0 {
-			val = pricing.WithCrossMarket(val, ref)
+		if cm := d.CrossSupport(ctx, val); cm.Support > 0 {
+			val = pricing.WithCrossDepth(val, cm)
 		}
 	}
 
@@ -283,7 +288,19 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	g := d.cfg.Sig
 	var fails []string
 
-	if v.Edge <= 0 {
+	// A lot the desk cannot pay for is not an opportunity, it is noise at 2am.
+	if d.Spendable != nil {
+		if room, ok := d.Spendable(); ok && v.Cost > room {
+			fails = append(fails, fmt.Sprintf("лот стоит %.2f, а поднять сейчас можно максимум %.2f (тикет и свободный баланс)", v.Cost, room))
+		}
+	}
+	// No trait premium, cheaper offers already standing in front of us: this is
+	// an expensive listing, not a mispriced one.
+	if v.PricedAboveMarket {
+		fails = append(fails, fmt.Sprintf(
+			"дешевле твоего входа %.3f уже стоит %d чужих асков на Tonnel и других площадках, а премии за трейты нет — это не мисприс",
+			v.Cost, v.AsksBelowEntry))
+	} else if v.Edge <= 0 {
 		fails = append(fails, fmt.Sprintf("реальный вход %.3f выше быстрого выхода %.3f — сделка уже %.1f%% в минусе до риск-буфера", v.Cost, v.FastExit, -v.Edge*100))
 	} else if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
 		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
@@ -358,7 +375,10 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	if !v.HasCompetingAsk {
 		fails = append(fails, "не от чего отталкиваться — конкурентов в стакане нет")
 	} else if v.LiveDepthCount < 2 {
-		fails = append(fails, "в стакане только один чужой аск — для автобая это не глубина")
+		fails = append(fails, fmt.Sprintf(
+			"в стакане одна живая цена %.2f, дальше дырка (%d аска всего) — для автобая это не глубина", v.CompetingAsk, v.ExternalAsks))
+	} else if v.DepthCapped {
+		fails = append(fails, "стакан дырявый — глубину пришлось резать, автобай на такой не работает")
 	}
 	return fails
 }

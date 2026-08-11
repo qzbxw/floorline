@@ -16,85 +16,211 @@ import (
 
 // renderCard builds the actionable signal message.
 //
-// Every line answers a question a trader would otherwise have to open three
-// tabs for: what am I paying, what will I realistically get out at, how sure
-// are we, and how long will my money be stuck.
+// Every section answers one question a trader would otherwise open three tabs
+// for: what am I paying, what do I realistically get out at, who is standing in
+// front of me, and what does the history say. The order matters — the verdict
+// and the money are at the top, the evidence below, the plumbing last — because
+// this arrives on a phone at 2am and gets three seconds of attention.
 func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string) string {
 	v := dec.Val
 	g := dec.Gift
 	var b strings.Builder
 
+	b.WriteString(titleBlock("⚡️", v, g))
+	b.WriteString("\n" + entryBlock(v))
+	b.WriteString("\n" + exitBlock(v))
+	b.WriteString("\n" + a.bookBlock(v))
+	if lines := a.crossMarketLines(ctx, v); len(lines) > 0 {
+		b.WriteString("\n🌐 <b>Другие площадки</b>\n")
+		for _, line := range lines {
+			b.WriteString(line + "\n")
+		}
+	}
+	b.WriteString("\n" + a.historyBlock(v))
+	b.WriteString("\n" + traitBlock(v, g))
+	b.WriteString("\n" + mixLine(v))
+	if line := fxLine(v); line != "" {
+		b.WriteString(line)
+	}
+
+	b.WriteString("\n")
+	if note != "" {
+		fmt.Fprintf(&b, "⛔️ <b>Только руками:</b> %s\n", bot.Esc(note))
+	}
+	if dec.Age > 0 {
+		fmt.Fprintf(&b, "<i>лот висит %s</i> · ", dur(dec.Age))
+	}
+	fmt.Fprintf(&b, "<code>гифт %d</code>", g.GiftID.Int())
+	return b.String()
+}
+
+// ---- shared card blocks -------------------------------------------------
+//
+// Both the signal card and /val are built from these, so the two views never
+// drift into describing the same number two different ways.
+
+func titleBlock(icon string, v pricing.Valuation, g tonnel.Gift) string {
 	title := bot.Esc(v.Key.Name)
 	if n := g.GiftNum.Int(); n > 0 {
 		title += fmt.Sprintf(" #%d", n)
 	}
-	fmt.Fprintf(&b, "⚡️ <b>%s</b> · %s\n", title, bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
+	return fmt.Sprintf("%s <b>%s</b>\n<i>%s</i>\n", icon, title, bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
+}
 
-	fmt.Fprintf(&b, "Листинг <b>%s</b> · реально спишется <b>%s</b>", num(v.Price), num(v.Cost))
+// entryBlock is the money going out. The listing price is not it — the referral
+// fee is, and that is the number every later comparison uses.
+func entryBlock(v pricing.Valuation) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "💵 <b>Вход %s</b> · аск %s с комиссией\n", num(v.Cost), num(v.Price))
 	if v.Floor > 0 {
-		fmt.Fprintf(&b, "  ·  флор модели %s  ·  <b>%+.0f%%</b>", num(v.Floor), -v.DiscountToFloor*100)
+		rel := "ниже"
+		if v.DiscountToFloor < 0 {
+			rel = "<b>выше</b>"
+		}
+		fmt.Fprintf(&b, "Флор модели %s — берём на %.0f%% %s флора\n", num(v.Floor), math.Abs(v.DiscountToFloor)*100, rel)
 	}
-	b.WriteString("\n\n")
+	return b.String()
+}
 
-	fmt.Fprintf(&b, "Слить сейчас %s · быстрый выход <b>%s</b> за ~%s\n", num(v.Liquidation), num(v.FastExit), days(v.FastExpectedDays))
-	fmt.Fprintf(&b, "Фэйр %s · терпеливый аск %s за ~%s\n", num(v.FairValue), num(v.PatientAsk), days(v.PatientExpectedDays))
+// exitBlock is the whole point of the bot: four prices that mean four different
+// things, laid out as a ladder so they can never be read as one blurred number.
+func exitBlock(v pricing.Valuation) string {
+	var b strings.Builder
+	b.WriteString("🎯 <b>Выход</b>\n")
+	fmt.Fprintf(&b, "├ слить сейчас %s\n", num(v.Liquidation))
+	fmt.Fprintf(&b, "├ быстро <b>%s</b> за ~%s ← считаем по нему\n", num(v.FastExit), days(v.FastExpectedDays))
+	fmt.Fprintf(&b, "├ фэйр %s\n", num(v.FairValue))
+	fmt.Fprintf(&b, "└ терпеливо %s за ~%s\n", num(v.PatientAsk), days(v.PatientExpectedDays))
 	if v.BearCase > 0 {
 		fmt.Fprintf(&b, "Если рынок поплывёт: %s\n", num(v.BearCase))
 	}
-	fmt.Fprintf(&b, "Ожидаемая продажа <b>%s</b> · нет <b>%s</b> (%+.1f%%)\n", num(v.FastExit), num(v.Net), v.Edge*100)
-	fmt.Fprintf(&b, "<i>%s</i>\n", bot.Esc(exitExplain(v)))
-	fmt.Fprintf(&b, "Скор %.1f · эдж с риском %.1f%% · конфа %.0f%%\n", v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100, v.Confidence*100)
-	if v.FX.Valid {
-		fmt.Fprintf(&b, "GRAM/USDT %s · 15м %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100)
-		if v.FX.ExpectedFloor > 0 {
-			fmt.Fprintf(&b, " · лаг флора %+.1f%%", v.FX.FloorLag*100)
-		}
-		b.WriteString("\n")
+	verdict := "➖"
+	switch {
+	case v.Edge > 0:
+		verdict = "🟢"
+	case v.Edge < 0:
+		verdict = "🔴"
 	}
+	fmt.Fprintf(&b, "%s Итог <b>%s</b> (<b>%s</b>) · эдж с риском %.1f%% · скор %.1f · конфа %.0f%%\n",
+		verdict, num(v.Net), pct(v.Edge), v.ScoreBreakdown.RiskAdjustedEdge*100, v.ScoreBreakdown.Total, v.Confidence*100)
+	if v.ExitCapped != "" {
+		fmt.Fprintf(&b, "⚠️ %s\n", bot.Esc(v.ExitCapped))
+	}
+	return b.String()
+}
 
-	fmt.Fprintf(&b, "Ликва %.1f сделок/день · %d сделок за %dд · %d разных гифтов\n",
-		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.DistinctGifts)
+// bookBlock describes the queue we would have to sell through. Depth that had
+// to be cut says so out loud: a reference the engine distrusts is exactly the
+// thing the operator must see.
+func (a *App) bookBlock(v pricing.Valuation) string {
+	var b strings.Builder
+	b.WriteString("📚 <b>Стакан Tonnel</b>\n")
+	if !v.HasCompetingAsk {
+		b.WriteString("Чужих асков нет — сравнивать не с чем\n")
+	} else {
+		fmt.Fprintf(&b, "Следующий аск %s · глубина %s · всего %s\n",
+			num(v.CompetingAsk), num(v.LiveDepth), plural(v.ExternalAsks, "аск", "аска", "асков"))
+		if v.DepthCapped || v.LiveDepthCount < minInt(2, v.ExternalAsks) {
+			fmt.Fprintf(&b, "⚠️ Дырявый стакан: %s → %s. Живых цен подряд %d, глубину подрезали\n",
+				num(v.CompetingAsk), num(v.DepthPrice3), v.LiveDepthCount)
+		} else {
+			fmt.Fprintf(&b, "Гэп до следующего %.1f%% · до глубины-3 %.1f%%\n", v.AskGap1*100, v.AskGap3*100)
+		}
+		switch {
+		case v.CheaperAsks > 0:
+			fmt.Fprintf(&b, "Перед тобой в очереди %s дешевле выхода, самый дешёвый %s\n",
+				plural(v.CheaperAsks, "аск", "аска", "асков"), num(v.CompetingAsk))
+		case v.CompetitorsNear > 0:
+			fmt.Fprintf(&b, "Дешевле тебя никого, но %s в 5%% над выходом — риск андерката\n",
+				plural(v.CompetitorsNear, "продавец", "продавца", "продавцов"))
+		default:
+			b.WriteString("Дешевле тебя никого — выходишь первым в очереди\n")
+		}
+	}
+	if v.AsksBelowEntry > 0 {
+		fmt.Fprintf(&b, "Дешевле твоего входа по всем площадкам: <b>%d</b>\n", v.AsksBelowEntry)
+	}
+	fmt.Fprintf(&b, "Саплай %d · запаса %s\n", v.Supply, days(v.DaysOfSupply))
+	return b.String()
+}
+
+func (a *App) historyBlock(v pricing.Valuation) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "📊 <b>История %dд</b>\n", a.cfg.LookbackDays)
+	fmt.Fprintf(&b, "%d сделок · %d гифтов · %.2f в день · последняя %s\n",
+		v.Liq.Sales, v.Liq.DistinctGifts, v.Liq.Velocity, ago(v.Liq.LastSale))
 	fmt.Fprintf(&b, "Медиана %s · разброс %.0f%% · тренд %+.0f%%\n",
 		num(v.Liq.Median), v.Liq.MADRatio*100, (v.Liq.Trend-1)*100)
-	if v.HasCompetingAsk {
-		fmt.Fprintf(&b, "Стакан: следующий %s · глубина-3 %s · гэп %.1f%% / %.1f%%\n", num(v.CompetingAsk), num(v.DepthPrice3), v.AskGap1*100, v.AskGap3*100)
-	}
 	if v.MarketDisagreement {
 		fmt.Fprintf(&b, "⚠️ История и живой стакан разъехались на %.0f%% — только руками\n", v.MarketDivergence*100)
 	}
+	return b.String()
+}
 
-	if v.CompetitorsNear == 0 {
-		b.WriteString("В 5% от твоего выхода никого → ты лучший аск\n")
-	} else {
-		fmt.Fprintf(&b, "%d продавцов в 5%% от твоего выхода (риск андерката)\n", v.CompetitorsNear)
-	}
-	fmt.Fprintf(&b, "Продажа ≈ %s · саплай %d (%s запаса)\n",
-		days(v.ExpectedDays), v.Supply, days(v.DaysOfSupply))
-
+func traitBlock(v pricing.Valuation, g tonnel.Gift) string {
+	var b strings.Builder
 	if bd := tonnel.BaseAttr(g.Backdrop); bd != "" {
-		fmt.Fprintf(&b, "Фон %s · Символ %s\n",
+		fmt.Fprintf(&b, "🎨 <b>Трейты</b>: %s · %s\n",
 			bot.Esc(attrWithRarity(bd, g.BackdropRarity.Float())),
 			bot.Esc(attrWithRarity(tonnel.BaseAttr(g.Symbol), g.SymbolRarity.Float())))
 	}
-	if v.Attribute.Valid && v.Attribute.ExactSamples >= pricing.MinAttributeSamples {
-		fmt.Fprintf(&b, "Премия за атрибуты %+.1f%% · выборка фон %d / символ %d / точных %d\n", v.Attribute.Premium*100, v.Attribute.BackdropSamples, v.Attribute.SymbolSamples, v.Attribute.ExactSamples)
-	} else if v.Attribute.ExactSamples > 0 {
-		fmt.Fprintf(&b, "Трейты: данных мало (%d точных), в цену не лезут\n", v.Attribute.ExactSamples)
-	}
-
-	for _, line := range a.crossMarketLines(ctx, v) {
-		b.WriteString(line + "\n")
-	}
-
-	if dec.Age > 0 {
-		fmt.Fprintf(&b, "Лот висит %s\n", dur(dec.Age))
-	}
-	fmt.Fprintf(&b, "<code>гифт %d</code>\n", g.GiftID.Int())
-
-	if note != "" {
-		fmt.Fprintf(&b, "\n<i>%s</i>", bot.Esc(note))
+	switch {
+	case v.Attribute.Valid && v.Attribute.ExactSamples >= pricing.MinAttributeSamples:
+		fmt.Fprintf(&b, "Премия %+.1f%% · выборка: фон %d / символ %d / точных %d\n",
+			v.Attribute.Premium*100, v.Attribute.BackdropSamples, v.Attribute.SymbolSamples, v.Attribute.ExactSamples)
+	case v.Attribute.ExactSamples > 0:
+		fmt.Fprintf(&b, "Премии нет: всего %d точных сделок, в цену не лезут\n", v.Attribute.ExactSamples)
+	default:
+		b.WriteString("Премии нет: точных сделок по этим трейтам не было\n")
 	}
 	return b.String()
+}
+
+func mixLine(v pricing.Valuation) string {
+	return fmt.Sprintf("⚖️ <b>Из чего цена</b>: стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%\n",
+		v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
+}
+
+func fxLine(v pricing.Valuation) string {
+	if !v.FX.Valid {
+		return ""
+	}
+	s := fmt.Sprintf("💱 GRAM/USDT %s · 15м %s", num(v.FX.CurrentUSD), pct(v.FX.Move15m))
+	if v.FX.ExpectedFloor > 0 {
+		s += fmt.Sprintf(" · лаг флора %s", pct(v.FX.FloorLag))
+	}
+	return s + "\n"
+}
+
+// pct renders a signed percentage with the same typographic minus num uses, so
+// a card never mixes "−1.139" with "-18.9%" two lines apart.
+func pct(v float64) string {
+	s := fmt.Sprintf("%+.1f%%", v*100)
+	return strings.Replace(s, "-", "−", 1)
+}
+
+// plural renders a Russian count with the right noun form, because "1 асков"
+// in a trading alert reads like a bug in everything else too.
+func plural(n int, one, few, many string) string {
+	word := many
+	switch mod100 := n % 100; {
+	case mod100 >= 11 && mod100 <= 14:
+	default:
+		switch n % 10 {
+		case 1:
+			word = one
+		case 2, 3, 4:
+			word = few
+		}
+	}
+	return fmt.Sprintf("%d %s", n, word)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // renderValuation is the verbose form used by /val, including the gates the
@@ -102,88 +228,64 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valuation, fails, autoFails []string) string {
 	var b strings.Builder
 
-	title := bot.Esc(v.Key.Name)
-	if n := g.GiftNum.Int(); n > 0 {
-		title += fmt.Sprintf(" #%d", n)
-	}
-	fmt.Fprintf(&b, "🔍 <b>%s</b> · %s\n", title, bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
-
+	b.WriteString(titleBlock("🔍", v, g))
 	if !v.Valid {
 		fmt.Fprintf(&b, "\nОценить нельзя: %s\n", bot.Esc(v.Reason))
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "Листинг <b>%s</b> · реально спишется <b>%s</b>", num(v.Price), num(v.Cost))
-	if v.Floor > 0 {
-		fmt.Fprintf(&b, " · флор модели %s (%+.0f%%)", num(v.Floor), -v.DiscountToFloor*100)
-	}
-	b.WriteString("\n\n<b>Четыре цены без каши</b>\n")
-	if v.HasCompetingAsk {
-		fmt.Fprintf(&b, "Лучший чужой аск %s → андеркат %s\n", num(v.CompetingAsk), num(v.CompetingAsk*(1-a.cfg.Undercut)))
+	// The verdict first. Everything under it is the argument for it.
+	if len(fails) == 0 {
+		b.WriteString("\n✅ <b>BUY</b> — проходит фильтр сигнала\n")
 	} else {
-		b.WriteString("Конкурентов нет — ты был бы единственным продавцом\n")
+		b.WriteString("\n" + passBlock(v, fails))
 	}
-	fmt.Fprintf(&b, "Слить почти сейчас: %s\n", num(v.Liquidation))
-	fmt.Fprintf(&b, "Быстрый выход 24–72ч: <b>%s</b> · по нему решаем BUY\n", num(v.FastExit))
-	fmt.Fprintf(&b, "Фэйр рынка: %s\nТерпеливый аск: %s\n", num(v.FairValue), num(v.PatientAsk))
-	if v.BearCase > 0 {
-		fmt.Fprintf(&b, "Медвежий сценарий: %s\n", num(v.BearCase))
-	}
-	fmt.Fprintf(&b, "На руки %s · себестоимость %s · нет <b>%s</b> (%+.1f%%)\n", num(v.Proceeds), num(v.Cost), num(v.Net), v.Edge*100)
-	fmt.Fprintf(&b, "Вес: живой стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%\n", v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
-	fmt.Fprintf(&b, "История после шринка %s · живая глубина %s · внешняя опора %s\n", num(v.HistoryReference), num(v.LiveDepth), num(v.CrossMarketSupport))
+
+	b.WriteString("\n" + entryBlock(v))
+	b.WriteString("\n" + exitBlock(v))
 	if v.HasCompetingAsk {
-		fmt.Fprintf(&b, "Гэпы: до следующего %.1f%% · до глубины-3 %.1f%%\n", v.AskGap1*100, v.AskGap3*100)
+		fmt.Fprintf(&b, "Андеркат лучшего чужого аска %s → %s\n", num(v.CompetingAsk), num(v.CompetingAsk*(1-a.cfg.Undercut)))
 	}
-	if v.MarketDisagreement {
-		fmt.Fprintf(&b, "⚠️ Рынок спорит сам с собой на %.0f%% — только руками\n", v.MarketDivergence*100)
-	}
-	if len(fails) > 0 {
-		fmt.Fprintf(&b, "\n<b>%s</b>\n", bot.Esc(passLine(v, fails)))
-	}
-	fmt.Fprintf(&b, "Конфа %.0f%% · скор %.1f · эдж с риском %.1f%%\n", v.Confidence*100, v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100)
-	if v.FX.Valid {
-		fmt.Fprintf(&b, "GRAM/USD %s · 15м %+.1f%% · 1ч %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100, v.FX.Move1h*100)
-		if v.FX.ExpectedFloor > 0 {
-			fmt.Fprintf(&b, " · FX-флор %s (лаг %+.1f%%)", num(v.FX.ExpectedFloor), v.FX.FloorLag*100)
-		}
-		b.WriteString("\n")
-	}
-	if v.Liq.FXCoverage > 0 {
-		fmt.Fprintf(&b, "Медиана %s GRAM с поправкой на GRAM/USD (покрытие %.0f%%; сырая %s)\n", num(v.Liq.Median), v.Liq.FXCoverage*100, num(v.Liq.RawMedian))
-	}
+	fmt.Fprintf(&b, "Опоры: история после шринка %s · живая глубина %s · площадки %s\n",
+		num(v.HistoryReference), num(v.LiveDepth), num(v.CrossMarketSupport))
 
-	b.WriteString("\n<b>Ликва</b>\n")
-	fmt.Fprintf(&b, "%.2f сделок/день · %d сделок за %dд · %d разных гифтов (оборот %.2f)\n",
-		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.DistinctGifts, v.Liq.Turnover)
-	fmt.Fprintf(&b, "Разброс %.0f%% · тренд %+.0f%% · последняя сделка %s\n",
-		v.Liq.MADRatio*100, (v.Liq.Trend-1)*100, ago(v.Liq.LastSale))
-	fmt.Fprintf(&b, "Саплай %d (%s запаса) · %d продавцов в 5%% от выхода\n",
-		v.Supply, days(v.DaysOfSupply), v.CompetitorsNear)
-	fmt.Fprintf(&b, "Ожидаемая продажа ≈ %s\n", days(v.ExpectedDays))
-
+	b.WriteString("\n" + a.bookBlock(v))
 	if lines := a.crossMarketLines(ctx, v); len(lines) > 0 {
-		b.WriteString("\n<b>Другие площадки · участвуют в оценке</b>\n")
+		b.WriteString("\n🌐 <b>Другие площадки · участвуют в оценке</b>\n")
 		for _, line := range lines {
 			b.WriteString(line + "\n")
 		}
 	}
 
+	b.WriteString("\n" + a.historyBlock(v))
+	fmt.Fprintf(&b, "Оборот %.2f · ожидаемая продажа ≈ %s\n", v.Liq.Turnover, days(v.ExpectedDays))
+	if v.Liq.FXCoverage > 0 {
+		fmt.Fprintf(&b, "Медиана пересчитана по GRAM/USD (покрытие %.0f%%, сырая %s)\n", v.Liq.FXCoverage*100, num(v.Liq.RawMedian))
+	}
+
+	b.WriteString("\n" + traitBlock(v, g))
+	b.WriteString("\n" + mixLine(v))
+	if v.FX.Valid {
+		fmt.Fprintf(&b, "💱 GRAM/USD %s · 15м %+.1f%% · 1ч %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100, v.FX.Move1h*100)
+		if v.FX.ExpectedFloor > 0 {
+			fmt.Fprintf(&b, " · FX-флор %s (лаг %+.1f%%)", num(v.FX.ExpectedFloor), v.FX.FloorLag*100)
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString("\n<b>Фильтры</b>\n")
 	if len(fails) == 0 {
-		b.WriteString("✅ проходит фильтр сигнала\n")
-	} else {
-		for _, f := range fails {
-			b.WriteString("❌ " + bot.Esc(f) + "\n")
-		}
-	}
-	if len(fails) == 0 {
+		b.WriteString("✅ сигнал: проходит\n")
 		if len(autoFails) == 0 {
-			b.WriteString("✅ проходит фильтр автобая\n")
+			b.WriteString("✅ автобай: проходит\n")
 		} else {
 			for _, f := range autoFails {
 				b.WriteString("⛔️ автобай: " + bot.Esc(f) + "\n")
 			}
+		}
+	} else {
+		for _, f := range fails {
+			b.WriteString("❌ " + bot.Esc(f) + "\n")
 		}
 	}
 	return b.String()
@@ -322,24 +424,50 @@ func (a *App) crossMarketLines(ctx context.Context, v pricing.Valuation) []strin
 	defer cancel()
 
 	quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
-	lines := make([]string, 0, len(quotes))
+	lines := make([]string, 0, 2*len(quotes))
 	for _, q := range quotes {
-		line := fmt.Sprintf("%s аски %s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor))
-		if q.Scope != "" {
-			line += " [" + q.Scope + "]"
-		}
-		if ref := q.Reference(); ref > 0 && ref != q.Floor {
-			line += fmt.Sprintf(" · глубина %s", num(ref))
-		}
+		lines = append(lines, fmt.Sprintf("<b>%s</b> %s%s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor), scopeNote(q.Scope)))
+
+		detail := fmt.Sprintf("опора %s", num(q.Reference()))
 		if q.Fee > 0 {
-			line += fmt.Sprintf(" (нет %s)", num(q.NetReference()))
+			detail += fmt.Sprintf(" (нет %s)", num(q.NetReference()))
 		}
 		if v.Cost > 0 {
-			line += fmt.Sprintf(" · %+.0f%% к входу", (q.Reference()/v.Cost-1)*100)
+			detail += fmt.Sprintf(" · %+.0f%% к входу", (q.Reference()/v.Cost-1)*100)
+			// The count is the part that decides trades: one cheap ask is a
+			// bait, four are a queue our buyer can walk to instead of us.
+			if n := countBelow(q.Asks, v.Cost); n > 0 {
+				detail += fmt.Sprintf(" · %s дешевле входа", plural(n, "аск", "аска", "асков"))
+			}
 		}
-		lines = append(lines, line)
+		lines = append(lines, detail)
 	}
 	return lines
+}
+
+// scopeNote translates the venue's matching scope into something readable: it
+// decides whether the quote is about this exact gift or the whole model.
+func scopeNote(scope string) string {
+	switch scope {
+	case "exact attributes":
+		return " · точно по трейтам"
+	case "model":
+		return " · по модели"
+	case "floor only":
+		return " · только флор"
+	default:
+		return ""
+	}
+}
+
+func countBelow(prices []float64, limit float64) int {
+	n := 0
+	for _, p := range prices {
+		if p > 0 && p < limit {
+			n++
+		}
+	}
+	return n
 }
 
 func askPreview(asks []float64, fallback float64) string {
@@ -357,18 +485,41 @@ func askPreview(asks []float64, fallback float64) string {
 	return strings.Join(parts, " / ")
 }
 
-// exitExplain says in one clause where the exit price came from, so the number
-// is never an opaque model output.
-func exitExplain(v pricing.Valuation) string {
-	return fmt.Sprintf("микс: стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%",
-		v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
+// passBlock is the verdict at the top of /val: the economic reasons to skip,
+// one per line. Three of them read; a semicolon-joined paragraph of five does
+// not, and this is the part the operator actually acts on.
+func passBlock(v pricing.Valuation, fails []string) string {
+	reasons := passReasons(v, fails)
+	if len(reasons) > 3 {
+		reasons = reasons[:3]
+	}
+	var b strings.Builder
+	b.WriteString("🚫 <b>PASS — не берём</b>\n")
+	for _, r := range reasons {
+		b.WriteString("• " + bot.Esc(r) + "\n")
+	}
+	return b.String()
 }
 
-// passLine states the actual economic reason to skip a listing. The detailed
-// gates stay below it for debugging, but the operator should not have to infer
-// "entry is above exit" from a clamped risk-adjusted zero.
+// passLine is the one-line form, kept for notifications that have no room for
+// a block.
 func passLine(v pricing.Valuation, fails []string) string {
-	parts := make([]string, 0, 4)
+	return "PASS: " + strings.Join(passReasons(v, fails), "; ") + "."
+}
+
+// passReasons states the actual economic reasons to skip a listing, most
+// decisive first. The detailed gates stay below them for debugging, but the
+// operator should not have to infer "entry is above exit" from a clamped
+// risk-adjusted zero.
+func passReasons(v pricing.Valuation, fails []string) []string {
+	parts := make([]string, 0, 5)
+	if v.PricedAboveMarket {
+		parts = append(parts, fmt.Sprintf("дешевле входа %s стоит %s на всех площадках, премии за трейты нет",
+			num(v.Cost), plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков")))
+	}
+	if v.DepthCapped {
+		parts = append(parts, fmt.Sprintf("стакан дырявый (%s → %s), глубине верить нельзя", num(v.CompetingAsk), num(v.DepthPrice3)))
+	}
 	if v.Cost >= v.FastExit && v.FastExit > 0 {
 		parts = append(parts, fmt.Sprintf("реальный вход %s выше быстрого выхода %s", num(v.Cost), num(v.FastExit)))
 	}
@@ -386,7 +537,7 @@ func passLine(v pricing.Valuation, fails []string) string {
 	if len(parts) == 0 && len(fails) > 0 {
 		parts = append(parts, fails[0])
 	}
-	return "PASS: " + strings.Join(parts, "; ") + "."
+	return parts
 }
 
 func attrWithRarity(name string, rarity float64) string {

@@ -454,6 +454,91 @@ func TestAskGapRewardsThinDepthAndTightQueueCannotFakeEdge(t *testing.T) {
 	}
 }
 
+// Production, 12 Aug: Pet Snake / Black Mamba listed at 6 (6.03 all in) while
+// the next Tonnel ask was 4.21 and Portals was showing 4 / 5 / 5 / 5.89 / 6.
+// The engine still printed a 6.867 fast exit and a +13.9% edge, because the
+// median of 4.21 / 7.9 / 10.20 pretended a hole in the book was liquidity, and
+// because an external venue was only ever allowed to raise the ceiling.
+func TestGappyBookCannotInventAnExitAboveTheEntry(t *testing.T) {
+	liq := liqOf(3.846, 9)
+	liq.MADRatio, liq.Trend, liq.Velocity = .15, 1.05, .6
+	v := evalPrice(t, 6, bookOf(42, 6, 4.21, 7.9, 10.2), liq, 4.21, 13)
+	v = WithCrossDepth(v, CrossMarket{Support: 5, Venues: 1, Asks: []float64{4, 5, 5, 5.89, 6}})
+
+	if !v.Valid {
+		t.Fatalf("valuation is invalid: %s", v.Reason)
+	}
+	if v.LiveDepthCount != 1 {
+		t.Errorf("trusted depth = %d, want 1: 4.21 → 7.90 is a hole, not a second price point", v.LiveDepthCount)
+	}
+	if !v.DepthCapped || v.LiveDepth > 4.21*(1+depthGapLimit)+1e-9 {
+		t.Errorf("depth %.3f (capped=%v) must be pulled back towards the 4.21 ask", v.LiveDepth, v.DepthCapped)
+	}
+	if v.FastExit > v.Cost {
+		t.Errorf("fast exit %.3f above the %.3f entry with five cheaper asks in front of us", v.FastExit, v.Cost)
+	}
+	if v.Edge > 0 {
+		t.Errorf("edge %.3f must not be positive here", v.Edge)
+	}
+	if v.AsksBelowEntry < 5 {
+		t.Errorf("asks below entry = %d, want the 4.21 Tonnel ask plus 4 / 5 / 5 / 5.89 on Portals", v.AsksBelowEntry)
+	}
+	// "Nobody within 5% of your exit" is not the same statement as "you are the
+	// cheapest offer", and the card used to conflate the two.
+	if v.CheaperAsks < 1 {
+		t.Error("the 4.21 ask undercuts our exit; the card must not call us the best ask")
+	}
+}
+
+// The backstop behind the depth fix: a stale-high history and one expensive
+// external venue can still blend their way to an exit above our own entry while
+// the whole live book sits under it. Without a measured trait premium that is
+// arithmetic, not an edge.
+func TestBlendCannotPriceAboveEntryWhileTheBookIsCheaper(t *testing.T) {
+	v := evalPrice(t, 5, bookOf(42, 5, 4.9, 4.95, 5), liqOf(8, 40), 4.9, 20)
+	v = WithCrossDepth(v, CrossMarket{Support: 9, Venues: 1, Asks: []float64{9, 9.5}})
+
+	if !v.PricedAboveMarket {
+		t.Fatalf("guard did not fire: exit %.3f, entry %.3f, %d asks below entry", v.FastExit, v.Cost, v.AsksBelowEntry)
+	}
+	if v.FastExit > v.Cost {
+		t.Errorf("exit %.3f still above the %.3f entry", v.FastExit, v.Cost)
+	}
+	if v.Edge > 0 {
+		t.Errorf("edge %.4f must not survive the clamp", v.Edge)
+	}
+	if v.ExitCapped == "" {
+		t.Error("a clamped exit must explain itself on the card")
+	}
+}
+
+// The trait premium is the only thing that can justify pricing above the crowd,
+// and it has to be measured, not assumed.
+func TestMeasuredTraitPremiumSurvivesTheOverpricedGuard(t *testing.T) {
+	attr := AttributeValue{Valid: true, Fair: 9, Premium: .5, ExactSamples: 20, ExactShare: .3, Confidence: .8}
+	v := Evaluate(Input{
+		GiftID: 42, Key: testKey, Price: 6, Backdrop: "Platinum", Symbol: "Khinkali", Attribute: attr,
+		Book: bookOf(42, 6, 7.5, 8, 8.4), Liq: liqOf(7.5, 30),
+		Params: Params{Fee: testFee, Undercut: testUndercut},
+	})
+	v = WithCrossDepth(v, CrossMarket{Support: 5, Venues: 1, Asks: []float64{4, 5, 5}})
+	if v.PricedAboveMarket {
+		t.Errorf("a 20-sample trait premium is evidence; the guard must not fire: exit %.3f cost %.3f", v.FastExit, v.Cost)
+	}
+}
+
+// A venue with a real queue below us caps the exit instead of confirming it.
+func TestCheaperExternalQueueCapsTheFastExit(t *testing.T) {
+	base := evalPrice(t, 3, bookOf(42, 3, 4, 4.1, 4.2), liqOf(4, 30), 4, 20)
+	capped := WithCrossDepth(base, CrossMarket{Support: 3.5, Venues: 1, Asks: []float64{3.4, 3.5, 3.6}})
+	if capped.FastExit >= base.FastExit {
+		t.Errorf("cheaper external depth must pull the exit down: %.3f vs %.3f", capped.FastExit, base.FastExit)
+	}
+	if capped.FastExit < capped.Liquidation-1e-9 {
+		t.Errorf("the cap must never push the exit below the live liquidation price %.3f", capped.Liquidation)
+	}
+}
+
 func TestBookExcludesBundlesAndPremarket(t *testing.T) {
 	gifts := []tonnel.Gift{
 		{GiftID: 1, Price: 100},

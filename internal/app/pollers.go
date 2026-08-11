@@ -84,27 +84,64 @@ func (a *App) pollFeed(ctx context.Context) error {
 	return nil
 }
 
-// crossMarketSupport is robust price discovery: each venue contributes the
-// middle of its first three asks, then venues are combined by their median.
-// Gross asks are used because selling on Tonnel has no second referral fee.
-func (a *App) crossMarketSupport(ctx context.Context, v pricing.Valuation) float64 {
+// spendable is the largest single purchase the desk could make right now: the
+// ticket limit, cut down by whatever the balance leaves above the reserve.
+//
+// Alerting on a 53 GRAM lot while the ticket cap is 5.5 and the wallet holds 25
+// is not a trading signal, it is a notification nobody can act on.
+func (a *App) spendable() (float64, bool) {
+	l := a.rm.Limits()
+	room, known := math.Inf(1), false
+	if l.MaxTicket > 0 {
+		room, known = l.MaxTicket, true
+	}
+	if bal, ok := a.rm.Balance(); ok {
+		known = true
+		room = math.Min(room, math.Max(bal-l.MinBalanceReserve, 0))
+	}
+	if !known {
+		return 0, false
+	}
+	return room, true
+}
+
+// crossMarketDepth is robust price discovery: each venue contributes the middle
+// of its first three asks, then venues are combined by their median. Gross asks
+// are used because selling on Tonnel has no second referral fee.
+//
+// The individual asks travel with the reference. A single number can only ever
+// nudge the blend; the queue behind it is what proves a buyer has somewhere
+// cheaper to go, which is the difference between a misprice and an overprice.
+func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing.CrossMarket {
 	if !a.cross.Enabled() {
-		return 0
+		return pricing.CrossMarket{}
 	}
 	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
+
+	cm := pricing.CrossMarket{}
 	var refs []float64
 	for _, q := range quotes {
-		if ref := q.Reference(); ref > 0 {
-			refs = append(refs, ref)
+		ref := q.Reference()
+		if ref <= 0 {
+			continue
+		}
+		refs = append(refs, ref)
+		cm.Venues++
+		if len(q.Asks) > 0 {
+			cm.Asks = append(cm.Asks, q.Asks...)
+		} else {
+			cm.Asks = append(cm.Asks, q.Floor)
 		}
 	}
 	if len(refs) == 0 {
-		return 0
+		return pricing.CrossMarket{}
 	}
 	sort.Float64s(refs)
-	return refs[len(refs)/2]
+	sort.Float64s(cm.Asks)
+	cm.Support = refs[len(refs)/2]
+	return cm
 }
 
 // handleDecision records a signal, buys it if it clears every unattended gate,

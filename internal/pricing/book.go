@@ -118,6 +118,23 @@ func (b *Book) CountAttributesBetween(lo, hi float64, excludeID, ownerID int64, 
 	return n
 }
 
+// CountBelow counts genuinely competing asks cheaper than a price. It is what
+// tells "you would be the cheapest offer" apart from "you would be behind a
+// queue of cheaper sellers" — a distinction a narrow band above the exit price
+// cannot make on its own.
+func (b *Book) CountBelow(price float64, excludeID, ownerID int64) int {
+	n := 0
+	for _, a := range b.Asks {
+		if a.GiftID == excludeID || (ownerID != 0 && a.Seller == ownerID) {
+			continue
+		}
+		if a.Price > 0 && a.Price < price {
+			n++
+		}
+	}
+	return n
+}
+
 // CountBetween counts asks in [lo, hi], excluding one gift.
 func (b *Book) CountBetween(lo, hi float64, excludeID, ownerID int64) int {
 	n := 0

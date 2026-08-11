@@ -144,7 +144,8 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		sources = append(sources, mk)
 	}
 	a.cross = market.NewComparison(sources...)
-	a.det.CrossSupport = a.crossMarketSupport
+	a.det.CrossSupport = a.crossMarketDepth
+	a.det.Spendable = a.spendable
 
 	// The Telegram client is created in Run, not here: `smoke` and `backfill`
 	// must work with nothing but a Tonnel session, and connecting to Telegram

@@ -239,9 +239,9 @@ func (b *Bot) register() {
 	}))
 
 	tb.Handle("/val", b.reply(func(ctx context.Context, c tele.Context) Reply {
-		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
-		if err != nil {
-			return Text("Формат: <code>/val 123456</code> — ID лота на Tonnel")
+		id, ok := ParseGiftRef(c.Message().Payload)
+		if !ok {
+			return Text("Формат: <code>/val 123456</code> — ID лота на Tonnel.\nИли просто кинь сюда ссылку из мини-аппа: «Share» → отправить боту.")
 		}
 		return b.back.Val(ctx, id)
 	}))
@@ -380,6 +380,21 @@ func (b *Bot) register() {
 			log.Warn().Err(err).Msg("could not delete the message carrying authData")
 		}
 		return b.back.SetAuth(ctx, raw)
+	}))
+
+	// Anything that is not a command: the fast path from the Tonnel mini app.
+	// Sharing a gift there produces a link plus a caption, and the numeric id
+	// is nowhere on screen, so pasting that share into the chat has to be
+	// enough to get a valuation.
+	tb.Handle(tele.OnText, b.reply(func(ctx context.Context, c tele.Context) Reply {
+		text := strings.TrimSpace(c.Message().Text)
+		if strings.HasPrefix(text, "/") {
+			return Reply{}
+		}
+		if id, ok := ParseGiftRef(text); ok {
+			return b.back.Val(ctx, id)
+		}
+		return Text("Не нашёл тут лота. Кинь ссылку на гифт из Tonnel (Share) или ID числом — оценю.\n\nВсё остальное — через /start.")
 	}))
 
 	b.registerCallbacks()
@@ -703,4 +718,3 @@ var commandMenu = []tele.Command{
 	{Text: "start", Description: "главное меню"},
 	{Text: "help", Description: "все команды"},
 }
-

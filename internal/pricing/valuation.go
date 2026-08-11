@@ -14,6 +14,18 @@ const (
 	// just the same exit with a slower fill, so it carries a modest 1.5% wait
 	// premium and is still capped by a genuinely comparable live ask.
 	patientWaitPremium = 0.015
+	// depthGapLimit is how far one ask may sit above the previous one and still
+	// belong to the same pool of liquidity. A book reading 4.21 / 4.21 / 10.20
+	// is two real asks and one wish: the median of those three points is not a
+	// price anyone can sell into, so the depth reference is capped this far
+	// above the cheapest genuinely competing ask and the run of trusted depth
+	// ends at the first larger jump.
+	depthGapLimit = 0.20
+	// depthWindow is how many of the cheapest external asks feed the reference.
+	depthWindow = 3
+	// minAsksBelowEntry is how many independent cheaper offers it takes to call
+	// a listing overpriced rather than mispriced.
+	minAsksBelowEntry = 2
 )
 
 // Params are the economics of a round trip.
@@ -63,13 +75,21 @@ type Valuation struct {
 	CompetingAsk    float64
 	HasCompetingAsk bool
 	LiveDepth       float64
-	LiveDepthCount  int
-	DepthPrice3     float64
-	AskGap1         float64
-	AskGap3         float64
+	// LiveDepthCount is the run of cheapest asks that form one pool of
+	// liquidity, i.e. how many of them are reachable without stepping over a
+	// hole in the book. It is not the raw ask count — see ExternalAsks.
+	LiveDepthCount int
+	ExternalAsks   int
+	DepthPrice3    float64
+	// DepthCapped records that the raw depth median sat above the cheapest ask
+	// by more than depthGapLimit and was pulled back down to it.
+	DepthCapped bool
+	AskGap1     float64
+	AskGap3     float64
 
 	HistoryReference   float64
 	CrossMarketSupport float64
+	Cross              CrossMarket
 	HistoryWeight      float64
 	LiveWeight         float64
 	CrossWeight        float64
@@ -90,6 +110,17 @@ type Valuation struct {
 	MarketDisagreement bool
 	MarketDivergence   float64
 	CrossDivergence    float64
+
+	// AsksBelowEntry counts independent offers — ours excluded, every venue
+	// included — that are already cheaper than what this listing costs us.
+	AsksBelowEntry int
+	// PricedAboveMarket is the hard verdict: no measured trait premium, several
+	// cheaper offers in front of us, and a model that still wanted to price the
+	// exit above our own entry. The exit was clamped and the trade is manual.
+	PricedAboveMarket bool
+	ExitCapped        string
+	// CheaperAsks is how many live Tonnel asks undercut our own fast exit.
+	CheaperAsks int
 
 	DiscountToFloor     float64
 	Liq                 Liquidity
@@ -145,19 +176,36 @@ func Evaluate(in Input) Valuation {
 	return v
 }
 
+// CrossMarket is what other venues are showing for the same model: a robust
+// price reference plus the actual queue behind it. The queue matters as much as
+// the reference — five asks under our entry price on Portals mean our buyer can
+// shop there instead, whatever Tonnel's own thin book suggests.
+type CrossMarket struct {
+	Support float64
+	Asks    []float64 // merged across venues, ascending
+	Venues  int
+}
+
 // WithCrossMarket promotes external depth from a footnote to a pricing input.
 // It intentionally recomputes every dependent number, including BUY edge.
 func WithCrossMarket(v Valuation, support float64) Valuation {
-	if support <= 0 {
+	return WithCrossDepth(v, CrossMarket{Support: support})
+}
+
+// WithCrossDepth is the full form: the reference and the queue behind it.
+func WithCrossDepth(v Valuation, cm CrossMarket) Valuation {
+	if cm.Support <= 0 {
 		return v
 	}
-	v.CrossMarketSupport = support
+	v.Cross = cm
+	v.CrossMarketSupport = cm.Support
 	recompute(&v)
 	return v
 }
 
 func recompute(v *Valuation) {
 	in := v.input
+	cost := v.Cost
 	undercut := in.Params.Undercut
 	if undercut < 0 || undercut >= 1 {
 		undercut = 0
@@ -166,20 +214,41 @@ func recompute(v *Valuation) {
 	v.Valid, v.Reason = false, ""
 	v.CompetingAsk, v.HasCompetingAsk = 0, false
 	v.LiveDepth, v.DepthPrice3, v.AskGap1, v.AskGap3, v.LiveDepthCount = 0, 0, 0, 0, 0
+	v.ExternalAsks, v.DepthCapped = 0, false
+	v.AsksBelowEntry, v.CheaperAsks, v.PricedAboveMarket, v.ExitCapped = 0, 0, false, ""
 	var external []Ask
 	if in.Book != nil {
 		external = in.Book.ExternalAsks(in.GiftID, in.OwnerID)
 	}
 	if len(external) > 0 {
+		v.ExternalAsks = len(external)
 		v.CompetingAsk, v.HasCompetingAsk = external[0].Price, true
-		v.LiveDepthCount = minInt(3, len(external))
+		v.LiveDepthCount = contiguousDepth(external, depthWindow)
 		if len(external) >= 2 {
-			v.LiveDepth = medianFirst(external, 3)
+			depth := medianFirst(external, depthWindow)
+			// A hole in the book is not liquidity. Whatever the median of the
+			// first three says, nothing proves the market clears more than
+			// depthGapLimit above the cheapest genuinely competing ask, so that
+			// is where the reference stops.
+			if lid := external[0].Price * (1 + depthGapLimit); depth > lid {
+				depth, v.DepthCapped = lid, true
+			}
+			v.LiveDepth = depth
 		}
 		v.DepthPrice3 = external[minInt(2, len(external)-1)].Price
 		if v.Price > 0 {
 			v.AskGap1 = math.Max(0, external[0].Price/v.Price-1)
 			v.AskGap3 = math.Max(0, v.DepthPrice3/v.Price-1)
+		}
+		for _, a := range external {
+			if a.Price > 0 && a.Price < cost {
+				v.AsksBelowEntry++
+			}
+		}
+	}
+	for _, p := range v.Cross.Asks {
+		if p > 0 && p < cost {
+			v.AsksBelowEntry++
 		}
 	}
 
@@ -254,10 +323,17 @@ func recompute(v *Valuation) {
 	)
 	// History can pull a live price down, but cannot lift a fast exit through
 	// the visible queue. External depth may raise that ceiling only when an
-	// independent venue confirms it.
+	// independent venue confirms it — and it works in both directions: a venue
+	// with a real stack *below* the Tonnel book caps us instead of confirming
+	// us, because that is where our buyer will go.
 	ceiling := liveFast
 	if v.CrossMarketSupport > 0 {
-		ceiling = math.Max(ceiling, v.CrossMarketSupport*(1-undercut))
+		crossFast := v.CrossMarketSupport * (1 - undercut)
+		if len(v.Cross.Asks) >= 2 && crossFast < ceiling {
+			ceiling = math.Max(math.Min(ceiling, crossFast), v.Liquidation)
+		} else {
+			ceiling = math.Max(ceiling, crossFast)
+		}
 	}
 	if ceiling > 0 && v.FastExit > ceiling {
 		v.FastExit = ceiling
@@ -273,6 +349,21 @@ func recompute(v *Valuation) {
 	if v.Liquidation > 0 && v.FastExit < v.Liquidation {
 		v.FastExit = v.Liquidation
 	}
+
+	// The overpriced-listing guard. Claiming we can get out above what we just
+	// paid needs a reason, and "the model averaged its way there" is not one:
+	// with no measured trait premium and several independent offers already
+	// cheaper than our entry, we are the expensive ask, not the misprice. The
+	// exit is pulled back to entry (never below the live liquidation price) and
+	// the listing is flagged manual.
+	if tw == 0 && v.AsksBelowEntry >= minAsksBelowEntry && cost > 0 && v.FastExit > cost {
+		if capped := math.Max(v.Liquidation, cost); capped < v.FastExit {
+			v.FastExit = capped
+			v.PricedAboveMarket = true
+			v.ExitCapped = "выход прижат ко входу: рынок дешевле нас"
+		}
+	}
+
 	v.PatientAsk = math.Max(v.FastExit, v.FairValue*(1+patientWaitPremium))
 	if in.Attribute.Valid && in.Attribute.ExactSamples >= MinAttributeSamples && in.Book != nil {
 		if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.OwnerID, in.Backdrop, in.Symbol); ok {
@@ -293,6 +384,7 @@ func recompute(v *Valuation) {
 
 	if in.Book != nil {
 		v.CompetitorsNear = in.Book.CountBetween(v.FastExit, v.FastExit*1.05, in.GiftID, in.OwnerID)
+		v.CheaperAsks = in.Book.CountBelow(v.FastExit, in.GiftID, in.OwnerID)
 	}
 	if in.Liq.Velocity > 0 {
 		v.DaysOfSupply = float64(in.Supply) / in.Liq.Velocity
@@ -346,6 +438,19 @@ func historyWeight(distinct int) float64 {
 	default:
 		return .40
 	}
+}
+
+// contiguousDepth counts how many of the cheapest asks belong to one pool of
+// liquidity. The run ends at the first jump wider than depthGapLimit, because
+// past a hole like 4.21 → 10.20 there is nothing to sell into.
+func contiguousDepth(asks []Ask, limit int) int {
+	n := minInt(limit, len(asks))
+	for i := 1; i < n; i++ {
+		if asks[i-1].Price <= 0 || asks[i].Price > asks[i-1].Price*(1+depthGapLimit) {
+			return i
+		}
+	}
+	return n
 }
 
 func medianFirst(asks []Ask, n int) float64 {

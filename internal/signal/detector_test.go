@@ -416,6 +416,75 @@ func TestMuteSuppressesTheAlertNotTheEvaluation(t *testing.T) {
 	}
 }
 
+// Production, 12 Aug: a 53 GRAM Fine Pen was pushed as a signal while the
+// ticket cap was 5.5 and the wallet held 25.1. Nobody could act on it, in
+// either direction — that is not an opportunity, it is a 2am notification.
+func TestUnaffordableLotIsNotASignal(t *testing.T) {
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 40, 40)
+	h.seedStat(t, 800, 12)
+	h.det.Spendable = func() (float64, bool) { return 100, true }
+
+	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if dec == nil {
+		t.Fatal("no decision at all")
+	}
+	if dec.Signal {
+		t.Error("a lot 8x the spendable budget must not alert")
+	}
+	if !containsSubstring(dec.SignalFails, "поднять сейчас можно максимум") {
+		t.Errorf("the refusal must name the budget: %v", dec.SignalFails)
+	}
+
+	// The same listing with money behind it is still a signal.
+	h.det.Spendable = func() (float64, bool) { return 5000, true }
+	dec, err = h.det.EvaluateFresh(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if !dec.Signal {
+		t.Errorf("affordable and profitable, but rejected: %v", dec.SignalFails)
+	}
+}
+
+// The overpriced-listing guard, end to end: a hole in the book plus a cheaper
+// external queue must not reach the operator as a buy.
+func TestOverpricedListingIsRejectedWithAnExplanation(t *testing.T) {
+	h := newHarness(t, 6, 4.21, 7.9, 10.2)
+	h.seedSales(t, 3.85, 9, 9)
+	h.seedStat(t, 4.21, 13)
+	h.cfg.Sig.MinPrice, h.cfg.Sig.MinSales, h.cfg.Sig.MinVelocity = 0.1, 5, 0.1
+	h.det.CrossSupport = func(context.Context, pricing.Valuation) pricing.CrossMarket {
+		return pricing.CrossMarket{Support: 5, Venues: 1, Asks: []float64{4, 5, 5, 5.89, 6}}
+	}
+
+	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 6), defaultLimits(), time.Now())
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if dec == nil {
+		t.Fatal("no decision at all")
+	}
+	if dec.Signal {
+		t.Fatalf("6 GRAM behind a 4.21 ask and a 4 / 5 / 5 Portals queue must not be a signal: exit %.3f", dec.Val.FastExit)
+	}
+	// The hole is what used to invent the edge: 4.21 / 7.90 / 10.20 has one
+	// price point of real liquidity, not three.
+	if dec.Val.LiveDepthCount != 1 || !dec.Val.DepthCapped {
+		t.Errorf("the gappy book was still trusted: depth %.3f over %d asks (capped=%v)",
+			dec.Val.LiveDepth, dec.Val.LiveDepthCount, dec.Val.DepthCapped)
+	}
+	if dec.Val.AsksBelowEntry < 5 {
+		t.Errorf("asks below entry = %d, want the Tonnel 4.21 plus the Portals queue", dec.Val.AsksBelowEntry)
+	}
+	if !containsSubstring(dec.SignalFails, "выше быстрого выхода") {
+		t.Errorf("the refusal must say why: %v", dec.SignalFails)
+	}
+}
+
 func TestGatesForExplainsAnAlreadySignalledListing(t *testing.T) {
 	h := newHarness(t)
 	v := pricing.Valuation{Valid: false, Reason: "no exit reference"}
