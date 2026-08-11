@@ -19,9 +19,12 @@ const (
 	sortSalesLatest = `{"timestamp":-1,"gift_id":-1}`
 )
 
-// AssetTON is the only asset Floorline trades. USDT-denominated listings live in
-// a separate book with a separate floor and are ignored on purpose.
-const AssetTON = "TON"
+// AssetGRAM is the native Gram currency. Tonnel has not migrated its private
+// wire value yet, so requests must still send the legacy literal "TON".
+const AssetGRAM = "TON"
+
+// AssetTON is kept for source compatibility; new code should use AssetGRAM.
+const AssetTON = AssetGRAM
 
 // maxPageLimit is enforced server-side; larger values return an error.
 const maxPageLimit = 30
@@ -38,7 +41,7 @@ func BaseFilter() Filter {
 		"refunded":  Filter{"$ne": true},
 		"buyer":     Filter{"$exists": false},
 		"export_at": Filter{"$exists": true},
-		"asset":     AssetTON,
+		"asset":     AssetGRAM,
 	}
 }
 
@@ -356,7 +359,8 @@ func (c *Client) Balance(ctx context.Context) (*Balance, error) {
 		return nil, err
 	}
 	b := &Balance{Raw: raw}
-	b.TON = pickFloat(raw, "balance", "ton", "TON", "tonBalance")
+	b.GRAM = pickFloat(raw, "balance", "gram", "GRAM", "gramBalance", "ton", "TON", "tonBalance")
+	b.TON = b.GRAM
 	b.USDT = pickFloat(raw, "usdt", "USDT", "usdtBalance")
 	b.Tonnel = pickFloat(raw, "tonnel", "TONNEL", "tonnelBalance")
 	return b, nil
@@ -428,7 +432,7 @@ func (c *Client) BuyGift(ctx context.Context, giftID int64, price float64) (*Res
 	}
 	body := map[string]any{
 		"authData":  c.Auth(),
-		"asset":     AssetTON,
+		"asset":     AssetGRAM,
 		"price":     price,
 		"timestamp": ts,
 		"wtf":       wtf,
@@ -451,7 +455,7 @@ func (c *Client) ListForSale(ctx context.Context, giftID int64, price float64) (
 		"authData":  c.Auth(),
 		"gift_id":   giftID,
 		"price":     price,
-		"asset":     AssetTON,
+		"asset":     AssetGRAM,
 		"timestamp": ts,
 		"wtf":       wtf,
 	}

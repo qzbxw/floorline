@@ -21,12 +21,18 @@ import (
 // nothing themselves — each method returns ready, HTML-safe output.
 type Backend interface {
 	Status(ctx context.Context) Reply
+	Gram(ctx context.Context) Reply
 	Floor(ctx context.Context, collection, model string) Reply
 	BookText(ctx context.Context, collection, model string) Reply
 	Hist(ctx context.Context, collection, model string) Reply
 	Val(ctx context.Context, giftID int64) Reply
 
 	Positions(ctx context.Context) Reply
+	Portfolio(ctx context.Context) Reply
+	Advice(ctx context.Context, giftID int64) Reply
+	PositionHistory(ctx context.Context, giftID int64) Reply
+	SetCost(ctx context.Context, giftID int64, price float64) Reply
+	ExitAt(ctx context.Context, giftID int64, price float64, confirm string) Reply
 	PnL(ctx context.Context) Reply
 	BalanceText(ctx context.Context) Reply
 	Relist(ctx context.Context, giftID int64) Reply
@@ -202,6 +208,9 @@ func (b *Bot) register() {
 	tb.Handle("/status", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Status(ctx)
 	}))
+	tb.Handle("/gram", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		return b.back.Gram(ctx)
+	}))
 
 	tb.Handle("/floor", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
@@ -237,6 +246,49 @@ func (b *Bot) register() {
 
 	tb.Handle("/pos", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Positions(ctx)
+	}))
+	tb.Handle("/portfolio", b.reply(func(ctx context.Context, c tele.Context) Reply { return b.back.Portfolio(ctx) }))
+	tb.Handle("/advice", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
+		if err != nil {
+			return Text("Usage: <code>/advice 123456</code>")
+		}
+		return b.back.Advice(ctx, id)
+	}))
+	tb.Handle("/history", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
+		if err != nil {
+			return Text("Usage: <code>/history 123456</code>")
+		}
+		return b.back.PositionHistory(ctx, id)
+	}))
+	tb.Handle("/cost", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		f := strings.Fields(c.Message().Payload)
+		if len(f) != 2 {
+			return Text("Usage: <code>/cost 123456 4.25</code>")
+		}
+		id, e1 := strconv.ParseInt(f[0], 10, 64)
+		price, e2 := strconv.ParseFloat(f[1], 64)
+		if e1 != nil || e2 != nil {
+			return Text("Usage: <code>/cost 123456 4.25</code>")
+		}
+		return b.back.SetCost(ctx, id, price)
+	}))
+	tb.Handle("/exit", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		f := strings.Fields(c.Message().Payload)
+		if len(f) < 2 {
+			return Text("Usage: <code>/exit 123456 3.25</code> (then confirm)")
+		}
+		id, e1 := strconv.ParseInt(f[0], 10, 64)
+		price, e2 := strconv.ParseFloat(f[1], 64)
+		if e1 != nil || e2 != nil {
+			return Text("Usage: <code>/exit 123456 3.25</code>")
+		}
+		confirm := ""
+		if len(f) == 3 {
+			confirm = f[2]
+		}
+		return b.back.ExitAt(ctx, id, price, confirm)
 	}))
 	tb.Handle("/pnl", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.PnL(ctx)
@@ -407,6 +459,10 @@ func (b *Bot) registerCallbacks() {
 			r = b.back.Status(ctx)
 		case "pnl":
 			r = b.back.PnL(ctx)
+		case "portfolio":
+			r = b.back.Portfolio(ctx)
+		case "gram":
+			r = b.back.Gram(ctx)
 		default:
 			return nil
 		}
@@ -559,7 +615,13 @@ func trimNum(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 // commandMenu is what Telegram shows when the operator types "/".
 var commandMenu = []tele.Command{
 	{Text: "status", Description: "pollers, data freshness, auto-buy state"},
+	{Text: "gram", Description: "GRAM rate and gift-floor lag"},
 	{Text: "pos", Description: "open positions"},
+	{Text: "portfolio", Description: "actions and risk-adjusted exits"},
+	{Text: "advice", Description: "gift_id — detailed position advice"},
+	{Text: "history", Description: "gift_id — full position lifecycle"},
+	{Text: "cost", Description: "gift_id price — set missing cost basis"},
+	{Text: "exit", Description: "gift_id price — manually confirmed loss exit"},
 	{Text: "pnl", Description: "realised and unrealised profit"},
 	{Text: "balance", Description: "account balance"},
 	{Text: "floor", Description: "Collection [/ Model] — floors and cheapest asks"},
@@ -582,6 +644,7 @@ var commandMenu = []tele.Command{
 const helpText = `<b>Floorline</b> — Tonnel gift trading desk.
 
 <b>Market</b>
+/gram — GRAM/USDT volatility and tracked gift-floor lag
 /floor <i>Collection [/ Model]</i> — floor, supply, rarity, cheapest asks
 /book <i>Collection / Model</i> — the ask ladder
 /hist <i>Collection / Model</i> — real trades, median, velocity
@@ -589,6 +652,11 @@ const helpText = `<b>Floorline</b> — Tonnel gift trading desk.
 
 <b>Book</b>
 /pos — open positions, each with a Relist button
+/portfolio — hold/relist/exit recommendations and conservative NAV
+/advice <i>gift_id</i> — fast and patient exits for one position
+/history <i>gift_id</i> — purchase, listings, market marks and final PnL
+/cost <i>gift_id price</i> — set a missing acquisition cost
+/exit <i>gift_id price</i> — prepare a manually confirmed exit, including below cost
 /pnl — realised and unrealised, net of fees
 /balance — account balance
 /relist <i>gift_id</i> — reprice an owned gift against the current book

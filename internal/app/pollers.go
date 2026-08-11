@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -64,6 +66,11 @@ func (a *App) pollFeed(ctx context.Context) error {
 			continue
 		}
 		if dec != nil && dec.Signal {
+			a.applyCrossMarketDecision(ctx, dec)
+			if fit, _, err := a.rm.PortfolioFit(ctx, dec.Val.Key, dec.Val.Price); err == nil {
+				dec.Val.ScoreBreakdown = pricing.BuildScore(dec.Val, fit)
+				dec.Score = dec.Val.ScoreBreakdown.Total
+			}
 			decisions = append(decisions, dec)
 		}
 	}
@@ -78,10 +85,55 @@ func (a *App) pollFeed(ctx context.Context) error {
 	return nil
 }
 
+// applyCrossMarketDecision treats other venues as a sanity check, never as an
+// executable arbitrage quote. A large disagreement makes unattended spending
+// unsafe; a moderate one reduces ranking confidence.
+func (a *App) applyCrossMarketDecision(ctx context.Context, dec *signal.Decision) {
+	if dec == nil || !a.cross.Enabled() || dec.Val.Exit <= 0 {
+		return
+	}
+	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	quotes := a.cross.QuotesForGift(qctx, dec.Val.Key.Name, dec.Val.Key.Model, dec.Val.Backdrop, dec.Val.Symbol)
+	if len(quotes) == 0 {
+		return
+	}
+	var nets []float64
+	for _, q := range quotes {
+		if q.NetReference() > 0 {
+			nets = append(nets, q.NetReference())
+		}
+	}
+	if len(nets) == 0 {
+		return
+	}
+	sort.Float64s(nets)
+	ext := nets[len(nets)/2]
+	diff := math.Abs(ext/dec.Val.Exit - 1)
+	switch {
+	case diff > .30:
+		dec.Auto = false
+		dec.AutoFails = append(dec.AutoFails, fmt.Sprintf("external ask books differ by %.0f%% (auto veto)", diff*100))
+		dec.Val.Confidence *= .5
+	case diff > .15:
+		dec.Val.Confidence *= .75
+	}
+	dec.Val.ScoreBreakdown = pricing.BuildScore(dec.Val, 1)
+	dec.Score = dec.Val.ScoreBreakdown.Total
+}
+
 // handleDecision records a signal, buys it if it clears every unattended gate,
 // and otherwise sends the card.
 func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time.Time) error {
 	v := dec.Val
+	payload, _ := json.Marshal(struct {
+		Score                 pricing.ScoreBreakdown `json:"score"`
+		Confidence            float64                `json:"confidence"`
+		ChosenExit            string                 `json:"chosen_exit"`
+		FastExit, PatientExit float64
+		Attribute             pricing.AttributeValue `json:"attribute"`
+		DataAgeSeconds        float64                `json:"data_age_seconds"`
+	}{v.ScoreBreakdown, v.Confidence, v.ChosenExit, v.FastExit, v.PatientExit, v.Attribute, v.DataAge.Seconds()})
 	sigID, err := a.st.InsertSignal(ctx, store.SignalRow{
 		TS:       now,
 		Kind:     signal.KindBuy,
@@ -92,6 +144,7 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 		Edge:     v.Edge,
 		Velocity: v.Liq.Velocity,
 		Score:    dec.Score,
+		Payload:  string(payload),
 	})
 	if err != nil {
 		return fmt.Errorf("record signal: %w", err)
@@ -314,7 +367,7 @@ func (a *App) detectSweeps(ctx context.Context, now time.Time) {
 // the balance, and raises book-keeping alerts.
 func (a *App) pollInventory(ctx context.Context) error {
 	if bal, err := a.api.Balance(ctx); err == nil {
-		a.rm.SetBalance(bal.TON)
+		a.rm.SetBalance(bal.GRAM)
 	} else {
 		log.Warn().Err(err).Msg("reading balance failed")
 	}
@@ -323,20 +376,25 @@ func (a *App) pollInventory(ctx context.Context) error {
 	owned := make(map[int64]tonnel.Gift)
 
 	for _, listed := range []bool{false, true} {
-		gifts, err := a.api.MyGifts(ctx, listed, 1, 30)
-		if err != nil {
-			return fmt.Errorf("read inventory (listed=%v): %w", listed, err)
-		}
-		for i := range gifts {
-			g := gifts[i]
-			owned[g.GiftID.Int()] = g
-			if err := a.reconcileOwned(ctx, g, listed, now); err != nil {
-				log.Warn().Err(err).Int64("gift", g.GiftID.Int()).Msg("reconciling a gift failed")
+		for page := 1; ; page++ {
+			gifts, err := a.api.MyGifts(ctx, listed, page, 30)
+			if err != nil {
+				return fmt.Errorf("read inventory (listed=%v page=%d): %w", listed, page, err)
+			}
+			for i := range gifts {
+				g := gifts[i]
+				owned[g.GiftID.Int()] = g
+				if err := a.reconcileOwned(ctx, g, listed, now); err != nil {
+					log.Warn().Err(err).Int64("gift", g.GiftID.Int()).Msg("reconciling a gift failed")
+				}
+			}
+			if len(gifts) < 30 {
+				break
 			}
 		}
 	}
 
-	positions, err := a.st.OpenPositions(ctx)
+	positions, err := a.st.TrackedPositions(ctx)
 	if err != nil {
 		return fmt.Errorf("load positions: %w", err)
 	}
@@ -347,6 +405,11 @@ func (a *App) pollInventory(ctx context.Context) error {
 		}
 		a.checkUndercut(ctx, p, now)
 		a.checkStale(ctx, p, now)
+	}
+	if a.throttle("position-marks", 10*time.Minute) {
+		if current, err := a.st.OpenPositions(ctx); err == nil {
+			a.snapshotPositionMarks(ctx, current, now)
+		}
 	}
 	return nil
 }
@@ -360,30 +423,111 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 		return err
 	}
 
-	if existing == nil {
+	reacquired := existing != nil && (existing.Status == store.StatusSold || existing.Status == store.StatusReturned)
+	if existing == nil || reacquired {
 		// Bought outside Floorline: track it, but flag that the cost basis is
 		// unknown rather than silently pretending it was free.
+		after := time.Time{}
+		if reacquired {
+			after = existing.SoldAt
+		}
+		buyPrice, boughtAt, found, lookupErr := a.st.AcquisitionForGiftAfter(ctx, id, after)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		costSource, costConfidence := "unknown", 0.0
+		note := "imported from inventory; entry price unknown — set with /cost"
+		if found {
+			costSource, costConfidence, note = "sale_history", .85, "imported from inventory; cost recovered from trade history"
+		} else {
+			boughtAt = now
+		}
+		_, mr := tonnel.SplitAttr(g.Model)
+		_, br := tonnel.SplitAttr(g.Backdrop)
+		_, sr := tonnel.SplitAttr(g.Symbol)
+		source, eventKind := "import", "acquired"
+		if reacquired {
+			source, eventKind = "reacquired", "reacquired"
+		}
 		pos := store.Position{
-			GiftID:   id,
-			GiftNum:  g.GiftNum.Int(),
-			Key:      g.Key(),
-			Backdrop: tonnel.BaseAttr(g.Backdrop),
-			Symbol:   tonnel.BaseAttr(g.Symbol),
-			BoughtAt: now,
-			Status:   store.StatusOpen,
-			Source:   "import",
-			Note:     "imported from inventory; entry price unknown",
+			GiftID:      id,
+			GiftNum:     g.GiftNum.Int(),
+			Key:         g.Key(),
+			Backdrop:    tonnel.BaseAttr(g.Backdrop),
+			Symbol:      tonnel.BaseAttr(g.Symbol),
+			ModelRarity: mr, BackdropRarity: br, SymbolRarity: sr,
+			BuyPrice: buyPrice, BoughtAt: boughtAt,
+			CostSource: costSource, CostConfidence: costConfidence,
+			Status: store.StatusOpen,
+			Source: source,
+			Note:   note,
 		}
 		if listed {
 			pos.Status = store.StatusListed
 			pos.ListPrice = g.Price.Float()
 			pos.ListedAt = now
 		}
-		return a.st.UpsertPosition(ctx, pos)
+		if err := a.st.UpsertPosition(ctx, pos); err != nil {
+			return err
+		}
+		if err := a.st.RecordPositionEvent(ctx, id, eventKind, 0, buyPrice, note, boughtAt); err != nil {
+			return err
+		}
+		if listed {
+			return a.st.RecordPositionEvent(ctx, id, "listed", 0, g.Price.Float(), "observed in Tonnel inventory", now)
+		}
+		return nil
 	}
 
+	if existing.BuyPrice <= 0 {
+		after := time.Time{}
+		if existing.Source == "reacquired" {
+			if cycles, _ := a.st.PositionTradesForGift(ctx, id); len(cycles) > 0 {
+				after = cycles[0].SoldAt
+			}
+		}
+		if price, boughtAt, found, err := a.st.AcquisitionForGiftAfter(ctx, id, after); err != nil {
+			return err
+		} else if found {
+			if err := a.st.SetRecoveredCostBasis(ctx, id, price, boughtAt, "sale_history", .85); err != nil {
+				return err
+			}
+			_ = a.st.RecordPositionEvent(ctx, id, "cost_recovered", 0, price, "matched physical gift in Tonnel sales", now)
+			existing.BuyPrice, existing.BoughtAt = price, boughtAt
+		}
+	}
+	if existing.Status == store.StatusMissing {
+		if listed {
+			if err := a.st.SetPositionListed(ctx, id, g.Price.Float(), now); err != nil {
+				return err
+			}
+			return a.st.RecordPositionEvent(ctx, id, "returned", 0, g.Price.Float(), "gift reappeared listed", now)
+		}
+	}
 	if listed && g.Price.Float() > 0 && existing.ListPrice != g.Price.Float() {
-		return a.st.SetPositionListed(ctx, id, g.Price.Float(), now)
+		old := existing.ListPrice
+		if err := a.st.SetPositionListed(ctx, id, g.Price.Float(), now); err != nil {
+			return err
+		}
+		kind := "listed"
+		if old > 0 {
+			kind = "repriced"
+			_ = a.st.RecordReprice(ctx, id, old, g.Price.Float(), "observed manual/external reprice", now)
+		}
+		return a.st.RecordPositionEvent(ctx, id, kind, old, g.Price.Float(), "observed in Tonnel inventory", now)
+	}
+	if !listed && (existing.Status == store.StatusListed || existing.Status == store.StatusMissing || existing.ListPrice > 0) {
+		old := existing.ListPrice
+		if err := a.st.SetPositionUnlisted(ctx, id); err != nil {
+			return err
+		}
+		kind := "unlisted"
+		detail := "removed from sale"
+		if existing.Status == store.StatusMissing {
+			kind = "returned"
+			detail = "gift reappeared unlisted"
+		}
+		return a.st.RecordPositionEvent(ctx, id, kind, old, 0, detail, now)
 	}
 	return nil
 }
@@ -391,39 +535,73 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 // closePosition records a position that has left our inventory, preferring the
 // real sale price from the trade history over the price we listed at.
 func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time) {
-	price := p.ListPrice
-	note := ""
-
-	sales, err := a.st.SalesSince(ctx, p.Key, p.BoughtAt)
-	if err == nil {
-		for _, s := range sales {
-			if s.GiftID == p.GiftID {
-				price = s.Price
-				note = ""
-				break
+	after := p.BoughtAt
+	price, soldAt, found, err := a.st.SaleForGiftAfter(ctx, p.GiftID, after)
+	if err != nil {
+		log.Warn().Err(err).Int64("gift", p.GiftID).Msg("confirming position sale failed")
+		return
+	}
+	if !found {
+		if p.Status != store.StatusMissing {
+			if err := a.st.SetPositionMissing(ctx, p.GiftID, now); err != nil {
+				return
 			}
+			_ = a.st.RecordPositionEvent(ctx, p.GiftID, "missing", p.ListPrice, 0, "left Tonnel inventory; no matching sale yet", now)
+			a.notify(fmt.Sprintf("🔎 <b>Inventory change</b> — %s\nGift left Tonnel inventory, but no sale is confirmed. It is marked missing, not sold; Floorline will keep checking history.\n<code>/history %d</code>", bot.Esc(p.Key.String()), p.GiftID))
 		}
-	}
-	if price <= 0 {
-		note = "sale price unknown"
+		return
 	}
 
-	if err := a.st.SetPositionSold(ctx, p.GiftID, price, now); err != nil {
+	if err := a.st.SetPositionSold(ctx, p.GiftID, price, soldAt); err != nil {
 		log.Warn().Err(err).Int64("gift", p.GiftID).Msg("closing position failed")
 		return
 	}
+	_ = a.st.RecordPositionEvent(ctx, p.GiftID, "sold", p.ListPrice, price, "confirmed by Tonnel sale history", soldAt)
 
 	msg := fmt.Sprintf("💰 <b>Sold</b> — %s\nEntry %s → exit %s",
 		bot.Esc(p.Key.String()), num(p.BuyPrice), num(price))
 	if p.BuyPrice > 0 && price > 0 {
 		net := price*(1-a.cfg.TonnelFee) - p.BuyPrice
 		msg += fmt.Sprintf("\nNet %s (%+.1f%%) after %.1f%% fee, held %s",
-			num(net), net/p.BuyPrice*100, a.cfg.TonnelFee*100, dur(now.Sub(p.BoughtAt)))
-	}
-	if note != "" {
-		msg += "\n<i>" + bot.Esc(note) + "</i>"
+			num(net), net/p.BuyPrice*100, a.cfg.TonnelFee*100, dur(soldAt.Sub(p.BoughtAt)))
 	}
 	a.notify(msg)
+}
+
+func (a *App) snapshotPositionMarks(ctx context.Context, positions []store.Position, now time.Time) {
+	q, _, _ := a.st.LatestGramQuote(ctx)
+	for _, p := range positions {
+		events, _ := a.st.PositionEvents(ctx, p.GiftID, 1)
+		if len(events) == 0 {
+			_ = a.st.RecordPositionEvent(ctx, p.GiftID, "tracking_started", p.BuyPrice, p.ListPrice, "existing position adopted by lifecycle tracker", now)
+		}
+		ad := a.advisePosition(ctx, p, now)
+		m := store.PositionMark{TS: now, EntryPrice: p.BuyPrice, AskPrice: p.ListPrice, RecommendedExit: ad.Val.Exit, ExternalRef: ad.CrossReference, GramUSD: q.USD, Edge: ad.Val.Edge, ExpectedDays: ad.Val.ExpectedDays, Score: ad.Val.ScoreBreakdown.Total, Action: ad.Action}
+		if stat, _ := a.st.ModelStat(ctx, p.Key); stat != nil {
+			m.ModelFloor = stat.Floor
+		}
+		previous, _ := a.st.PositionMarks(ctx, p.GiftID, 1)
+		if len(previous) > 0 && now.Sub(previous[0].TS) < 10*time.Minute && previous[0].Action == m.Action && previous[0].AskPrice == m.AskPrice && relativeChange(previous[0].RecommendedExit, m.RecommendedExit) < .005 && relativeChange(previous[0].ModelFloor, m.ModelFloor) < .01 && relativeChange(previous[0].GramUSD, m.GramUSD) < .01 {
+			continue
+		}
+		if err := a.st.InsertPositionMark(ctx, p.GiftID, m); err != nil {
+			log.Warn().Err(err).Int64("gift", p.GiftID).Msg("saving position mark failed")
+			continue
+		}
+		if len(previous) > 0 && previous[0].Action != m.Action {
+			_ = a.st.RecordPositionEvent(ctx, p.GiftID, "advice_changed", previous[0].RecommendedExit, m.RecommendedExit, previous[0].Action+" → "+m.Action, now)
+		}
+	}
+}
+
+func relativeChange(old, new float64) float64 {
+	if old == 0 {
+		if new == 0 {
+			return 0
+		}
+		return 1
+	}
+	return math.Abs(new/old - 1)
 }
 
 // checkUndercut warns when our ask is no longer the cheapest.
@@ -440,6 +618,26 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 	}
 	if !a.throttle(fmt.Sprintf("undercut:%d:%.2f", p.GiftID, stat.Floor), 6*time.Hour) {
 		return
+	}
+	// Safe automatic repricing: never below cost+markup, never a large jump,
+	// and never more than once per six hours. Loss-taking remains manual.
+	if !a.cfg.ShadowMode && a.rm.Armed() && p.BuyPrice > 0 {
+		last, _ := a.st.LastReprice(ctx, p.GiftID)
+		if last.IsZero() || now.Sub(last) >= 6*time.Hour {
+			ad := a.advisePosition(ctx, p, now)
+			if preview := ad.Val; preview.Valid && ad.CrossDivergence <= .30 {
+				target := math.Floor(preview.Exit*100) / 100
+				change := math.Abs(target/p.ListPrice - 1)
+				if target >= p.BuyPrice*(1+a.rm.Limits().MinMarkup) && change >= .02 && change <= .15 {
+					if actual, _, err := a.ex.ListAt(ctx, p.GiftID, p.Key, target, p.BuyPrice, now); err == nil && actual > 0 {
+						_ = a.st.RecordReprice(ctx, p.GiftID, p.ListPrice, actual, "safe undercut response", now)
+						_ = a.st.RecordPositionEvent(ctx, p.GiftID, "repriced", p.ListPrice, actual, "safe automatic undercut response", now)
+						a.notify(fmt.Sprintf("♻️ <b>Auto-repriced</b> — %s\n%s → %s", bot.Esc(p.Key.String()), num(p.ListPrice), num(actual)))
+						return
+					}
+				}
+			}
+		}
 	}
 	a.notify(fmt.Sprintf(
 		"🥊 <b>Undercut</b> — %s\nYour ask %s · floor now %s (−%.1f%%)\nEntry %s · <code>/relist %d</code>",
@@ -529,5 +727,28 @@ func (a *App) trackedModels(ctx context.Context) ([]tonnel.ModelKey, error) {
 
 // maintenance prunes data that no longer affects a decision.
 func (a *App) maintenance(ctx context.Context) error {
-	return a.st.Prune(ctx, time.Now(), a.cfg.LookbackDays*3)
+	now := time.Now()
+	for _, h := range []int{1, 6, 24, 72} {
+		sigs, err := a.st.SignalsNeedingOutcome(ctx, h, now)
+		if err != nil {
+			return err
+		}
+		for _, s := range sigs {
+			price, sold, err := a.st.SaleForGiftBetween(ctx, s.GiftID, s.TS, s.TS.Add(time.Duration(h)*time.Hour))
+			if err != nil {
+				continue
+			}
+			floor := 0.0
+			if f, ok, _ := a.st.FloorAt(ctx, s.Key, s.TS.Add(time.Duration(h)*time.Hour)); ok {
+				floor = f
+			}
+			profitable := sold && price*(1-a.cfg.TonnelFee) > s.Price
+			_ = a.st.PutSignalOutcome(ctx, s.ID, h, now, sold, price, floor, profitable)
+		}
+	}
+	keep := a.cfg.LookbackDays * 3
+	if a.cfg.AttributeLookbackDays+15 > keep {
+		keep = a.cfg.AttributeLookbackDays + 15
+	}
+	return a.st.Prune(ctx, now, keep)
 }

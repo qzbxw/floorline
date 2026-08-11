@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -58,7 +59,7 @@ func main() {
 
 func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	switch cmd {
-	case "run", "smoke", "backfill", "dump":
+	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history":
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -75,6 +76,34 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	defer a.Close()
 
 	switch cmd {
+	case "history":
+		if flag.NArg() < 2 {
+			return fmt.Errorf("history requires a gift id")
+		}
+		id, err := strconv.ParseInt(flag.Arg(1), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid gift id: %w", err)
+		}
+		if err := a.SyncInventory(ctx); err != nil {
+			return err
+		}
+		fmt.Println(a.PositionHistory(ctx, id).Text)
+		return nil
+	case "gram":
+		if err := a.SyncGram(ctx); err != nil {
+			return err
+		}
+		fmt.Println(a.Gram(ctx).Text)
+		return nil
+	case "portfolio":
+		if err := a.SyncGram(ctx); err != nil {
+			log.Warn().Err(err).Msg("GRAM quote unavailable; portfolio will use native-price history")
+		}
+		if err := a.SyncInventory(ctx); err != nil {
+			return err
+		}
+		fmt.Println(a.PortfolioReport(ctx))
+		return nil
 	case "smoke":
 		fmt.Println("Probing Tonnel endpoints…")
 		fmt.Println()
@@ -94,7 +123,7 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 
 	case "backfill":
 		if days <= 0 {
-			days = cfg.LookbackDays
+			days = cfg.AttributeLookbackDays
 		}
 		fmt.Printf("Downloading %d days of trade history…\n", days)
 		start := time.Now()
@@ -136,6 +165,9 @@ Commands:
   run        start the pollers and the Telegram bot (default)
   smoke      probe every read endpoint and exit
   backfill   download trade history and exit
+  portfolio  sync all inventory pages and print recommendations
+  gram       refresh and print GRAM/USDT plus tracked floor lag
+  history ID sync inventory and print the full position lifecycle
   dump <x>   print one endpoint's raw JSON (feed, sales, sales-all, balance, mygifts)
 
 Flags:

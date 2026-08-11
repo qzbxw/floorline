@@ -21,6 +21,15 @@ type fakeSource struct {
 	calls   atomic.Int32
 }
 
+type fakeDepthSource struct {
+	fakeSource
+	asks []float64
+}
+
+func (f *fakeDepthSource) ModelAsks(context.Context, string, string, string, string, int) ([]float64, error) {
+	return append([]float64(nil), f.asks...), f.err
+}
+
 func (f *fakeSource) Venue() string { return f.name }
 func (f *fakeSource) Enabled() bool { return f.enabled }
 func (f *fakeSource) Fee() float64  { return f.fee }
@@ -68,6 +77,23 @@ func TestComparisonSkipsVenuesWithNothingToSay(t *testing.T) {
 	}
 	if got := quotes[0].Net(); got != 1620*0.98 {
 		t.Errorf("net = %v, want the floor less the 2%% venue fee", got)
+	}
+}
+
+func TestComparisonUsesActualAskDepthAndRobustReference(t *testing.T) {
+	d := &fakeDepthSource{fakeSource: fakeSource{name: "Depth", enabled: true, floor: 1, fee: .02}, asks: []float64{10, 20, 21, 40}}
+	quotes := NewComparison(d).QuotesForGift(context.Background(), "c", "m", "b", "s")
+	if len(quotes) != 1 || len(quotes[0].Asks) != 4 {
+		t.Fatalf("quotes = %+v", quotes)
+	}
+	if quotes[0].Floor != 10 || quotes[0].Reference() != 20 {
+		t.Fatalf("floor/reference = %.2f/%.2f, want 10/20", quotes[0].Floor, quotes[0].Reference())
+	}
+	if quotes[0].Scope != "exact attributes" {
+		t.Fatalf("scope = %q", quotes[0].Scope)
+	}
+	if quotes[0].NetReference() != 20*.98 {
+		t.Fatalf("net reference = %v", quotes[0].NetReference())
 	}
 }
 
@@ -200,13 +226,13 @@ func TestPortalsShortName(t *testing.T) {
 	}
 }
 
-// MRKT quotes integer nanoTON; showing those raw would be off by a billion.
-func TestNanoToTON(t *testing.T) {
-	if got := nanoToTON(1_240_000_000); got != 1.24 {
-		t.Errorf("nanoToTON = %v, want 1.24", got)
+// MRKT quotes integer nanoGRAM; showing those raw would be off by a billion.
+func TestNanoToGRAM(t *testing.T) {
+	if got := nanoToGRAM(1_240_000_000); got != 1.24 {
+		t.Errorf("nanoToGRAM = %v, want 1.24", got)
 	}
-	if got := nanoToTON(0); got != 0 {
-		t.Errorf("nanoToTON(0) = %v, want 0", got)
+	if got := nanoToGRAM(0); got != 0 {
+		t.Errorf("nanoToGRAM(0) = %v, want 0", got)
 	}
 }
 
@@ -222,6 +248,8 @@ func TestSourcesImplementTheInterface(t *testing.T) {
 
 	var _ Source = p
 	var _ Source = m
+	var _ DepthSource = p
+	var _ DepthSource = m
 
 	if !p.Enabled() || !m.Enabled() {
 		t.Error("both sources should be enabled when given credentials")

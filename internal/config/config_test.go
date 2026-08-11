@@ -64,10 +64,10 @@ func TestLoadDefaults(t *testing.T) {
 	if c.TonnelFee != 0.005 {
 		t.Errorf("TonnelFee = %v, want 0.005", c.TonnelFee)
 	}
-	if c.Sig.MinEdge != 0.05 || c.Sig.MinVelocity != 1.0 || c.Sig.MinSales != 10 {
-		t.Errorf("signal gates = %+v, want the medium profile", c.Sig)
+	if c.Sig.MinEdge != 0.01 || c.Sig.MinVelocity != .5 || c.Sig.MinSales != 6 {
+		t.Errorf("signal gates = %+v, want the micro-edge profile", c.Sig)
 	}
-	if c.Auto.MinEdge != 0.10 || c.Auto.MinTurnover != 0.6 {
+	if c.Auto.MinEdge != 0.03 || c.Auto.MinTurnover != 0.6 {
 		t.Errorf("auto gates = %+v, want the strict profile", c.Auto)
 	}
 	if c.FeedInterval != 2*time.Second {
@@ -142,7 +142,9 @@ func clearConfigEnv(t *testing.T) {
 		"SIG_MIN_TREND", "SIG_MIN_PRICE", "SIG_MAX_PRICE",
 		"AUTOBUY_MIN_EDGE", "AUTOBUY_MIN_VELOCITY", "AUTOBUY_MIN_SALES", "AUTOBUY_MIN_TURNOVER",
 		"AUTOBUY_MAX_MAD_RATIO", "AUTOBUY_MIN_TREND", "AUTOBUY_MAX_DATA_AGE",
-		"LOOKBACK_DAYS", "POLL_FEED", "POLL_STATS", "POLL_SALES", "POLL_INVENTORY",
+		"AUTOBUY_MAX_GRAM_MOVE_15M",
+		"LOOKBACK_DAYS", "ATTRIBUTE_LOOKBACK_DAYS", "SHADOW_MODE", "CALIBRATION_MIN_SIGNALS", "CALIBRATION_MIN_DAYS", "POLL_FEED", "POLL_STATS", "POLL_SALES", "POLL_INVENTORY",
+		"GRAM_QUOTE_URL", "POLL_GRAM",
 		"BOOK_CACHE_TTL", "READ_RPS", "READ_BURST", "HTTP_TIMEOUT",
 	}
 	for _, k := range keys {

@@ -132,7 +132,7 @@ func (a *App) probeFreshness(ctx context.Context, w io.Writer) error {
 				break
 			}
 			t := sales[i].When()
-			fmt.Fprintf(w, "    %s UTC  (%7s ago)  %9.2f TON  #%-7d %s\n",
+			fmt.Fprintf(w, "    %s UTC  (%7s ago)  %9.2f GRAM  #%-7d %s\n",
 				t.Format("15:04:05"), dur(now.Sub(t)), sales[i].Price.Float(),
 				sales[i].GiftNum.Int(), sales[i].Type)
 		}

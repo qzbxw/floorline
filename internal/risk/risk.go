@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,14 +28,17 @@ const (
 
 // Limits are the hard money constraints.
 type Limits struct {
-	MaxTicket         float64       `json:"max_ticket"`          // biggest single purchase
-	DailyBudget       float64       `json:"daily_budget"`        // total spend per UTC day
-	MaxOpenPositions  int           `json:"max_positions"`       // inventory ceiling
-	MaxBuysPerHour    int           `json:"max_buys_per_hour"`   // cascade brake
-	ModelCooldown     time.Duration `json:"model_cooldown"`      // no repeat buys of one model
-	MinBalanceReserve float64       `json:"min_balance_reserve"` // never spend below this
-	MinMarkup         float64       `json:"min_markup"`          // refuse to relist below entry+this
-	MaxExitDays       float64       `json:"max_exit_days"`       // must be sellable this fast
+	MaxTicket                float64       `json:"max_ticket"`          // biggest single purchase
+	DailyBudget              float64       `json:"daily_budget"`        // total spend per UTC day
+	MaxOpenPositions         int           `json:"max_positions"`       // inventory ceiling
+	MaxBuysPerHour           int           `json:"max_buys_per_hour"`   // cascade brake
+	ModelCooldown            time.Duration `json:"model_cooldown"`      // no repeat buys of one model
+	MinBalanceReserve        float64       `json:"min_balance_reserve"` // never spend below this
+	MinMarkup                float64       `json:"min_markup"`          // refuse to relist below entry+this
+	MaxExitDays              float64       `json:"max_exit_days"`       // must be sellable this fast
+	MaxModelExposurePct      float64       `json:"max_model_exposure_pct"`
+	MaxCollectionExposurePct float64       `json:"max_collection_exposure_pct"`
+	MaxPositionsPerModel     int           `json:"max_positions_per_model"`
 }
 
 // DefaultLimits deliberately leaves MaxTicket and DailyBudget at zero. Arming
@@ -42,14 +46,17 @@ type Limits struct {
 // the bot to spend.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxTicket:         0,
-		DailyBudget:       0,
-		MaxOpenPositions:  8,
-		MaxBuysPerHour:    3,
-		ModelCooldown:     15 * time.Minute,
-		MinBalanceReserve: 0,
-		MinMarkup:         0.03,
-		MaxExitDays:       3,
+		MaxTicket:                0,
+		DailyBudget:              0,
+		MaxOpenPositions:         8,
+		MaxBuysPerHour:           3,
+		ModelCooldown:            15 * time.Minute,
+		MinBalanceReserve:        0,
+		MinMarkup:                0.03,
+		MaxExitDays:              3,
+		MaxModelExposurePct:      .15,
+		MaxCollectionExposurePct: .30,
+		MaxPositionsPerModel:     2,
 	}
 }
 
@@ -83,6 +90,15 @@ func New(ctx context.Context, st *store.Store) (*Manager, error) {
 		var l Limits
 		if err := json.Unmarshal([]byte(raw), &l); err == nil {
 			m.limits = l
+			if m.limits.MaxModelExposurePct <= 0 {
+				m.limits.MaxModelExposurePct = .15
+			}
+			if m.limits.MaxCollectionExposurePct <= 0 {
+				m.limits.MaxCollectionExposurePct = .30
+			}
+			if m.limits.MaxPositionsPerModel <= 0 {
+				m.limits.MaxPositionsPerModel = 2
+			}
 		}
 	}
 	armed, err := st.GetKV(ctx, kvArmed)
@@ -260,6 +276,13 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 				now.Sub(last).Round(time.Second), l.ModelCooldown)
 		}
 	}
+	fit, why, err := m.portfolioFit(ctx, key, price, l)
+	if err != nil {
+		return false, "portfolio exposure unavailable: " + err.Error()
+	}
+	if fit <= 0 {
+		return false, why
+	}
 
 	if balanceKnown && l.MinBalanceReserve > 0 && balance-price < l.MinBalanceReserve {
 		return false, fmt.Sprintf("balance %.2f would drop below reserve %.2f", balance, l.MinBalanceReserve)
@@ -269,6 +292,66 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 	}
 
 	return true, ""
+}
+
+// PortfolioFit is a soft ranking multiplier which reaches zero at a hard
+// concentration limit. Allow uses the same calculation as a veto.
+func (m *Manager) PortfolioFit(ctx context.Context, key tonnel.ModelKey, price float64) (float64, string, error) {
+	return m.portfolioFit(ctx, key, price, m.Limits())
+}
+
+func (m *Manager) portfolioFit(ctx context.Context, key tonnel.ModelKey, price float64, l Limits) (float64, string, error) {
+	mv, cv, count, err := m.st.PositionExposure(ctx, key)
+	if err != nil {
+		return 0, "", err
+	}
+	if l.MaxPositionsPerModel > 0 && count >= l.MaxPositionsPerModel {
+		return 0, fmt.Sprintf("%d positions in this model, limit %d", count, l.MaxPositionsPerModel), nil
+	}
+	positions, err := m.st.OpenPositions(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	// Percentage limits need an actual portfolio denominator. During bootstrap
+	// the per-model count limit is the meaningful guard; otherwise the first
+	// purchase would necessarily be 100% concentrated and no portfolio could
+	// ever be built.
+	if len(positions) < 3 {
+		return 1, "", nil
+	}
+	nav := 0.0
+	for _, p := range positions {
+		if p.BuyPrice > 0 {
+			nav += p.BuyPrice
+		} else if p.ListPrice > 0 {
+			nav += p.ListPrice
+		}
+	}
+	m.mu.RLock()
+	if m.balanceKnown {
+		nav += m.balance
+	}
+	m.mu.RUnlock()
+	if nav+price <= 0 {
+		return 1, "", nil
+	}
+	nav += price
+	mPct := (mv + price) / nav
+	cPct := (cv + price) / nav
+	if l.MaxModelExposurePct > 0 && mPct > l.MaxModelExposurePct {
+		return 0, fmt.Sprintf("model exposure %.0f%% above %.0f%%", mPct*100, l.MaxModelExposurePct*100), nil
+	}
+	if l.MaxCollectionExposurePct > 0 && cPct > l.MaxCollectionExposurePct {
+		return 0, fmt.Sprintf("collection exposure %.0f%% above %.0f%%", cPct*100, l.MaxCollectionExposurePct*100), nil
+	}
+	fit := 1.0
+	if l.MaxModelExposurePct > 0 {
+		fit = math.Min(fit, 1-mPct/l.MaxModelExposurePct*.5)
+	}
+	if l.MaxCollectionExposurePct > 0 {
+		fit = math.Min(fit, 1-cPct/l.MaxCollectionExposurePct*.5)
+	}
+	return math.Max(fit, .1), "", nil
 }
 
 // Commit books a completed purchase against the daily budget.
@@ -352,6 +435,24 @@ func applyLimit(l *Limits, key, value string) error {
 			return fmt.Errorf("max_exit_days must be a positive number of days")
 		}
 		l.MaxExitDays = v
+	case "max_model_exposure_pct":
+		v, err := num()
+		if err != nil || v <= 0 || v > 1 {
+			return fmt.Errorf("max_model_exposure_pct must be in (0,1]")
+		}
+		l.MaxModelExposurePct = v
+	case "max_collection_exposure_pct":
+		v, err := num()
+		if err != nil || v <= 0 || v > 1 {
+			return fmt.Errorf("max_collection_exposure_pct must be in (0,1]")
+		}
+		l.MaxCollectionExposurePct = v
+	case "max_positions_per_model":
+		v, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || v <= 0 {
+			return fmt.Errorf("max_positions_per_model must be positive")
+		}
+		l.MaxPositionsPerModel = v
 	default:
 		return fmt.Errorf("unknown limit %q; known: %s", key, strings.Join(LimitKeys(), ", "))
 	}
@@ -363,6 +464,7 @@ func LimitKeys() []string {
 	keys := []string{
 		"max_ticket", "daily_budget", "max_positions", "max_buys_per_hour",
 		"model_cooldown_min", "min_balance_reserve", "min_markup", "max_exit_days",
+		"max_model_exposure_pct", "max_collection_exposure_pct", "max_positions_per_model",
 	}
 	sort.Strings(keys)
 	return keys
@@ -384,6 +486,9 @@ func (m *Manager) Describe(ctx context.Context, now time.Time) string {
 	fmt.Fprintf(&b, "min_balance_reserve %s\n", money(l.MinBalanceReserve))
 	fmt.Fprintf(&b, "min_markup          %.1f%%\n", l.MinMarkup*100)
 	fmt.Fprintf(&b, "max_exit_days       %.1f\n", l.MaxExitDays)
+	fmt.Fprintf(&b, "max_model_exposure  %.0f%%\n", l.MaxModelExposurePct*100)
+	fmt.Fprintf(&b, "max_collection_exp  %.0f%%\n", l.MaxCollectionExposurePct*100)
+	fmt.Fprintf(&b, "max_pos_per_model   %d\n", l.MaxPositionsPerModel)
 	return b.String()
 }
 

@@ -29,12 +29,14 @@ type Liquidity struct {
 	// changing hands; near 0 means the same one going in circles.
 	Turnover float64
 
-	Velocity float64 // trades per day, normalised to the history we really have
-	Median   float64 // median price over the window
-	Median7  float64 // median price over the last 7 days
-	MAD      float64 // median absolute deviation
-	MADRatio float64 // MAD / Median — dispersion, i.e. how quotable this model is
-	Trend    float64 // Median7 / Median; < 1 means the model is bleeding
+	Velocity   float64 // trades per day, normalised to the history we really have
+	Median     float64 // median price over the window
+	RawMedian  float64 // unadjusted historical GRAM median
+	FXCoverage float64 // share of sales normalized with a nearby GRAM/USD quote
+	Median7    float64 // median price over the last 7 days
+	MAD        float64 // median absolute deviation
+	MADRatio   float64 // MAD / Median — dispersion, i.e. how quotable this model is
+	Trend      float64 // Median7 / Median; < 1 means the model is bleeding
 
 	LastSale time.Time
 }

@@ -113,7 +113,7 @@ func TestReplyBuilder(t *testing.T) {
 }
 
 func TestTextfFormats(t *testing.T) {
-	if got := Textf("%d TON", 1240).Text; got != "1240 TON" {
+	if got := Textf("%d GRAM", 1240).Text; got != "1240 GRAM" {
 		t.Errorf("Textf = %q", got)
 	}
 }

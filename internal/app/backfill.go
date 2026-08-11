@@ -87,6 +87,9 @@ func (a *App) Backfill(ctx context.Context, days int, onProgress func(BackfillPr
 	if err := a.st.SetKV(ctx, "backfill.done", "1"); err != nil {
 		return err
 	}
+	if days >= a.cfg.AttributeLookbackDays {
+		_ = a.st.SetKV(ctx, "backfill.attributes.done", "1")
+	}
 	if err := a.refreshCoverage(ctx); err != nil {
 		return err
 	}
@@ -104,7 +107,7 @@ func (a *App) Backfill(ctx context.Context, days int, onProgress func(BackfillPr
 // backfillIfNeeded runs the history download on first start, in the background,
 // and tells the operator when the bot becomes ready to act on its own.
 func (a *App) backfillIfNeeded(ctx context.Context) {
-	done, err := a.st.GetKV(ctx, "backfill.done")
+	done, err := a.st.GetKV(ctx, "backfill.attributes.done")
 	if err != nil {
 		log.Warn().Err(err).Msg("could not read backfill state")
 		return
@@ -114,12 +117,12 @@ func (a *App) backfillIfNeeded(ctx context.Context) {
 	}
 
 	a.notify(fmt.Sprintf(
-		"⏳ Downloading %d days of trade history. Signals stay conservative and auto-buy is held back until this finishes.",
-		a.cfg.LookbackDays))
+		"⏳ Downloading %d days of trade history for model liquidity and attribute premiums. Signals stay conservative and auto-buy is held back until this finishes.",
+		a.cfg.AttributeLookbackDays))
 
 	start := time.Now()
 	last := time.Now()
-	err = a.Backfill(ctx, a.cfg.LookbackDays, func(p BackfillProgress) {
+	err = a.Backfill(ctx, a.cfg.AttributeLookbackDays, func(p BackfillProgress) {
 		if p.Finished || time.Since(last) < 30*time.Second {
 			return
 		}

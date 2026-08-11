@@ -1,16 +1,16 @@
-// Package market reads model floor prices from other gift marketplaces.
+// Package market reads active sell queues from other gift marketplaces.
 //
 // This is a price *reference* only. Floorline never trades on these venues:
 // moving a gift out of Tonnel's off-chain engine to sell it elsewhere takes
 // minutes to hours plus gas, by which time any spread has gone. What the
-// comparison is good for is sanity — if Tonnel's floor for a model is far off
-// what a second venue shows, one of the two numbers is wrong and the trade
-// deserves a second look.
+// comparison is good for is sanity — if Tonnel's executable exit is far from
+// the first few asks elsewhere, the trade deserves a second look.
 package market
 
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,19 +24,43 @@ import (
 // churning User-Agent is something no real browser produces.
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-// nanoTON is the denomination both Portals and MRKT quote integer prices in.
-const nanoTON = 1_000_000_000
+// nanoGRAM is the denomination both Portals and MRKT quote integer prices in.
+const nanoGRAM = 1_000_000_000
 
-// Quote is one venue's floor for a model.
+// Quote is one venue's live sell queue for a model.
 type Quote struct {
 	Venue string
 	Floor float64
+	// Asks is the actual cheapest sell queue, not a cached headline floor.
+	Asks  []float64
+	Scope string // exact attributes | model | floor only
 	// Fee is that venue's sale commission, used only to annotate the quote.
 	Fee float64
 }
 
 // Net is what the floor would actually pay out on that venue.
 func (q Quote) Net() float64 { return q.Floor * (1 - q.Fee) }
+
+// Reference is deliberately robust to one bait floor: with enough depth it is
+// the median of the three cheapest real asks. This is a market sanity check,
+// not a promise that a cross-venue transfer can execute instantly.
+func (q Quote) Reference() float64 {
+	if len(q.Asks) == 0 {
+		return q.Floor
+	}
+	n := len(q.Asks)
+	if n > 3 {
+		n = 3
+	}
+	x := append([]float64(nil), q.Asks[:n]...)
+	sort.Float64s(x)
+	if n%2 == 1 {
+		return x[n/2]
+	}
+	return (x[n/2-1] + x[n/2]) / 2
+}
+
+func (q Quote) NetReference() float64 { return q.Reference() * (1 - q.Fee) }
 
 // Source is one marketplace we can read a model floor from.
 type Source interface {
@@ -47,6 +71,16 @@ type Source interface {
 	// error means the venue simply has nothing listed; an error means it could
 	// not be asked. Cards ignore the distinction, diagnostics do not.
 	ModelFloor(ctx context.Context, collection, model string) (float64, error)
+}
+
+type AttributeSource interface {
+	ModelFloorForAttributes(ctx context.Context, collection, model, backdrop, symbol string) (float64, error)
+}
+
+// DepthSource exposes live listings. Sources without it still contribute a
+// floor, but depth-aware venues are preferred everywhere decisions are made.
+type DepthSource interface {
+	ModelAsks(ctx context.Context, collection, model, backdrop, symbol string, limit int) ([]float64, error)
 }
 
 // Comparison fans a lookup out across every configured venue.
@@ -84,6 +118,12 @@ func (c *Comparison) Venues() []string {
 // have nothing to say. A slow or broken venue delays the card by at most the
 // context deadline and never blocks the others.
 func (c *Comparison) Quotes(ctx context.Context, collection, model string) []Quote {
+	return c.QuotesForGift(ctx, collection, model, "", "")
+}
+
+// QuotesForGift asks venues with attribute-aware APIs for a tighter comparable
+// and gracefully falls back to their model floor otherwise.
+func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backdrop, symbol string) []Quote {
 	if !c.Enabled() {
 		return nil
 	}
@@ -94,8 +134,30 @@ func (c *Comparison) Quotes(ctx context.Context, collection, model string) []Quo
 		wg.Add(1)
 		go func(i int, s Source) {
 			defer wg.Done()
-			if floor, err := s.ModelFloor(ctx, collection, model); err == nil && floor > 0 {
-				results[i] = Quote{Venue: s.Venue(), Floor: floor, Fee: s.Fee()}
+			var floor float64
+			var asks []float64
+			var err error
+			scope := "floor only"
+			if ds, ok := s.(DepthSource); ok {
+				asks, err = ds.ModelAsks(ctx, collection, model, backdrop, symbol, 20)
+				if err == nil && len(asks) == 0 && (backdrop != "" || symbol != "") {
+					asks, err = ds.ModelAsks(ctx, collection, model, "", "", 20)
+					scope = "model"
+				} else if len(asks) > 0 && (backdrop != "" || symbol != "") {
+					scope = "exact attributes"
+				} else if len(asks) > 0 {
+					scope = "model"
+				}
+				if len(asks) > 0 {
+					floor = asks[0]
+				}
+			} else if as, ok := s.(AttributeSource); ok && (backdrop != "" || symbol != "") {
+				floor, err = as.ModelFloorForAttributes(ctx, collection, model, backdrop, symbol)
+			} else {
+				floor, err = s.ModelFloor(ctx, collection, model)
+			}
+			if err == nil && floor > 0 {
+				results[i] = Quote{Venue: s.Venue(), Floor: floor, Asks: asks, Scope: scope, Fee: s.Fee()}
 			}
 		}(i, s)
 	}
@@ -114,9 +176,11 @@ func (c *Comparison) Quotes(ctx context.Context, collection, model string) []Quo
 // Probing is the diagnostic form of Quotes: it keeps the per-venue error so
 // "nothing listed here" can be told apart from "credentials rejected".
 type Probing struct {
-	Venue string
-	Floor float64
-	Err   error
+	Venue     string
+	Floor     float64
+	Asks      []float64
+	Reference float64
+	Err       error
 }
 
 // Probe queries every venue and reports exactly what each one said.
@@ -130,8 +194,19 @@ func (c *Comparison) Probe(ctx context.Context, collection, model string) []Prob
 		wg.Add(1)
 		go func(i int, s Source) {
 			defer wg.Done()
-			floor, err := s.ModelFloor(ctx, collection, model)
-			out[i] = Probing{Venue: s.Venue(), Floor: floor, Err: err}
+			var floor float64
+			var asks []float64
+			var err error
+			if ds, ok := s.(DepthSource); ok {
+				asks, err = ds.ModelAsks(ctx, collection, model, "", "", 20)
+				if len(asks) > 0 {
+					floor = asks[0]
+				}
+			} else {
+				floor, err = s.ModelFloor(ctx, collection, model)
+			}
+			q := Quote{Floor: floor, Asks: asks}
+			out[i] = Probing{Venue: s.Venue(), Floor: floor, Asks: asks, Reference: q.Reference(), Err: err}
 		}(i, s)
 	}
 	wg.Wait()
@@ -198,8 +273,8 @@ func matchKey(s string) string {
 	return strings.ToLower(strings.Join(strings.Fields(s), " "))
 }
 
-// nanoToTON converts an integer nanoTON price to TON.
-func nanoToTON(n int64) float64 { return float64(n) / nanoTON }
+// nanoToGRAM converts an integer nanoGRAM price to GRAM.
+func nanoToGRAM(n int64) float64 { return float64(n) / nanoGRAM }
 
 // errNoCredentials is returned by a source that was asked despite being disabled.
 var errNoCredentials = errors.New("no credentials configured")

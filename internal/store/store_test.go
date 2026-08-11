@@ -218,6 +218,112 @@ func TestSpendLedgerAccumulates(t *testing.T) {
 	}
 }
 
+func TestGramQuotesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	quotes := []GramQuote{{TS: now.Add(-time.Hour), USD: 1.25}, {TS: now, USD: 1.5, Bid: 1.49, Ask: 1.51, Change24: .08}}
+	if err := st.InsertGramQuotes(ctx, quotes); err != nil {
+		t.Fatalf("insert quotes: %v", err)
+	}
+	latest, ok, err := st.LatestGramQuote(ctx)
+	if err != nil || !ok || latest.USD != 1.5 || latest.Bid != 1.49 {
+		t.Fatalf("latest = %+v, %v, %v", latest, ok, err)
+	}
+	at, ok, err := st.GramQuoteAt(ctx, now.Add(-30*time.Minute))
+	if err != nil || !ok || at.USD != 1.25 {
+		t.Fatalf("historical = %+v, %v, %v", at, ok, err)
+	}
+}
+
+func TestPositionLifecycleJournalAndMarks(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	p := Position{GiftID: 77, GiftNum: 7, Key: key, BuyPrice: 10, BoughtAt: now.Add(-time.Hour), Status: StatusListed, Source: "manual", ListPrice: 12, ListedAt: now}
+	if err := st.UpsertPosition(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordPositionEvent(ctx, 77, "acquired", 0, 10, "manual", p.BoughtAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordPositionEvent(ctx, 77, "listed", 0, 12, "manual", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertPositionMark(ctx, 77, PositionMark{TS: now, EntryPrice: 10, AskPrice: 12, RecommendedExit: 11.5, ExternalRef: 11.8, GramUSD: 1.33, Edge: .144, Action: "HOLD"}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := st.PositionEvents(ctx, 77, 10)
+	if err != nil || len(events) != 2 || events[0].Kind != "listed" {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+	marks, err := st.PositionMarks(ctx, 77, 10)
+	if err != nil || len(marks) != 1 || marks[0].ExternalRef != 11.8 {
+		t.Fatalf("marks=%+v err=%v", marks, err)
+	}
+	if err := st.SetPositionMissing(ctx, 77, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	open, _ := st.OpenPositions(ctx)
+	if len(open) != 0 {
+		t.Fatalf("missing position counted open: %+v", open)
+	}
+	tracked, _ := st.TrackedPositions(ctx)
+	if len(tracked) != 1 || tracked[0].Status != StatusMissing || tracked[0].MissingSince.IsZero() {
+		t.Fatalf("tracked=%+v", tracked)
+	}
+	if err := st.SetPositionUnlisted(ctx, 77); err != nil {
+		t.Fatal(err)
+	}
+	p2, _ := st.GetPosition(ctx, 77)
+	if p2.Status != StatusOpen || p2.ListPrice != 0 || !p2.MissingSince.IsZero() {
+		t.Fatalf("reappeared=%+v", p2)
+	}
+}
+
+func TestSaleLookupNeverReusesAcquisition(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	_, err := st.InsertSales(ctx, []tonnel.Sale{{GiftID: 88, GiftName: key.Name, Model: key.Model, Price: 10, Timestamp: tonnel.FlexTime{Time: now.Add(-time.Hour)}}, {GiftID: 88, GiftName: key.Name, Model: key.Model, Price: 12, Timestamp: tonnel.FlexTime{Time: now}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	price, _, ok, err := st.SaleForGiftAfter(ctx, 88, now.Add(-30*time.Minute))
+	if err != nil || !ok || price != 12 {
+		t.Fatalf("sale=(%v,%v,%v)", price, ok, err)
+	}
+	_, _, ok, err = st.SaleForGiftAfter(ctx, 88, now.Add(time.Minute))
+	if err != nil || ok {
+		t.Fatalf("future lookup ok=%v err=%v", ok, err)
+	}
+}
+
+func TestReacquisitionPreservesCompletedCycle(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	first := Position{GiftID: 99, Key: key, BuyPrice: 10, BoughtAt: now.Add(-2 * time.Hour), Status: StatusListed, Source: "manual", ListPrice: 12}
+	if err := st.UpsertPosition(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetPositionSold(ctx, 99, 12, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	second := Position{GiftID: 99, Key: key, BuyPrice: 20, BoughtAt: now, Status: StatusOpen, Source: "reacquired"}
+	if err := st.UpsertPosition(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := st.GetPosition(ctx, 99)
+	if current.BuyPrice != 20 || current.SellPrice != 0 || current.ListPrice != 0 || current.Status != StatusOpen || current.Source != "reacquired" {
+		t.Fatalf("current=%+v", current)
+	}
+	cycles, err := st.PositionTradesForGift(ctx, 99)
+	if err != nil || len(cycles) != 1 || cycles[0].BuyPrice != 10 || cycles[0].SellPrice != 12 {
+		t.Fatalf("cycles=%+v err=%v", cycles, err)
+	}
+}
+
 func TestMutesCoverCollectionAndModel(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -333,6 +439,31 @@ func TestPositionLifecycle(t *testing.T) {
 	}
 	if !last.Equal(now.UTC()) {
 		t.Errorf("last buy = %v, want %v", last, now.UTC())
+	}
+}
+
+func TestImportedCostBasisAndOutcomeRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+	_, err := st.InsertSales(ctx, []tonnel.Sale{{GiftID: 77, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 88, Timestamp: tonnel.FlexTime{Time: now}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, at, ok, err := st.AcquisitionForGift(ctx, 77)
+	if err != nil || !ok || p != 88 || !at.Equal(now.UTC()) {
+		t.Fatalf("acquisition=(%v,%v,%v,%v)", p, at, ok, err)
+	}
+	id, err := st.InsertSignal(ctx, SignalRow{TS: now, Kind: "buy", GiftID: 77, Key: key, Price: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSignalOutcome(ctx, id, 24, now.Add(24*time.Hour), true, 88, 90, true); err != nil {
+		t.Fatal(err)
+	}
+	need, err := st.SignalsNeedingOutcome(ctx, 24, now.Add(25*time.Hour))
+	if err != nil || len(need) != 0 {
+		t.Fatalf("outcome was not deduped: %v %v", need, err)
 	}
 }
 

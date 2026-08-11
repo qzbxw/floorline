@@ -36,7 +36,7 @@ func (f *fakeBook) ModelBook(ctx context.Context, k tonnel.ModelKey, limit int) 
 			Name:   k.Name,
 			Model:  k.Model + " (0.4%)",
 			Price:  tonnel.Flex64(p),
-			Asset:  tonnel.AssetTON,
+			Asset:  tonnel.AssetGRAM,
 		})
 	}
 	return out, nil
@@ -79,6 +79,14 @@ func newHarness(t *testing.T, askPrices ...float64) *harness {
 	det := New(st, pricing.NewBookCache(fb, cfg.BookCacheTTL, 10), cfg)
 	det.Coverage = func() time.Duration { return 14 * 24 * time.Hour }
 	det.Warm = func() bool { return true }
+	now := time.Now().UTC()
+	if err := st.InsertGramQuotes(context.Background(), []store.GramQuote{
+		{TS: now.Add(-time.Hour), USD: 1},
+		{TS: now.Add(-15 * time.Minute), USD: 1},
+		{TS: now, USD: 1},
+	}); err != nil {
+		t.Fatalf("seed GRAM quotes: %v", err)
+	}
 
 	return &harness{det: det, st: st, book: fb, cfg: cfg}
 }
@@ -131,7 +139,7 @@ func gift(id int64, price float64) tonnel.Gift {
 		Name:   key.Name,
 		Model:  key.Model + " (0.4%)",
 		Price:  tonnel.Flex64(price),
-		Asset:  tonnel.AssetTON,
+		Asset:  tonnel.AssetGRAM,
 	}
 }
 
@@ -239,6 +247,24 @@ func TestWarmUpBlocksAutoBuy(t *testing.T) {
 	}
 	if !dec.Signal {
 		t.Error("warm-up should not suppress the alert itself")
+	}
+}
+
+func TestGramVolatilityBlocksAutoButKeepsManualSignal(t *testing.T) {
+	h := newHarness(t, 800, 1200, 1250)
+	h.cfg.Auto.MaxGramMove15m = .03
+	now := time.Now().UTC()
+	if err := h.st.InsertGramQuotes(context.Background(), []store.GramQuote{{TS: now, USD: 1.1}}); err != nil {
+		t.Fatal(err)
+	}
+	h.seedSales(t, 1200, 40, 40)
+	h.seedStat(t, 800, 12)
+	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), now)
+	if err != nil || dec == nil || !dec.Signal {
+		t.Fatalf("manual signal = %+v, err=%v", dec, err)
+	}
+	if dec.Auto || !containsSubstring(dec.AutoFails, "GRAM moved") {
+		t.Fatalf("volatile GRAM must block auto only: %+v", dec.AutoFails)
 	}
 }
 

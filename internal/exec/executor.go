@@ -129,18 +129,23 @@ func (e *Executor) Buy(ctx context.Context, val pricing.Valuation, gift tonnel.G
 	}
 
 	pos := store.Position{
-		GiftID:   giftID,
-		GiftNum:  gift.GiftNum.Int(),
-		Key:      val.Key,
-		Backdrop: tonnel.BaseAttr(gift.Backdrop),
-		Symbol:   tonnel.BaseAttr(gift.Symbol),
-		BuyPrice: price,
+		GiftID:      giftID,
+		GiftNum:     gift.GiftNum.Int(),
+		Key:         val.Key,
+		Backdrop:    tonnel.BaseAttr(gift.Backdrop),
+		Symbol:      tonnel.BaseAttr(gift.Symbol),
+		ModelRarity: gift.ModelRarity.Float(), BackdropRarity: gift.BackdropRarity.Float(), SymbolRarity: gift.SymbolRarity.Float(),
+		BuyPrice:   price,
+		CostSource: "floorline", CostConfidence: 1,
 		BoughtAt: now,
 		Status:   store.StatusOpen,
 		Source:   source,
 	}
 	if err := e.st.UpsertPosition(ctx, pos); err != nil {
 		return out, fmt.Errorf("bought gift %d but failed to record the position: %w", giftID, err)
+	}
+	if err := e.st.RecordPositionEvent(ctx, giftID, "acquired", 0, price, "bought by Floorline ("+source+")", now); err != nil {
+		return out, fmt.Errorf("bought gift %d but failed to journal acquisition: %w", giftID, err)
 	}
 
 	// We just removed the cheapest ask; anything cached is now wrong.
@@ -154,6 +159,7 @@ func (e *Executor) Buy(ctx context.Context, val pricing.Valuation, gift tonnel.G
 	if listPrice > 0 {
 		out.Listed = true
 		out.ListPrice = listPrice
+		_ = e.st.RecordPositionEvent(ctx, giftID, "listed", 0, listPrice, "immediate post-purchase listing", now)
 	}
 	return out, nil
 }
@@ -198,6 +204,17 @@ func (e *Executor) Relist(ctx context.Context, giftID int64, key tonnel.ModelKey
 			target, floorPrice, entry, limits.MinMarkup*100), nil
 	}
 
+	return e.ListAt(ctx, giftID, key, target, entry, now)
+}
+
+// ListAt applies the same no-loss invariant to an externally computed target
+// (for example the attribute-aware portfolio adviser).
+func (e *Executor) ListAt(ctx context.Context, giftID int64, key tonnel.ModelKey, target, entry float64, now time.Time) (float64, string, error) {
+	floorPrice := entry * (1 + e.rm.Limits().MinMarkup)
+	target = roundDown2(target)
+	if target < floorPrice {
+		return 0, fmt.Sprintf("not listed: target %.2f is below entry+markup %.2f", target, floorPrice), nil
+	}
 	res, err := e.api.ListForSale(ctx, giftID, target)
 	if err != nil {
 		return 0, "", fmt.Errorf("list for sale at %.2f: %w", target, err)
@@ -217,13 +234,18 @@ func (e *Executor) Relist(ctx context.Context, giftID int64, key tonnel.ModelKey
 // unlisted and listed inventories.
 func (e *Executor) owns(ctx context.Context, giftID int64) (bool, error) {
 	for _, listed := range []bool{false, true} {
-		gifts, err := e.api.MyGifts(ctx, listed, 1, 30)
-		if err != nil {
-			return false, err
-		}
-		for i := range gifts {
-			if gifts[i].GiftID.Int() == giftID {
-				return true, nil
+		for page := 1; ; page++ {
+			gifts, err := e.api.MyGifts(ctx, listed, page, 30)
+			if err != nil {
+				return false, err
+			}
+			for i := range gifts {
+				if gifts[i].GiftID.Int() == giftID {
+					return true, nil
+				}
+			}
+			if len(gifts) < 30 {
+				break
 			}
 		}
 	}

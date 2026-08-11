@@ -108,7 +108,7 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 			if err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("TON %s (user %d)", num(b.TON), a.api.UserID()), nil
+			return fmt.Sprintf("GRAM %s (user %d)", num(b.GRAM), a.api.UserID()), nil
 		}},
 
 		{"inventory (myGifts)", func(ctx context.Context) (string, error) {
@@ -184,7 +184,7 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 			case r.Floor == 0:
 				fmt.Fprintf(w, "  warn  %-8s reachable, but nothing listed for %s\n", r.Venue, probe)
 			default:
-				fmt.Fprintf(w, "  ok    %-8s floor for %s: %s\n", r.Venue, probe, num(r.Floor))
+				fmt.Fprintf(w, "  ok    %-8s %d asks for %s: floor %s · depth ref %s\n", r.Venue, len(r.Asks), probe, num(r.Floor), num(r.Reference))
 			}
 		}
 	}
@@ -203,8 +203,8 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 		fmt.Fprintln(w, "request rate is the problem — lower READ_RPS, or try again from another IP.")
 	case authFailed > 0:
 		fmt.Fprintln(w, "The transport works — requests reached Tonnel and were answered. Only the")
-		fmt.Fprintln(w, "session was rejected. Grab a fresh authData from LocalStorage of")
-		fmt.Fprintln(w, "market.tonnel.network and put it in TONNEL_AUTH_DATA (or send /auth to the bot).")
+		fmt.Fprintln(w, "session was rejected. Copy Telegram.WebApp.initData from the Tonnel mini app")
+		fmt.Fprintln(w, "or user_auth from a gifts2 request, then send it with /auth.")
 	default:
 		fmt.Fprintln(w, "Endpoints answered but the payloads did not decode as expected — the private")
 		fmt.Fprintln(w, "API has probably changed shape. Everything to fix lives in internal/tonnel.")

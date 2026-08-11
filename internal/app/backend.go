@@ -9,6 +9,7 @@ import (
 
 	"floorline/internal/bot"
 	"floorline/internal/pricing"
+	"floorline/internal/store"
 	"floorline/internal/tonnel"
 )
 
@@ -21,16 +22,28 @@ func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pric
 		return pricing.Valuation{Reason: "listing has no collection or model"}, nil
 	}
 
-	sales, err := a.st.SalesSince(ctx, key, now.Add(-a.window()))
+	attrDays := a.cfg.AttributeLookbackDays
+	if attrDays < a.cfg.LookbackDays {
+		attrDays = a.cfg.LookbackDays
+	}
+	since := now.Add(-time.Duration(attrDays) * 24 * time.Hour)
+	sales, err := a.st.SalesSince(ctx, key, since)
 	if err != nil {
 		return pricing.Valuation{}, fmt.Errorf("load trade history: %w", err)
 	}
-	liq := pricing.ComputeLiquidity(sales, now, a.window(), a.Coverage())
+	rawLiq := pricing.ComputeLiquidity(sales, now, a.window(), a.Coverage())
+	fxSales, fxCoverage, _ := a.normalizeGramSales(ctx, sales, since)
+	liq := pricing.ComputeLiquidity(fxSales, now, a.window(), a.Coverage())
+	liq.RawMedian, liq.FXCoverage = rawLiq.Median, fxCoverage
 
 	var floor, rarity float64
 	var supply int
+	var snapshotAt time.Time
+	var fxContext pricing.FXContext
 	if stat, err := a.st.ModelStat(ctx, key); err == nil && stat != nil {
 		floor, supply, rarity = stat.Floor, stat.Supply, stat.Rarity
+		snapshotAt = stat.TS
+		fxContext = a.fxForModel(ctx, key, floor, now)
 	}
 
 	book, err := a.books.Get(ctx, key)
@@ -39,14 +52,17 @@ func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pric
 	}
 
 	return pricing.Evaluate(pricing.Input{
-		GiftID: g.GiftID.Int(),
-		Key:    key,
-		Price:  g.Price.Float(),
-		Book:   book,
-		Liq:    liq,
-		Floor:  floor,
-		Supply: supply,
-		Rarity: rarity,
+		GiftID:   g.GiftID.Int(),
+		Key:      key,
+		Price:    g.Price.Float(),
+		Book:     book,
+		Liq:      liq,
+		Floor:    floor,
+		Supply:   supply,
+		Rarity:   rarity,
+		Backdrop: tonnel.BaseAttr(g.Backdrop), Symbol: tonnel.BaseAttr(g.Symbol),
+		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
+		SnapshotAt: snapshotAt, Now: now, FX: fxContext,
 		Params: pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut, Window: a.window()},
 	}), nil
 }
@@ -68,6 +84,16 @@ func (a *App) statusText(ctx context.Context) string {
 		fmt.Fprintf(&b, " — %s", bot.Esc(reason))
 	}
 	b.WriteString("\n")
+	n, first, _ := a.st.CalibrationStats(ctx)
+	mode := "live"
+	if a.cfg.ShadowMode {
+		mode = "SHADOW — no unattended purchases"
+	}
+	fmt.Fprintf(&b, "Scoring %s · calibration %d/%d signals", mode, n, a.cfg.CalibrationMinSignals)
+	if !first.IsZero() {
+		fmt.Fprintf(&b, " · %s/%dd", dur(now.Sub(first)), a.cfg.CalibrationMinDays)
+	}
+	b.WriteString("\n")
 	if until := a.rm.DisabledUntil(); until.After(now) {
 		fmt.Fprintf(&b, "Paused for another %s\n", dur(until.Sub(now)))
 	}
@@ -86,6 +112,11 @@ func (a *App) statusText(ctx context.Context) string {
 	if cols, err := a.st.CollectionNames(ctx); err == nil {
 		fmt.Fprintf(&b, "Collections tracked: %d\n", len(cols))
 	}
+	if q, ok, _ := a.st.LatestGramQuote(ctx); ok {
+		fmt.Fprintf(&b, "GRAM/USDT %s · quote %s\n", num(q.USD), ago(q.TS))
+	} else {
+		b.WriteString("⚠️ GRAM/USDT reference unavailable\n")
+	}
 	if last := a.api.LastSuccess(); !last.IsZero() {
 		fmt.Fprintf(&b, "Last successful API call %s\n", ago(last))
 	}
@@ -93,9 +124,9 @@ func (a *App) statusText(ctx context.Context) string {
 		fmt.Fprintf(&b, "⚠️ %d consecutive anti-bot rejections\n", n)
 	}
 	if venues := a.cross.Venues(); len(venues) > 0 {
-		fmt.Fprintf(&b, "Cross-market reference: %s\n", strings.Join(venues, ", "))
+		fmt.Fprintf(&b, "Cross-market ask depth: %s\n", strings.Join(venues, ", "))
 	} else {
-		b.WriteString("Cross-market reference: none configured\n")
+		b.WriteString("Cross-market ask depth: none configured\n")
 	}
 
 	b.WriteString("\n<b>Pollers</b>\n")
@@ -119,7 +150,7 @@ func (a *App) statusText(ctx context.Context) string {
 	fmt.Fprintf(&b, "\n<b>Last 24h</b>\n%d signals · %d sent · %d bought\n", stats.Total, stats.Sent, stats.Bought)
 
 	if bal, ok := a.rm.Balance(); ok {
-		fmt.Fprintf(&b, "\nBalance %s TON\n", num(bal))
+		fmt.Fprintf(&b, "\nBalance %s GRAM\n", num(bal))
 	}
 	return b.String()
 }
@@ -213,6 +244,21 @@ func (a *App) bookText(ctx context.Context, collection, model string) string {
 
 	within10 := book.CountBetween(best, best*1.1, 0)
 	fmt.Fprintf(&b, "\n%d asks within 10%% of the floor.", within10)
+	if a.cross.Enabled() {
+		qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		quotes := a.cross.Quotes(qctx, key.Name, key.Model)
+		cancel()
+		if len(quotes) > 0 {
+			b.WriteString("\n\n<b>Other market sell queues</b>\n")
+			for _, q := range quotes {
+				fmt.Fprintf(&b, "%s: %s · depth ref %s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor), num(q.Reference()))
+				if q.Fee > 0 {
+					fmt.Fprintf(&b, " · net %s", num(q.NetReference()))
+				}
+				b.WriteString("\n")
+			}
+		}
+	}
 	return b.String()
 }
 
@@ -286,7 +332,7 @@ func (a *App) valText(ctx context.Context, giftID int64) string {
 
 // Positions lists open inventory with live marks.
 func (a *App) positionsText(ctx context.Context) string {
-	positions, err := a.st.OpenPositions(ctx)
+	positions, err := a.st.TrackedPositions(ctx)
 	if err != nil {
 		return "Could not read positions: " + bot.Esc(err.Error())
 	}
@@ -296,24 +342,23 @@ func (a *App) positionsText(ctx context.Context) string {
 
 	now := time.Now()
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%d open positions</b>\n", len(positions))
+	fmt.Fprintf(&b, "<b>%d tracked positions</b>\n", len(positions))
 	for _, p := range positions {
-		mark := 0.0
-		if stat, err := a.st.ModelStat(ctx, p.Key); err == nil && stat != nil {
-			mark = stat.Floor
+		if p.Status == store.StatusMissing {
+			fmt.Fprintf(&b, "\n<b>%s</b>\n⚠️ missing since %s; no sale booked · entry %s\n<code>/history %d</code>\n", bot.Esc(p.Key.String()), p.MissingSince.Format("02 Jan 15:04"), num(p.BuyPrice), p.GiftID)
+			continue
 		}
+		ad := a.advisePosition(ctx, p, now)
 		fmt.Fprintf(&b, "\n<b>%s</b>\n", bot.Esc(p.Key.String()))
 		fmt.Fprintf(&b, "entry %s · held %s · %s\n", num(p.BuyPrice), dur(now.Sub(p.BoughtAt)), p.Status)
 		if p.ListPrice > 0 {
 			fmt.Fprintf(&b, "asking %s\n", num(p.ListPrice))
 		}
-		if mark > 0 {
-			line := fmt.Sprintf("floor %s", num(mark))
-			if p.BuyPrice > 0 {
-				net := mark*(1-a.cfg.TonnelFee) - p.BuyPrice
-				line += fmt.Sprintf(" → unrealised %s (%+.1f%%)", num(net), net/p.BuyPrice*100)
+		if ad.Val.Valid {
+			fmt.Fprintf(&b, "recommended %s · %s · executable net %s (%+.1f%%)\n", num(ad.Val.Exit), ad.Action, num(ad.Val.Net), ad.Val.Edge*100)
+			if ad.CrossReference > 0 {
+				fmt.Fprintf(&b, "external ask-depth ref %s\n", num(ad.CrossReference))
 			}
-			b.WriteString(line + "\n")
 		}
 		if p.Note != "" {
 			fmt.Fprintf(&b, "<i>%s</i>\n", bot.Esc(p.Note))
@@ -325,7 +370,7 @@ func (a *App) positionsText(ctx context.Context) string {
 
 // PnL reports realised and unrealised profit, net of fees.
 func (a *App) pnlText(ctx context.Context) string {
-	closed, err := a.st.ClosedPositions(ctx, 500)
+	closed, err := a.st.PositionTrades(ctx, 500)
 	if err != nil {
 		return "Could not read closed positions: " + bot.Esc(err.Error())
 	}
@@ -359,24 +404,35 @@ func (a *App) pnlText(ctx context.Context) string {
 			continue
 		}
 		atRisk += p.BuyPrice
-		stat, err := a.st.ModelStat(ctx, p.Key)
-		if err != nil || stat == nil || stat.Floor <= 0 {
+		ad := a.advisePosition(ctx, p, time.Now())
+		if !ad.Val.Valid || ad.Val.FastExit <= 0 {
 			unmarked++
 			continue
 		}
-		unrealised += stat.Floor*(1-a.cfg.TonnelFee) - p.BuyPrice
+		unrealised += ad.Val.FastExit*(1-a.cfg.TonnelFee) - p.BuyPrice
+	}
+	tracked, _ := a.st.TrackedPositions(ctx)
+	missing, missingCost := 0, 0.0
+	for _, p := range tracked {
+		if p.Status == store.StatusMissing {
+			missing++
+			missingCost += p.BuyPrice
+		}
 	}
 
 	var b strings.Builder
 	b.WriteString("<b>PnL</b> <i>(net of fees)</i>\n\n")
-	fmt.Fprintf(&b, "Realised   <b>%s</b> TON over %d trades\n", num(realised), wins+losses)
+	fmt.Fprintf(&b, "Realised   <b>%s</b> GRAM over %d trades\n", num(realised), wins+losses)
 	if invested > 0 {
 		fmt.Fprintf(&b, "           %+.1f%% on %s deployed · %d win / %d loss\n",
 			realised/invested*100, num(invested), wins, losses)
 	}
-	fmt.Fprintf(&b, "Unrealised <b>%s</b> TON across %d open\n", num(unrealised), len(open))
-	fmt.Fprintf(&b, "At risk    %s TON\n", num(atRisk))
-	fmt.Fprintf(&b, "\nTotal      <b>%s</b> TON\n", num(realised+unrealised))
+	fmt.Fprintf(&b, "Unrealised <b>%s</b> GRAM across %d open\n", num(unrealised), len(open))
+	fmt.Fprintf(&b, "At risk    %s GRAM\n", num(atRisk))
+	if missing > 0 {
+		fmt.Fprintf(&b, "Unresolved %s GRAM across %d missing gifts (excluded, not booked sold)\n", num(missingCost), missing)
+	}
+	fmt.Fprintf(&b, "\nTotal      <b>%s</b> GRAM\n", num(realised+unrealised))
 
 	if unknown > 0 || unmarked > 0 {
 		b.WriteString("\n<i>")
@@ -388,7 +444,7 @@ func (a *App) pnlText(ctx context.Context) string {
 		}
 		b.WriteString("Those are excluded above.</i>\n")
 	}
-	fmt.Fprintf(&b, "\n<i>Marks use the model floor and a %.1f%% fee.</i>", a.cfg.TonnelFee*100)
+	fmt.Fprintf(&b, "\n<i>Open marks use the executable fast exit from the live ask book and a %.1f%% fee, not headline floor.</i>", a.cfg.TonnelFee*100)
 	return b.String()
 }
 
@@ -398,10 +454,10 @@ func (a *App) balanceText(ctx context.Context) string {
 	if err != nil {
 		return "Could not read the balance: " + bot.Esc(err.Error())
 	}
-	a.rm.SetBalance(bal.TON)
+	a.rm.SetBalance(bal.GRAM)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>Balance</b>\nTON %s\n", num(bal.TON))
+	fmt.Fprintf(&b, "<b>Balance</b>\nGRAM %s\n", num(bal.GRAM))
 	if bal.USDT > 0 {
 		fmt.Fprintf(&b, "USDT %s\n", num(bal.USDT))
 	}
@@ -421,14 +477,23 @@ func (a *App) relistText(ctx context.Context, giftID int64) string {
 		return fmt.Sprintf("No position for gift %d. Check <code>/pos</code>.", giftID)
 	}
 	a.books.Invalidate(p.Key)
-
-	price, note, err := a.ex.Relist(ctx, giftID, p.Key, p.BuyPrice, time.Now())
+	if p.BuyPrice <= 0 {
+		return "Cost basis is unknown. Set it first with <code>/cost " + fmt.Sprint(giftID) + " 4.25</code>."
+	}
+	now := time.Now()
+	ad := a.advisePosition(ctx, *p, now)
+	if !ad.Val.Valid {
+		return "Could not compute a safe target: " + bot.Esc(ad.Reason)
+	}
+	price, note, err := a.ex.ListAt(ctx, giftID, p.Key, ad.Val.Exit, p.BuyPrice, now)
 	if err != nil {
 		return "Relisting failed: " + bot.Esc(err.Error())
 	}
 	if price <= 0 {
 		return "Not relisted.\n" + bot.Esc(note)
 	}
+	_ = a.st.RecordReprice(ctx, giftID, p.ListPrice, price, "manual portfolio recommendation", now)
+	_ = a.st.RecordPositionEvent(ctx, giftID, "repriced", p.ListPrice, price, "manual portfolio recommendation", now)
 	net := price*(1-a.cfg.TonnelFee) - p.BuyPrice
 	return fmt.Sprintf("✅ Listed <b>%s</b> at <b>%s</b>\nEntry %s → net %s if it fills (%+.1f%%)",
 		bot.Esc(p.Key.String()), num(price), num(p.BuyPrice), num(net), net/p.BuyPrice*100)

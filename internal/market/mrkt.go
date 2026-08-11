@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ type MRKT struct {
 	static  bool // token came from config and cannot be refreshed
 
 	floors *cache[float64]
+	books  *cache[[]float64]
 }
 
 // NewMRKT builds the MRKT reader. Supply either a bearer token or the WebApp
@@ -58,6 +60,7 @@ func NewMRKT(initData, token string, fee float64, ttl time.Duration) (*MRKT, err
 		token:    token,
 		static:   token != "" && strings.TrimSpace(initData) == "",
 		floors:   newCache[float64](ttl),
+		books:    newCache[[]float64](ttl),
 	}, nil
 }
 
@@ -72,30 +75,63 @@ func (m *MRKT) Fee() float64 { return m.fee }
 
 // ModelFloor implements Source.
 func (m *MRKT) ModelFloor(ctx context.Context, collection, model string) (float64, error) {
+	return m.ModelFloorForAttributes(ctx, collection, model, "", "")
+}
+
+func (m *MRKT) ModelFloorForAttributes(ctx context.Context, collection, model, backdrop, symbol string) (float64, error) {
 	if !m.Enabled() {
 		return 0, errNoCredentials
 	}
-	key := matchKey(collection) + "|" + matchKey(model)
+	key := matchKey(collection) + "|" + matchKey(model) + "|" + matchKey(backdrop) + "|" + matchKey(symbol)
 	return m.floors.get(key, func() (float64, error) {
-		return m.cheapestAsk(ctx, collection, model)
+		return m.cheapestAsk(ctx, collection, model, backdrop, symbol)
+	})
+}
+
+func (m *MRKT) ModelAsks(ctx context.Context, collection, model, backdrop, symbol string, limit int) ([]float64, error) {
+	if !m.Enabled() {
+		return nil, errNoCredentials
+	}
+	if limit <= 0 || limit > 20 {
+		limit = 20
+	}
+	key := matchKey(collection) + "|" + matchKey(model) + "|" + matchKey(backdrop) + "|" + matchKey(symbol)
+	return m.books.get(key, func() ([]float64, error) {
+		return m.askDepth(ctx, collection, model, backdrop, symbol, limit)
 	})
 }
 
 // cheapestAsk asks for a single listing sorted by price ascending, which is the
 // model floor by definition.
-func (m *MRKT) cheapestAsk(ctx context.Context, collection, model string) (float64, error) {
+func (m *MRKT) cheapestAsk(ctx context.Context, collection, model, backdrop, symbol string) (float64, error) {
+	asks, err := m.askDepth(ctx, collection, model, backdrop, symbol, 1)
+	if err != nil || len(asks) == 0 {
+		return 0, err
+	}
+	return asks[0], nil
+}
+
+func (m *MRKT) askDepth(ctx context.Context, collection, model, backdrop, symbol string, limit int) ([]float64, error) {
+	backdrops := []string{}
+	if backdrop != "" {
+		backdrops = []string{backdrop}
+	}
+	symbols := []string{}
+	if symbol != "" {
+		symbols = []string{symbol}
+	}
 	body := map[string]any{
 		"collectionNames": []string{collection},
 		"modelNames":      []string{model},
-		"backdropNames":   []string{},
-		"symbolNames":     []string{},
+		"backdropNames":   backdrops,
+		"symbolNames":     symbols,
 		"ordering":        "Price",
 		"lowToHigh":       true,
 		"maxPrice":        nil,
 		"minPrice":        nil,
 		"mintable":        nil,
 		"number":          nil,
-		"count":           1,
+		"count":           limit,
 		"cursor":          "",
 		"query":           nil,
 		"promotedFirst":   false,
@@ -110,12 +146,16 @@ func (m *MRKT) cheapestAsk(ctx context.Context, collection, model string) (float
 		} `json:"gifts"`
 	}
 	if err := m.post(ctx, "/gifts/saling", body, &payload, true); err != nil {
-		return 0, err
+		return nil, err
 	}
-	if len(payload.Gifts) == 0 {
-		return 0, nil // nothing listed on this venue; not an error
+	asks := make([]float64, 0, len(payload.Gifts))
+	for _, gift := range payload.Gifts {
+		if p := nanoToGRAM(gift.SalePrice); p > 0 {
+			asks = append(asks, p)
+		}
 	}
-	return nanoToTON(payload.Gifts[0].SalePrice), nil
+	sort.Float64s(asks)
+	return asks, nil
 }
 
 // post sends an authenticated JSON request, refreshing the token once on 401.

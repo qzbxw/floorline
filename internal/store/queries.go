@@ -209,16 +209,89 @@ VALUES (?,?,?,?,?,?,?,?,?,?)`)
 
 // SaleRow is one stored trade.
 type SaleRow struct {
-	GiftID  int64
-	GiftNum int64
-	TS      time.Time
-	Price   float64
+	GiftID   int64
+	GiftNum  int64
+	TS       time.Time
+	Price    float64
+	Backdrop string
+	Symbol   string
+}
+
+type GramQuote struct {
+	TS       time.Time
+	USD      float64
+	Bid      float64
+	Ask      float64
+	Change24 float64
+}
+
+func (s *Store) InsertGramQuotes(ctx context.Context, quotes []GramQuote) error {
+	if len(quotes) == 0 {
+		return nil
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO gram_quotes(ts,usd,bid,ask,change_24) VALUES(?,?,?,?,?) ON CONFLICT(ts) DO UPDATE SET usd=excluded.usd,bid=excluded.bid,ask=excluded.ask,change_24=excluded.change_24`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for _, q := range quotes {
+			if q.USD <= 0 || q.TS.IsZero() {
+				continue
+			}
+			if _, err := stmt.ExecContext(ctx, unix(q.TS), q.USD, nullFloat(q.Bid), nullFloat(q.Ask), q.Change24); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) LatestGramQuote(ctx context.Context) (GramQuote, bool, error) {
+	return s.gramQuote(ctx, `SELECT ts,usd,COALESCE(bid,0),COALESCE(ask,0),COALESCE(change_24,0) FROM gram_quotes ORDER BY ts DESC LIMIT 1`)
+}
+
+func (s *Store) GramQuoteAt(ctx context.Context, at time.Time) (GramQuote, bool, error) {
+	return s.gramQuote(ctx, `SELECT ts,usd,COALESCE(bid,0),COALESCE(ask,0),COALESCE(change_24,0) FROM gram_quotes WHERE ts<=? ORDER BY ts DESC LIMIT 1`, unix(at))
+}
+
+func (s *Store) gramQuote(ctx context.Context, q string, args ...any) (GramQuote, bool, error) {
+	var out GramQuote
+	var ts int64
+	err := s.db.QueryRowContext(ctx, q, args...).Scan(&ts, &out.USD, &out.Bid, &out.Ask, &out.Change24)
+	if err == sql.ErrNoRows {
+		return out, false, nil
+	}
+	if err != nil {
+		return out, false, err
+	}
+	out.TS = fromUnix(ts)
+	return out, true, nil
+}
+
+func (s *Store) GramQuotesSince(ctx context.Context, since time.Time) ([]GramQuote, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT ts,usd,COALESCE(bid,0),COALESCE(ask,0),COALESCE(change_24,0) FROM gram_quotes WHERE ts>=? ORDER BY ts`, unix(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GramQuote
+	for rows.Next() {
+		var q GramQuote
+		var ts int64
+		if err := rows.Scan(&ts, &q.USD, &q.Bid, &q.Ask, &q.Change24); err != nil {
+			return nil, err
+		}
+		q.TS = fromUnix(ts)
+		out = append(out, q)
+	}
+	return out, rows.Err()
 }
 
 // SalesSince returns a model's trades newer than `since`, oldest first.
 func (s *Store) SalesSince(ctx context.Context, key tonnel.ModelKey, since time.Time) ([]SaleRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT gift_id, COALESCE(gift_num,0), ts, price
+SELECT gift_id, COALESCE(gift_num,0), ts, price, COALESCE(backdrop,''), COALESCE(symbol,'')
 FROM sales
 WHERE name = ? AND model = ? AND ts >= ? AND price > 0
 ORDER BY ts ASC`, key.Name, key.Model, unix(since))
@@ -231,7 +304,7 @@ ORDER BY ts ASC`, key.Name, key.Model, unix(since))
 	for rows.Next() {
 		var r SaleRow
 		var ts int64
-		if err := rows.Scan(&r.GiftID, &r.GiftNum, &ts, &r.Price); err != nil {
+		if err := rows.Scan(&r.GiftID, &r.GiftNum, &ts, &r.Price, &r.Backdrop, &r.Symbol); err != nil {
 			return nil, err
 		}
 		r.TS = fromUnix(ts)
@@ -501,20 +574,26 @@ ORDER BY ts DESC LIMIT 1`, key.Name, key.Model, unix(at)).Scan(&f)
 
 // Position is an owned gift tracked from purchase to sale.
 type Position struct {
-	GiftID    int64
-	GiftNum   int64
-	Key       tonnel.ModelKey
-	Backdrop  string
-	Symbol    string
-	BuyPrice  float64
-	BoughtAt  time.Time
-	ListPrice float64
-	ListedAt  time.Time
-	SellPrice float64
-	SoldAt    time.Time
-	Status    string
-	Source    string
-	Note      string
+	GiftID         int64
+	GiftNum        int64
+	Key            tonnel.ModelKey
+	Backdrop       string
+	Symbol         string
+	ModelRarity    float64
+	BackdropRarity float64
+	SymbolRarity   float64
+	BuyPrice       float64
+	CostSource     string
+	CostConfidence float64
+	BoughtAt       time.Time
+	ListPrice      float64
+	ListedAt       time.Time
+	SellPrice      float64
+	SoldAt         time.Time
+	MissingSince   time.Time
+	Status         string
+	Source         string
+	Note           string
 }
 
 // Position status values.
@@ -523,6 +602,7 @@ const (
 	StatusListed   = "listed"
 	StatusSold     = "sold"
 	StatusReturned = "returned"
+	StatusMissing  = "missing"
 )
 
 // UpsertPosition inserts or refreshes a position without clobbering fields that
@@ -530,35 +610,62 @@ const (
 func (s *Store) UpsertPosition(ctx context.Context, p Position) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO positions (gift_id, gift_num, name, model, backdrop, symbol,
-                       buy_price, bought_at, list_price, listed_at,
-                       sell_price, sold_at, status, source, note)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       model_rarity, backdrop_rarity, symbol_rarity,
+                       buy_price, cost_source, cost_confidence, bought_at, list_price, listed_at,
+					   sell_price, sold_at, missing_since, status, source, note)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(gift_id) DO UPDATE SET
-    list_price = COALESCE(excluded.list_price, positions.list_price),
-    listed_at  = COALESCE(NULLIF(excluded.listed_at,0), positions.listed_at),
-    sell_price = COALESCE(excluded.sell_price, positions.sell_price),
-    sold_at    = COALESCE(NULLIF(excluded.sold_at,0), positions.sold_at),
-    status     = excluded.status`,
+	backdrop = excluded.backdrop,
+	symbol = excluded.symbol,
+	model_rarity = excluded.model_rarity,
+	backdrop_rarity = excluded.backdrop_rarity,
+	symbol_rarity = excluded.symbol_rarity,
+	buy_price = CASE WHEN positions.status IN ('sold','returned') THEN excluded.buy_price WHEN positions.buy_price > 0 THEN positions.buy_price ELSE excluded.buy_price END,
+	cost_source = CASE WHEN positions.status IN ('sold','returned') THEN excluded.cost_source WHEN positions.buy_price > 0 THEN positions.cost_source ELSE excluded.cost_source END,
+	cost_confidence = CASE WHEN positions.status IN ('sold','returned') THEN excluded.cost_confidence ELSE MAX(positions.cost_confidence, excluded.cost_confidence) END,
+	bought_at = CASE WHEN positions.status IN ('sold','returned') THEN excluded.bought_at ELSE positions.bought_at END,
+	    list_price = CASE WHEN positions.status IN ('sold','returned') THEN excluded.list_price ELSE COALESCE(excluded.list_price, positions.list_price) END,
+	    listed_at  = CASE WHEN positions.status IN ('sold','returned') THEN excluded.listed_at ELSE COALESCE(NULLIF(excluded.listed_at,0), positions.listed_at) END,
+	    sell_price = CASE WHEN positions.status IN ('sold','returned') THEN excluded.sell_price ELSE COALESCE(excluded.sell_price, positions.sell_price) END,
+	    sold_at    = CASE WHEN positions.status IN ('sold','returned') THEN excluded.sold_at ELSE COALESCE(NULLIF(excluded.sold_at,0), positions.sold_at) END,
+	missing_since = CASE WHEN positions.status IN ('sold','returned') THEN excluded.missing_since WHEN excluded.missing_since > 0 THEN excluded.missing_since ELSE positions.missing_since END,
+	    status     = excluded.status,
+	source = CASE WHEN positions.status IN ('sold','returned') THEN excluded.source ELSE positions.source END,
+	note = CASE WHEN positions.status IN ('sold','returned') THEN excluded.note ELSE positions.note END`,
 		p.GiftID, p.GiftNum, p.Key.Name, p.Key.Model, p.Backdrop, p.Symbol,
-		p.BuyPrice, unix(p.BoughtAt), nullFloat(p.ListPrice), unix(p.ListedAt),
-		nullFloat(p.SellPrice), unix(p.SoldAt), p.Status, p.Source, p.Note)
+		p.ModelRarity, p.BackdropRarity, p.SymbolRarity,
+		p.BuyPrice, p.CostSource, p.CostConfidence, unix(p.BoughtAt), nullFloat(p.ListPrice), unix(p.ListedAt),
+		nullFloat(p.SellPrice), unix(p.SoldAt), unix(p.MissingSince), p.Status, p.Source, p.Note)
 	return err
 }
 
 // SetPositionListed records that a position is now on the market.
 func (s *Store) SetPositionListed(ctx context.Context, giftID int64, price float64, at time.Time) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE positions SET list_price = ?, listed_at = ?, status = ? WHERE gift_id = ?`,
+		`UPDATE positions SET list_price = ?, listed_at = ?, missing_since = NULL, status = ? WHERE gift_id = ?`,
 		price, unix(at), StatusListed, giftID)
+	return err
+}
+
+func (s *Store) SetPositionUnlisted(ctx context.Context, giftID int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE positions SET list_price=NULL, listed_at=NULL, missing_since=NULL, status=? WHERE gift_id=?`, StatusOpen, giftID)
+	return err
+}
+
+func (s *Store) SetPositionMissing(ctx context.Context, giftID int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE positions SET missing_since=CASE WHEN missing_since IS NULL OR missing_since=0 THEN ? ELSE missing_since END, status=? WHERE gift_id=?`, unix(at), StatusMissing, giftID)
 	return err
 }
 
 // SetPositionSold closes a position.
 func (s *Store) SetPositionSold(ctx context.Context, giftID int64, price float64, at time.Time) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE positions SET sell_price = ?, sold_at = ?, status = ? WHERE gift_id = ?`,
-		price, unix(at), StatusSold, giftID)
-	return err
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO position_trades(gift_id,name,model,buy_price,bought_at,sell_price,sold_at,source) SELECT gift_id,name,model,buy_price,bought_at,?,?,source FROM positions WHERE gift_id=?`, price, unix(at), giftID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE positions SET sell_price=?,sold_at=?,missing_since=NULL,status=? WHERE gift_id=?`, price, unix(at), StatusSold, giftID)
+		return err
+	})
 }
 
 // GetPosition loads one position.
@@ -586,6 +693,17 @@ func (s *Store) OpenPositions(ctx context.Context) ([]Position, error) {
 	return scanPositions(rows)
 }
 
+// TrackedPositions includes unresolved inventory disappearances so later sale
+// history can close them without falsely booking the last ask as proceeds.
+func (s *Store) TrackedPositions(ctx context.Context) ([]Position, error) {
+	rows, err := s.db.QueryContext(ctx, positionSelect+` WHERE status IN ('open','listed','missing') ORDER BY bought_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanPositions(rows)
+}
+
 // ClosedPositions returns sold positions, newest first.
 func (s *Store) ClosedPositions(ctx context.Context, limit int) ([]Position, error) {
 	rows, err := s.db.QueryContext(ctx,
@@ -595,6 +713,55 @@ func (s *Store) ClosedPositions(ctx context.Context, limit int) ([]Position, err
 	}
 	defer rows.Close()
 	return scanPositions(rows)
+}
+
+type PositionTrade struct {
+	GiftID              int64
+	Key                 tonnel.ModelKey
+	BuyPrice, SellPrice float64
+	BoughtAt, SoldAt    time.Time
+	Source              string
+}
+
+func (s *Store) PositionTrades(ctx context.Context, limit int) ([]PositionTrade, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT gift_id,name,model,COALESCE(buy_price,0),COALESCE(bought_at,0),COALESCE(sell_price,0),sold_at,COALESCE(source,'') FROM position_trades ORDER BY sold_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PositionTrade
+	for rows.Next() {
+		var r PositionTrade
+		var bought, sold int64
+		if err := rows.Scan(&r.GiftID, &r.Key.Name, &r.Key.Model, &r.BuyPrice, &bought, &r.SellPrice, &sold, &r.Source); err != nil {
+			return nil, err
+		}
+		r.BoughtAt, r.SoldAt = fromUnix(bought), fromUnix(sold)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) PositionTradesForGift(ctx context.Context, giftID int64) ([]PositionTrade, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT gift_id,name,model,COALESCE(buy_price,0),COALESCE(bought_at,0),COALESCE(sell_price,0),sold_at,COALESCE(source,'') FROM position_trades WHERE gift_id=? ORDER BY sold_at DESC`, giftID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PositionTrade
+	for rows.Next() {
+		var r PositionTrade
+		var bought, sold int64
+		if err := rows.Scan(&r.GiftID, &r.Key.Name, &r.Key.Model, &r.BuyPrice, &bought, &r.SellPrice, &sold, &r.Source); err != nil {
+			return nil, err
+		}
+		r.BoughtAt, r.SoldAt = fromUnix(bought), fromUnix(sold)
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // CountOpenPositions is a risk-limit input.
@@ -617,22 +784,160 @@ func (s *Store) LastBuyForModel(ctx context.Context, key tonnel.ModelKey) (time.
 
 const positionSelect = `
 SELECT gift_id, COALESCE(gift_num,0), name, model, COALESCE(backdrop,''), COALESCE(symbol,''),
-       buy_price, bought_at, COALESCE(list_price,0), COALESCE(listed_at,0),
-       COALESCE(sell_price,0), COALESCE(sold_at,0), status, source, COALESCE(note,'')
+       COALESCE(model_rarity,0), COALESCE(backdrop_rarity,0), COALESCE(symbol_rarity,0),
+       buy_price, COALESCE(cost_source,'unknown'), COALESCE(cost_confidence,0), bought_at,
+       COALESCE(list_price,0), COALESCE(listed_at,0),
+	       COALESCE(sell_price,0), COALESCE(sold_at,0), COALESCE(missing_since,0), status, source, COALESCE(note,'')
 FROM positions`
 
 func scanPositions(rows *sql.Rows) ([]Position, error) {
 	var out []Position
 	for rows.Next() {
 		var p Position
-		var boughtAt, listedAt, soldAt int64
+		var boughtAt, listedAt, soldAt, missingSince int64
 		if err := rows.Scan(&p.GiftID, &p.GiftNum, &p.Key.Name, &p.Key.Model, &p.Backdrop, &p.Symbol,
-			&p.BuyPrice, &boughtAt, &p.ListPrice, &listedAt,
-			&p.SellPrice, &soldAt, &p.Status, &p.Source, &p.Note); err != nil {
+			&p.ModelRarity, &p.BackdropRarity, &p.SymbolRarity,
+			&p.BuyPrice, &p.CostSource, &p.CostConfidence, &boughtAt, &p.ListPrice, &listedAt,
+			&p.SellPrice, &soldAt, &missingSince, &p.Status, &p.Source, &p.Note); err != nil {
 			return nil, err
 		}
-		p.BoughtAt, p.ListedAt, p.SoldAt = fromUnix(boughtAt), fromUnix(listedAt), fromUnix(soldAt)
+		p.BoughtAt, p.ListedAt, p.SoldAt, p.MissingSince = fromUnix(boughtAt), fromUnix(listedAt), fromUnix(soldAt), fromUnix(missingSince)
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// AcquisitionForGift returns the newest executed trade for a physical gift.
+// It is the best available cost basis for inventory acquired outside Floorline.
+func (s *Store) AcquisitionForGift(ctx context.Context, giftID int64) (float64, time.Time, bool, error) {
+	return s.AcquisitionForGiftAfter(ctx, giftID, time.Time{})
+}
+
+func (s *Store) AcquisitionForGiftAfter(ctx context.Context, giftID int64, after time.Time) (float64, time.Time, bool, error) {
+	var price float64
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `SELECT price, ts FROM sales WHERE gift_id = ? AND price > 0 AND ts>? ORDER BY ts DESC LIMIT 1`, giftID, unix(after)).Scan(&price, &ts)
+	if err == sql.ErrNoRows {
+		return 0, time.Time{}, false, nil
+	}
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return price, fromUnix(ts), true, nil
+}
+
+// SetCostBasis records a manually supplied or recovered acquisition price.
+func (s *Store) SetCostBasis(ctx context.Context, giftID int64, price float64, source string, confidence float64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE positions SET buy_price=?, cost_source=?, cost_confidence=? WHERE gift_id=?`, price, source, confidence, giftID)
+	return err
+}
+
+func (s *Store) SetRecoveredCostBasis(ctx context.Context, giftID int64, price float64, boughtAt time.Time, source string, confidence float64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE positions SET buy_price=?, bought_at=?, cost_source=?, cost_confidence=? WHERE gift_id=?`, price, unix(boughtAt), source, confidence, giftID)
+	return err
+}
+
+// SaleForGiftAfter returns the newest execution after acquisition/listing. It
+// cannot accidentally reuse the acquisition trade as sale proceeds.
+func (s *Store) SaleForGiftAfter(ctx context.Context, giftID int64, after time.Time) (float64, time.Time, bool, error) {
+	var price float64
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `SELECT price,ts FROM sales WHERE gift_id=? AND price>0 AND ts>? ORDER BY ts DESC LIMIT 1`, giftID, unix(after)).Scan(&price, &ts)
+	if err == sql.ErrNoRows {
+		return 0, time.Time{}, false, nil
+	}
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return price, fromUnix(ts), true, nil
+}
+
+// PositionExposure returns invested cost and counts for concentration checks.
+func (s *Store) PositionExposure(ctx context.Context, key tonnel.ModelKey) (modelValue, collectionValue float64, modelCount int, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE WHEN name=? AND model=? THEN buy_price ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN name=? THEN buy_price ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN name=? AND model=? THEN 1 ELSE 0 END),0)
+		FROM positions WHERE status IN ('open','listed')`, key.Name, key.Model, key.Name, key.Name, key.Model).
+		Scan(&modelValue, &collectionValue, &modelCount)
+	return
+}
+
+func (s *Store) RecordReprice(ctx context.Context, giftID int64, oldPrice, newPrice float64, reason string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO reprices(gift_id,ts,old_price,new_price,reason) VALUES(?,?,?,?,?)`, giftID, unix(at), nullFloat(oldPrice), newPrice, reason)
+	return err
+}
+
+func (s *Store) LastReprice(ctx context.Context, giftID int64) (time.Time, error) {
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(ts),0) FROM reprices WHERE gift_id=?`, giftID).Scan(&ts)
+	return fromUnix(ts), err
+}
+
+type PositionEvent struct {
+	TS                 time.Time
+	Kind               string
+	OldPrice, NewPrice float64
+	Detail             string
+}
+
+func (s *Store) RecordPositionEvent(ctx context.Context, giftID int64, kind string, oldPrice, newPrice float64, detail string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO position_events(gift_id,ts,kind,old_price,new_price,detail) VALUES(?,?,?,?,?,?)`, giftID, unix(at), kind, nullFloat(oldPrice), nullFloat(newPrice), detail)
+	return err
+}
+
+func (s *Store) PositionEvents(ctx context.Context, giftID int64, limit int) ([]PositionEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ts,kind,COALESCE(old_price,0),COALESCE(new_price,0),COALESCE(detail,'') FROM position_events WHERE gift_id=? ORDER BY ts DESC,id DESC LIMIT ?`, giftID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PositionEvent
+	for rows.Next() {
+		var e PositionEvent
+		var ts int64
+		if err := rows.Scan(&ts, &e.Kind, &e.OldPrice, &e.NewPrice, &e.Detail); err != nil {
+			return nil, err
+		}
+		e.TS = fromUnix(ts)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+type PositionMark struct {
+	TS                                                                      time.Time
+	EntryPrice, AskPrice, ModelFloor, RecommendedExit, ExternalRef, GramUSD float64
+	Edge, ExpectedDays, Score                                               float64
+	Action                                                                  string
+}
+
+func (s *Store) InsertPositionMark(ctx context.Context, giftID int64, m PositionMark) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO position_marks(gift_id,ts,entry_price,ask_price,model_floor,recommended_exit,external_ref,gram_usd,edge,expected_days,score,action) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, giftID, unix(m.TS), nullFloat(m.EntryPrice), nullFloat(m.AskPrice), nullFloat(m.ModelFloor), nullFloat(m.RecommendedExit), nullFloat(m.ExternalRef), nullFloat(m.GramUSD), m.Edge, nullFloat(m.ExpectedDays), m.Score, m.Action)
+	return err
+}
+
+func (s *Store) PositionMarks(ctx context.Context, giftID int64, limit int) ([]PositionMark, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ts,COALESCE(entry_price,0),COALESCE(ask_price,0),COALESCE(model_floor,0),COALESCE(recommended_exit,0),COALESCE(external_ref,0),COALESCE(gram_usd,0),COALESCE(edge,0),COALESCE(expected_days,0),COALESCE(score,0),COALESCE(action,'') FROM position_marks WHERE gift_id=? ORDER BY ts DESC LIMIT ?`, giftID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PositionMark
+	for rows.Next() {
+		var m PositionMark
+		var ts int64
+		if err := rows.Scan(&ts, &m.EntryPrice, &m.AskPrice, &m.ModelFloor, &m.RecommendedExit, &m.ExternalRef, &m.GramUSD, &m.Edge, &m.ExpectedDays, &m.Score, &m.Action); err != nil {
+			return nil, err
+		}
+		m.TS = fromUnix(ts)
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }
@@ -720,6 +1025,49 @@ FROM signals WHERE id = ?`, id).
 func (s *Store) MarkSignalSent(ctx context.Context, id int64, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE signals SET sent_at = ? WHERE id = ?`, unix(at), id)
 	return err
+}
+
+// SignalsNeedingOutcome returns mature signals without an evaluation at the
+// requested horizon.
+func (s *Store) SignalsNeedingOutcome(ctx context.Context, horizonHours int, now time.Time) ([]SignalRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT s.id,s.ts,s.kind,COALESCE(s.gift_id,0),COALESCE(s.name,''),COALESCE(s.model,''),COALESCE(s.price,0),COALESCE(s.exit_price,0),COALESCE(s.edge,0),COALESCE(s.velocity,0),COALESCE(s.score,0),COALESCE(s.payload,''),COALESCE(s.sent_at,0),COALESCE(s.action,'') FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id=s.id AND o.horizon_hours=? WHERE s.kind='buy' AND s.ts<=? AND o.signal_id IS NULL ORDER BY s.ts LIMIT 500`, horizonHours, unix(now.Add(-time.Duration(horizonHours)*time.Hour)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SignalRow
+	for rows.Next() {
+		var r SignalRow
+		var ts, sent int64
+		if err := rows.Scan(&r.ID, &ts, &r.Kind, &r.GiftID, &r.Key.Name, &r.Key.Model, &r.Price, &r.Exit, &r.Edge, &r.Velocity, &r.Score, &r.Payload, &sent, &r.Action); err != nil {
+			return nil, err
+		}
+		r.TS = fromUnix(ts)
+		r.SentAt = fromUnix(sent)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SaleForGiftBetween(ctx context.Context, giftID int64, from, to time.Time) (float64, bool, error) {
+	var p float64
+	err := s.db.QueryRowContext(ctx, `SELECT price FROM sales WHERE gift_id=? AND ts>? AND ts<=? ORDER BY ts LIMIT 1`, giftID, unix(from), unix(to)).Scan(&p)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	return p, err == nil, err
+}
+
+func (s *Store) PutSignalOutcome(ctx context.Context, signalID int64, horizon int, at time.Time, sold bool, salePrice, floor float64, profitable bool) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO signal_outcomes(signal_id,horizon_hours,evaluated_at,sold,sale_price,floor_price,profitable) VALUES(?,?,?,?,?,?,?)`, signalID, horizon, unix(at), boolInt(sold), nullFloat(salePrice), nullFloat(floor), boolInt(profitable))
+	return err
+}
+
+func (s *Store) CalibrationStats(ctx context.Context) (int, time.Time, error) {
+	var n int
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MIN(ts),0) FROM signals WHERE kind='buy'`).Scan(&n, &ts)
+	return n, fromUnix(ts), err
 }
 
 // LastSignalForModel powers the per-model alert cooldown.
@@ -938,6 +1286,12 @@ func (s *Store) Prune(ctx context.Context, now time.Time, keepDays int) error {
 		}
 		if _, err := t.ExecContext(ctx,
 			`DELETE FROM listings WHERE gone_at IS NOT NULL AND gone_at < ?`, cutoff); err != nil {
+			return err
+		}
+		if _, err := t.ExecContext(ctx, `DELETE FROM gram_quotes WHERE ts < ?`, cutoff); err != nil {
+			return err
+		}
+		if _, err := t.ExecContext(ctx, `DELETE FROM position_marks WHERE ts < ?`, cutoff); err != nil {
 			return err
 		}
 		_, err := t.ExecContext(ctx, `DELETE FROM mutes WHERE until < ?`, unix(now))

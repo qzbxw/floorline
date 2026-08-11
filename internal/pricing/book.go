@@ -67,6 +67,42 @@ func (b *Book) BestExcluding(giftID int64) (float64, bool) {
 	return 0, false
 }
 
+// BestAttributesExcluding returns the cheapest ask matching every non-empty
+// attribute. It powers the patient, collector-facing exit without confusing a
+// generic model floor with a genuinely comparable gift.
+func (b *Book) BestAttributesExcluding(giftID int64, backdrop, symbol string) (float64, bool) {
+	for _, a := range b.Asks {
+		if a.GiftID == giftID {
+			continue
+		}
+		if backdrop != "" && a.Backdrop != backdrop {
+			continue
+		}
+		if symbol != "" && a.Symbol != symbol {
+			continue
+		}
+		return a.Price, true
+	}
+	return 0, false
+}
+
+func (b *Book) CountAttributesBetween(lo, hi float64, excludeID int64, backdrop, symbol string) int {
+	n := 0
+	for _, a := range b.Asks {
+		if a.GiftID == excludeID || a.Price < lo || a.Price > hi {
+			continue
+		}
+		if backdrop != "" && a.Backdrop != backdrop {
+			continue
+		}
+		if symbol != "" && a.Symbol != symbol {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // CountBetween counts asks in [lo, hi], excluding one gift.
 func (b *Book) CountBetween(lo, hi float64, excludeID int64) int {
 	n := 0

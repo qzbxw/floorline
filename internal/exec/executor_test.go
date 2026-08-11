@@ -94,7 +94,7 @@ func (f *fakeAPI) ModelBook(ctx context.Context, k tonnel.ModelKey, limit int) (
 			Name:   k.Name,
 			Model:  k.Model + " (0.4%)",
 			Price:  tonnel.Flex64(p),
-			Asset:  tonnel.AssetTON,
+			Asset:  tonnel.AssetGRAM,
 		})
 	}
 	return out, nil

@@ -128,6 +128,31 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	positionColumns := []struct{ name, ddl string }{
+		{"model_rarity", "REAL NOT NULL DEFAULT 0"},
+		{"backdrop_rarity", "REAL NOT NULL DEFAULT 0"},
+		{"symbol_rarity", "REAL NOT NULL DEFAULT 0"},
+		{"cost_source", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"cost_confidence", "REAL NOT NULL DEFAULT 0"},
+		{"missing_since", "INTEGER"},
+	}
+	pcols, err := columns(db, "positions")
+	if err != nil {
+		return err
+	}
+	for _, c := range positionColumns {
+		if _, ok := pcols[c.name]; ok {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE positions ADD COLUMN " + c.name + " " + c.ddl); err != nil {
+			return err
+		}
+	}
+	// Backfill the immutable cycle ledger for databases that predate it.
+	if _, err := db.Exec(`INSERT OR IGNORE INTO position_trades(gift_id,name,model,buy_price,bought_at,sell_price,sold_at,source)
+		SELECT gift_id,name,model,buy_price,bought_at,sell_price,sold_at,source FROM positions WHERE status='sold' AND sold_at>0`); err != nil {
+		return err
+	}
 	return nil
 }
 

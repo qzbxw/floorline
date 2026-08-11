@@ -29,9 +29,15 @@ type Input struct {
 	Book *Book
 	Liq  Liquidity
 
-	Floor  float64 // model floor from the full-market snapshot
-	Supply int     // listed count for the model
-	Rarity float64
+	Floor      float64 // model floor from the full-market snapshot
+	Supply     int     // listed count for the model
+	Rarity     float64
+	Backdrop   string
+	Symbol     string
+	Attribute  AttributeValue
+	SnapshotAt time.Time
+	Now        time.Time
+	FX         FXContext
 
 	Params Params
 }
@@ -41,10 +47,13 @@ type Valuation struct {
 	Key    tonnel.ModelKey
 	GiftID int64
 
-	Price  float64
-	Floor  float64
-	Supply int
-	Rarity float64
+	Price     float64
+	Floor     float64
+	Supply    int
+	Rarity    float64
+	Backdrop  string
+	Symbol    string
+	Attribute AttributeValue
 
 	// CompetingAsk is the cheapest ask that is NOT this listing.
 	CompetingAsk    float64
@@ -63,6 +72,16 @@ type Valuation struct {
 	DaysOfSupply    float64 // listed supply divided by trade rate
 	ExpectedDays    float64 // rough time to actually get filled
 
+	FastExit            float64
+	FastExpectedDays    float64
+	PatientExit         float64
+	PatientExpectedDays float64
+	ChosenExit          string // fast | patient
+	Confidence          float64
+	DataAge             time.Duration
+	ScoreBreakdown      ScoreBreakdown
+	FX                  FXContext
+
 	Valid  bool
 	Reason string // why the valuation is unusable, when it is
 }
@@ -76,13 +95,17 @@ type Valuation struct {
 // has actually been trading at — whichever is worse.
 func Evaluate(in Input) Valuation {
 	v := Valuation{
-		Key:    in.Key,
-		GiftID: in.GiftID,
-		Price:  in.Price,
-		Floor:  in.Floor,
-		Supply: in.Supply,
-		Rarity: in.Rarity,
-		Liq:    in.Liq,
+		Key:       in.Key,
+		GiftID:    in.GiftID,
+		Price:     in.Price,
+		Floor:     in.Floor,
+		Supply:    in.Supply,
+		Rarity:    in.Rarity,
+		Backdrop:  in.Backdrop,
+		Symbol:    in.Symbol,
+		Attribute: in.Attribute,
+		Liq:       in.Liq,
+		FX:        in.FX,
 	}
 
 	if in.Price <= 0 {
@@ -144,7 +167,58 @@ func Evaluate(in Input) Valuation {
 		v.DaysOfSupply = math.Inf(1)
 		v.ExpectedDays = math.Inf(1)
 	}
+	v.FastExit = v.Exit
+	v.FastExpectedDays = v.ExpectedDays
+	v.ChosenExit = "fast"
+	v.Confidence = confidence(in.Liq, in.Attribute)
 
+	// A patient exit is allowed only when attributes have evidence. It is
+	// independently capped by the next genuinely comparable ask.
+	if in.Attribute.Valid && in.Attribute.Fair > 0 {
+		patient := in.Attribute.Fair
+		if in.Book != nil {
+			if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.Backdrop, in.Symbol); ok {
+				patient = math.Min(patient, ask*(1-undercut))
+			}
+		}
+		share := math.Max(in.Attribute.ExactShare, 0.05)
+		velocity := in.Liq.Velocity * share
+		queue := 0
+		if in.Book != nil {
+			queue = in.Book.CountAttributesBetween(patient, patient*1.05, in.GiftID, in.Backdrop, in.Symbol)
+		}
+		if velocity > 0 {
+			v.PatientExpectedDays = float64(1+queue) / velocity
+		} else {
+			v.PatientExpectedDays = math.Inf(1)
+		}
+		v.PatientExit = patient
+		fastProfitDay := (v.FastExit*(1-in.Params.Fee) - in.Price) / math.Max(v.FastExpectedDays, .25)
+		patientProfitDay := (patient*(1-in.Params.Fee) - in.Price) / math.Max(v.PatientExpectedDays, .25)
+		if in.Attribute.Confidence >= .55 && patientProfitDay > fastProfitDay {
+			v.Exit, v.ExpectedDays, v.ChosenExit = patient, v.PatientExpectedDays, "patient"
+			v.ExitBasis = "attribute fair value"
+			v.Proceeds = v.Exit * (1 - in.Params.Fee)
+			v.Net = v.Proceeds - in.Price
+			v.Edge = v.Net / in.Price
+		}
+	}
+	if !in.Now.IsZero() {
+		bookAt := time.Time{}
+		if in.Book != nil {
+			bookAt = in.Book.FetchedAt
+		}
+		for _, at := range []time.Time{in.SnapshotAt, bookAt, in.FX.QuoteAt} {
+			if at.IsZero() {
+				continue
+			}
+			age := in.Now.Sub(at)
+			if age > v.DataAge {
+				v.DataAge = age
+			}
+		}
+	}
 	v.Valid = true
+	v.ScoreBreakdown = BuildScore(v, 1)
 	return v
 }

@@ -30,7 +30,7 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 	}
 	fmt.Fprintf(&b, "⚡️ <b>%s</b> · %s\n", title, bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
 
-	fmt.Fprintf(&b, "<b>%s TON</b>", num(v.Price))
+	fmt.Fprintf(&b, "<b>%s GRAM</b>", num(v.Price))
 	if v.Floor > 0 {
 		fmt.Fprintf(&b, "  ·  model floor %s  ·  <b>%+.0f%%</b>", num(v.Floor), -v.DiscountToFloor*100)
 	}
@@ -38,6 +38,17 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 
 	fmt.Fprintf(&b, "Exit <b>%s</b>  <i>(%s)</i>\n", num(v.Exit), bot.Esc(exitExplain(v)))
 	fmt.Fprintf(&b, "Net <b>%s</b> (%+.1f%%) after %.1f%% fee\n", num(v.Net), v.Edge*100, a.cfg.TonnelFee*100)
+	if v.PatientExit > 0 {
+		fmt.Fprintf(&b, "Fast %s / %s · patient %s / %s · chose <b>%s</b>\n", num(v.FastExit), days(v.FastExpectedDays), num(v.PatientExit), days(v.PatientExpectedDays), v.ChosenExit)
+	}
+	fmt.Fprintf(&b, "Score %.1f · risk edge %.1f%% · confidence %.0f%%\n", v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100, v.Confidence*100)
+	if v.FX.Valid {
+		fmt.Fprintf(&b, "GRAM/USDT %s · 15m %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100)
+		if v.FX.ExpectedFloor > 0 {
+			fmt.Fprintf(&b, " · floor lag %+.1f%%", v.FX.FloorLag*100)
+		}
+		b.WriteString("\n")
+	}
 
 	fmt.Fprintf(&b, "Liquidity %.1f trades/day · %d trades in %dd · %d different gifts\n",
 		v.Liq.Velocity, v.Liq.Sales, a.cfg.LookbackDays, v.Liq.DistinctGifts)
@@ -56,6 +67,9 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 		fmt.Fprintf(&b, "Backdrop %s · Symbol %s\n",
 			bot.Esc(attrWithRarity(bd, g.BackdropRarity.Float())),
 			bot.Esc(attrWithRarity(tonnel.BaseAttr(g.Symbol), g.SymbolRarity.Float())))
+	}
+	if v.Attribute.Valid {
+		fmt.Fprintf(&b, "Attribute premium %+.1f%% · samples backdrop %d / symbol %d / exact %d\n", v.Attribute.Premium*100, v.Attribute.BackdropSamples, v.Attribute.SymbolSamples, v.Attribute.ExactSamples)
 	}
 
 	for _, line := range a.crossMarketLines(ctx, v) {
@@ -103,6 +117,20 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 	fmt.Fprintf(&b, "→ exit <b>%s</b> (%s)\n", num(v.Exit), bot.Esc(v.ExitBasis))
 	fmt.Fprintf(&b, "→ proceeds %s after %.1f%% fee\n", num(v.Proceeds), a.cfg.TonnelFee*100)
 	fmt.Fprintf(&b, "→ net <b>%s</b> (%+.1f%%)\n", num(v.Net), v.Edge*100)
+	if v.PatientExit > 0 {
+		fmt.Fprintf(&b, "Fast %s in %s · patient %s in %s · selected %s\n", num(v.FastExit), days(v.FastExpectedDays), num(v.PatientExit), days(v.PatientExpectedDays), v.ChosenExit)
+	}
+	fmt.Fprintf(&b, "Confidence %.0f%% · score %.1f · risk edge %.1f%%\n", v.Confidence*100, v.ScoreBreakdown.Total, v.ScoreBreakdown.RiskAdjustedEdge*100)
+	if v.FX.Valid {
+		fmt.Fprintf(&b, "GRAM/USD %s · 15m %+.1f%% · 1h %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100, v.FX.Move1h*100)
+		if v.FX.ExpectedFloor > 0 {
+			fmt.Fprintf(&b, " · FX floor %s (%+.1f%% lag)", num(v.FX.ExpectedFloor), v.FX.FloorLag*100)
+		}
+		b.WriteString("\n")
+	}
+	if v.Liq.FXCoverage > 0 {
+		fmt.Fprintf(&b, "Median %s GRAM normalized for GRAM/USD (%.0f%% coverage; raw %s)\n", num(v.Liq.Median), v.Liq.FXCoverage*100, num(v.Liq.RawMedian))
+	}
 
 	b.WriteString("\n<b>Liquidity</b>\n")
 	fmt.Fprintf(&b, "%.2f trades/day · %d trades in %dd · %d different gifts (turnover %.2f)\n",
@@ -156,7 +184,7 @@ func (a *App) statusLine() string {
 
 // ---- formatting helpers -------------------------------------------------
 
-// num renders a TON amount: no decimals for large values, two for small ones,
+// num renders a GRAM amount: no decimals for large values, two for small ones,
 // with thin thousands separators so four-digit prices stay readable.
 func num(v float64) string {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
@@ -245,9 +273,8 @@ func ago(t time.Time) string {
 	return dur(time.Since(t)) + " ago"
 }
 
-// crossMarketLines renders one line per other venue: its model floor, what that
-// floor would net after that venue's fee, and how it compares to what we are
-// paying here.
+// crossMarketLines renders actual sell queues. The robust reference is the
+// middle of the first three asks, so one abandoned bait floor cannot dominate.
 //
 // This is never a trade instruction. Getting a gift out of Tonnel's off-chain
 // engine takes minutes to hours, so no spread shown here is executable. It is a
@@ -261,25 +288,48 @@ func (a *App) crossMarketLines(ctx context.Context, v pricing.Valuation) []strin
 	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	quotes := a.cross.Quotes(qctx, v.Key.Name, v.Key.Model)
+	quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
 	lines := make([]string, 0, len(quotes))
 	for _, q := range quotes {
-		line := fmt.Sprintf("%s floor %s", bot.Esc(q.Venue), num(q.Floor))
+		line := fmt.Sprintf("%s asks %s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor))
+		if q.Scope != "" {
+			line += " [" + q.Scope + "]"
+		}
+		if ref := q.Reference(); ref > 0 && ref != q.Floor {
+			line += fmt.Sprintf(" · depth ref %s", num(ref))
+		}
 		if q.Fee > 0 {
-			line += fmt.Sprintf(" (net of %.0f%% there: %s)", q.Fee*100, num(q.Net()))
+			line += fmt.Sprintf(" (net ref %s)", num(q.NetReference()))
 		}
 		if v.Price > 0 {
-			line += fmt.Sprintf(" · %+.0f%% vs our entry", (q.Floor/v.Price-1)*100)
+			line += fmt.Sprintf(" · %+.0f%% vs entry", (q.Reference()/v.Price-1)*100)
 		}
 		lines = append(lines, line)
 	}
 	return lines
 }
 
+func askPreview(asks []float64, fallback float64) string {
+	if len(asks) == 0 {
+		return num(fallback) + " (floor only)"
+	}
+	n := len(asks)
+	if n > 5 {
+		n = 5
+	}
+	parts := make([]string, 0, n)
+	for _, p := range asks[:n] {
+		parts = append(parts, num(p))
+	}
+	return strings.Join(parts, " / ")
+}
+
 // exitExplain says in one clause where the exit price came from, so the number
 // is never an opaque model output.
 func exitExplain(v pricing.Valuation) string {
 	switch v.ExitBasis {
+	case "attribute fair value":
+		return "attribute-adjusted comparable sales"
 	case "undercut":
 		return fmt.Sprintf("undercutting the next ask at %s", num(v.CompetingAsk))
 	case "median":

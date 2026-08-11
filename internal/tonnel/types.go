@@ -230,7 +230,8 @@ type ModelStat struct {
 
 // Balance is the account state from /api/balance/info.
 type Balance struct {
-	TON    float64
+	GRAM   float64
+	TON    float64 // deprecated wire-compatible alias
 	USDT   float64
 	Tonnel float64
 	Raw    map[string]any

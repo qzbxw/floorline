@@ -72,6 +72,11 @@ func (a *App) Status(ctx context.Context) bot.Reply {
 		WithRow(bot.Callback("🔄 Refresh", cbRefresh, "status"))
 }
 
+// Gram shows the external GRAM/USDT rate and floors that have not caught up.
+func (a *App) Gram(ctx context.Context) bot.Reply {
+	return bot.Text(a.gramText(ctx)).WithRow(bot.Callback("🔄 Refresh", cbRefresh, "gram"))
+}
+
 // Floor shows a collection's models, or one model in detail.
 func (a *App) Floor(ctx context.Context, collection, model string) bot.Reply {
 	r := bot.Text(a.floorText(ctx, collection, model))
@@ -177,7 +182,7 @@ func (a *App) Val(ctx context.Context, giftID int64) bot.Reply {
 
 // Positions lists open inventory, each row carrying its own Relist button.
 func (a *App) Positions(ctx context.Context) bot.Reply {
-	r := bot.Text(a.positionsText(ctx))
+	r := bot.Text(a.portfolioText(ctx))
 
 	positions, err := a.st.OpenPositions(ctx)
 	if err != nil || len(positions) == 0 {
@@ -194,6 +199,22 @@ func (a *App) Positions(ctx context.Context) bot.Reply {
 		)
 	}
 	return r.WithRow(bot.Callback("🔄 Refresh", cbRefresh, "pos"))
+}
+
+func (a *App) Portfolio(ctx context.Context) bot.Reply {
+	return bot.Text(a.portfolioText(ctx)).WithRow(bot.Callback("🔄 Refresh", cbRefresh, "portfolio"))
+}
+func (a *App) Advice(ctx context.Context, giftID int64) bot.Reply {
+	return bot.Text(a.adviceText(ctx, giftID)).WithRow(bot.Callback("♻️ Relist", cbRelist, giftID), bot.Link("🔗", bot.TonnelGiftURL(giftID)))
+}
+func (a *App) PositionHistory(ctx context.Context, giftID int64) bot.Reply {
+	return bot.Text(a.positionHistoryText(ctx, giftID)).WithRow(bot.Link("🔗 Open on Tonnel", bot.TonnelGiftURL(giftID)))
+}
+func (a *App) SetCost(ctx context.Context, giftID int64, price float64) bot.Reply {
+	return bot.Text(a.setCostText(ctx, giftID, price))
+}
+func (a *App) ExitAt(ctx context.Context, giftID int64, price float64, confirm string) bot.Reply {
+	return bot.Text(a.exitAtText(ctx, giftID, price, confirm))
 }
 
 // PnL reports realised and unrealised profit, net of fees.

@@ -80,17 +80,71 @@ CREATE TABLE IF NOT EXISTS positions (
     model      TEXT NOT NULL,
     backdrop   TEXT,
     symbol     TEXT,
+    model_rarity    REAL NOT NULL DEFAULT 0,
+    backdrop_rarity REAL NOT NULL DEFAULT 0,
+    symbol_rarity   REAL NOT NULL DEFAULT 0,
     buy_price  REAL    NOT NULL,
+    cost_source TEXT NOT NULL DEFAULT 'unknown',
+    cost_confidence REAL NOT NULL DEFAULT 0,
     bought_at  INTEGER NOT NULL,
     list_price REAL,
     listed_at  INTEGER,
     sell_price REAL,
     sold_at    INTEGER,
-    status     TEXT NOT NULL,          -- open | listed | sold | returned
+    missing_since INTEGER,
+    status     TEXT NOT NULL,          -- open | listed | missing | sold | returned
     source     TEXT NOT NULL DEFAULT 'manual',  -- auto | manual | import
     note       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+
+-- Immutable lifecycle journal. Inventory reconciliation and bot actions both
+-- write here, so manual buys/reprices are auditable exactly like bot trades.
+CREATE TABLE IF NOT EXISTS position_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    gift_id   INTEGER NOT NULL,
+    ts        INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    old_price REAL,
+    new_price REAL,
+    detail    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_position_events_gift ON position_events(gift_id, ts DESC);
+
+-- Periodic mark-to-market trail used to explain how advice changed over time.
+CREATE TABLE IF NOT EXISTS position_marks (
+    gift_id       INTEGER NOT NULL,
+    ts            INTEGER NOT NULL,
+    entry_price   REAL,
+    ask_price     REAL,
+    model_floor   REAL,
+    recommended_exit REAL,
+    external_ref  REAL,
+    gram_usd      REAL,
+    edge          REAL,
+    expected_days REAL,
+    score         REAL,
+    action        TEXT,
+    PRIMARY KEY (gift_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_position_marks_gift ON position_marks(gift_id, ts DESC);
+
+-- Completed ownership cycles are immutable. A physical gift may be bought,
+-- sold and later reacquired; positions holds the current cycle, this table
+-- preserves every prior realised PnL row.
+CREATE TABLE IF NOT EXISTS position_trades (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    gift_id     INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    buy_price   REAL,
+    bought_at   INTEGER,
+    sell_price  REAL,
+    sold_at     INTEGER NOT NULL,
+    source      TEXT,
+    UNIQUE(gift_id, bought_at, sold_at)
+);
+CREATE INDEX IF NOT EXISTS idx_position_trades_sold ON position_trades(sold_at DESC);
 
 -- Every signal ever produced, including ones that were only logged in shadow
 -- mode. Joined against `sales` later, this table is a free backtest of the
@@ -146,6 +200,42 @@ CREATE TABLE IF NOT EXISTS buy_attempts (
     status  TEXT    NOT NULL,   -- pending | bought | failed
     detail  TEXT
 );
+
+-- Every price change is retained so repricing is rate-limited and auditable.
+CREATE TABLE IF NOT EXISTS reprices (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    gift_id   INTEGER NOT NULL,
+    ts        INTEGER NOT NULL,
+    old_price REAL,
+    new_price REAL NOT NULL,
+    reason    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reprices_gift ON reprices(gift_id, ts DESC);
+
+-- Forward outcomes make signal quality measurable instead of anecdotal.
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    signal_id      INTEGER NOT NULL,
+    horizon_hours  INTEGER NOT NULL,
+    evaluated_at   INTEGER NOT NULL,
+    sold           INTEGER NOT NULL DEFAULT 0,
+    sale_price     REAL,
+    floor_price    REAL,
+    profitable     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(signal_id, horizon_hours),
+    FOREIGN KEY(signal_id) REFERENCES signals(id) ON DELETE CASCADE
+);
+
+-- GRAM/USDT history. The marketplace can keep a stale GRAM floor while the
+-- native coin moves; this series lets sales and floors be compared in constant
+-- current-GRAM terms.
+CREATE TABLE IF NOT EXISTS gram_quotes (
+    ts        INTEGER PRIMARY KEY,
+    usd       REAL NOT NULL,
+    bid       REAL,
+    ask       REAL,
+    change_24 REAL
+);
+CREATE INDEX IF NOT EXISTS idx_gram_quotes_ts ON gram_quotes(ts DESC);
 
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,

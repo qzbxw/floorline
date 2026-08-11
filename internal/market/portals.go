@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +21,7 @@ import (
 // changed the response shape at the same time.
 const portalsAPI = "https://portals.tg/api"
 
-// Portals reads model floors from the Portals marketplace.
+// Portals reads model floors and actual listing depth from Portals.
 //
 // One request returns every model floor for a collection, so the cache is keyed
 // by collection rather than by model — a burst of cards for different models of
@@ -35,6 +37,7 @@ type Portals struct {
 	lim  *rate.Limiter
 
 	floors *cache[map[string]float64]
+	books  *cache[[]float64]
 }
 
 // NewPortals builds the Portals reader. authData is optional.
@@ -49,7 +52,69 @@ func NewPortals(authData string, fee float64, ttl time.Duration) (*Portals, erro
 		fee:    fee,
 		lim:    rate.NewLimiter(rate.Limit(1), 2),
 		floors: newCache[map[string]float64](ttl),
+		books:  newCache[[]float64](ttl),
 	}, nil
+}
+
+// ModelAsks reads the actual Portals sell queue, with optional exact
+// backdrop/symbol filters. The endpoint is public on the current portals.tg
+// host even though older Portals clients required WebApp auth.
+func (p *Portals) ModelAsks(ctx context.Context, collection, model, backdrop, symbol string, limit int) ([]float64, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 20
+	}
+	key := matchKey(collection) + "|" + matchKey(model) + "|" + matchKey(backdrop) + "|" + matchKey(symbol)
+	return p.books.get(key, func() ([]float64, error) {
+		if err := p.lim.Wait(ctx); err != nil {
+			return nil, err
+		}
+		v := url.Values{
+			"offset":                {"0"},
+			"limit":                 {strconv.Itoa(limit)},
+			"sort_by":               {"price asc"},
+			"filter_by_collections": {collection},
+			"filter_by_models":      {model},
+			"status":                {"listed"},
+		}
+		if backdrop != "" {
+			v.Set("filter_by_backdrops", backdrop)
+		}
+		if symbol != "" {
+			v.Set("filter_by_symbols", symbol)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, portalsAPI+"/nfts/search?"+v.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header = http.Header{"accept": {"application/json"}, "origin": {"https://portals.tg"}, "referer": {"https://portals.tg/"}, "user-agent": {userAgent}}
+		if p.auth != "" {
+			req.Header.Set("authorization", p.auth)
+		}
+		resp, err := p.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("portals listings: http %d", resp.StatusCode)
+		}
+		var payload struct {
+			Results []struct {
+				Price string `json:"price"`
+			} `json:"results"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&payload); err != nil {
+			return nil, fmt.Errorf("portals listings: decode: %w", err)
+		}
+		asks := make([]float64, 0, len(payload.Results))
+		for _, row := range payload.Results {
+			if price, err := strconv.ParseFloat(row.Price, 64); err == nil && price > 0 {
+				asks = append(asks, price)
+			}
+		}
+		sort.Float64s(asks)
+		return asks, nil
+	})
 }
 
 // Venue implements Source.

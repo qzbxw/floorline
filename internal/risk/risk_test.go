@@ -259,6 +259,25 @@ func TestAllowRespectsBalanceReserve(t *testing.T) {
 	}
 }
 
+func TestConcentrationBlocksAfterPortfolioBootstrap(t *testing.T) {
+	ctx := context.Background()
+	m, st := armed(t)
+	mustSet(t, m, "max_model_exposure_pct", "0.35")
+	mustSet(t, m, "max_collection_exposure_pct", "0.80")
+	mustSet(t, m, "max_positions_per_model", "5")
+	mustSet(t, m, "model_cooldown_min", "0")
+	m.SetBalance(100)
+	for i, k := range []tonnel.ModelKey{{Name: "A", Model: "1"}, {Name: "B", Model: "1"}, {Name: "C", Model: "1"}} {
+		if err := st.UpsertPosition(ctx, store.Position{GiftID: int64(i + 1), Key: k, BuyPrice: 100, BoughtAt: time.Now(), Status: store.StatusOpen, Source: "test"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ok, why := m.Allow(ctx, tonnel.ModelKey{Name: "A", Model: "1"}, 100, time.Now())
+	if ok || !strings.Contains(why, "model exposure") {
+		t.Fatalf("concentration allowed: %v %q", ok, why)
+	}
+}
+
 // A run of failures means something systemic is wrong, not that we are unlucky.
 func TestThreeFailuresDisarm(t *testing.T) {
 	ctx := context.Background()

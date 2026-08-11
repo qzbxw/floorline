@@ -13,6 +13,7 @@ import (
 	"floorline/internal/bot"
 	"floorline/internal/config"
 	"floorline/internal/exec"
+	"floorline/internal/fx"
 	"floorline/internal/market"
 	"floorline/internal/pricing"
 	"floorline/internal/risk"
@@ -32,6 +33,7 @@ type App struct {
 	rm    *risk.Manager
 	ex    *exec.Executor
 	cross *market.Comparison
+	fx    *fx.Client
 	tg    *bot.Bot
 
 	// nav holds short handles for keyboard buttons, because collection and
@@ -104,7 +106,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		return nil, err
 	}
 
-	a.books = pricing.NewBookCache(a.api, cfg.BookCacheTTL, 10)
+	a.books = pricing.NewBookCache(a.api, cfg.BookCacheTTL, 30)
 
 	a.rm, err = risk.New(ctx, st)
 	if err != nil {
@@ -118,8 +120,13 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	a.det = signal.New(st, a.books, cfg)
 	a.det.Coverage = a.Coverage
 	a.det.Warm = a.Warm
+	a.det.CalibrationReady = func() bool {
+		n, first, err := a.st.CalibrationStats(context.Background())
+		return err == nil && n >= cfg.CalibrationMinSignals && !first.IsZero() && time.Since(first) >= time.Duration(cfg.CalibrationMinDays)*24*time.Hour
+	}
 
 	a.ex = exec.New(a.api, st, a.books, a.rm, cfg)
+	a.fx = fx.New(cfg.GramQuoteURL, cfg.HTTPTimeout)
 
 	// Cross-market venues are read-only price references. A venue that fails to
 	// build is dropped with a warning rather than taking the process down —
@@ -156,6 +163,16 @@ func (a *App) API() *tonnel.Client { return a.api }
 // Store exposes the database (used by the backfill command).
 func (a *App) Store() *store.Store { return a.st }
 
+// SyncInventory performs one full paginated reconciliation. It is exported for
+// the read-mostly CLI portfolio report as well as used by the poller.
+func (a *App) SyncInventory(ctx context.Context) error { return a.pollInventory(ctx) }
+
+// SyncGram refreshes the public GRAM/USDT reference and its hourly history.
+func (a *App) SyncGram(ctx context.Context) error { return a.pollGram(ctx) }
+
+// PortfolioReport renders the same advice shown by /portfolio.
+func (a *App) PortfolioReport(ctx context.Context) string { return a.portfolioText(ctx) }
+
 // Run starts every poller and then blocks on the Telegram update loop.
 func (a *App) Run(ctx context.Context) error {
 	if err := a.cfg.RequireAuth(); err != nil {
@@ -181,6 +198,9 @@ func (a *App) Run(ctx context.Context) error {
 
 	// The market snapshot must land before anything is evaluated, otherwise the
 	// first minute of signals would price against empty floors.
+	if err := a.pollGram(ctx); err != nil {
+		log.Warn().Err(err).Msg("initial GRAM quote failed")
+	}
 	if err := a.pollStats(ctx); err != nil {
 		log.Warn().Err(err).Msg("initial market snapshot failed")
 	}
@@ -189,6 +209,7 @@ func (a *App) Run(ctx context.Context) error {
 	start("sales", a.cfg.SalesInterval, a.pollSales)
 	start("feed", a.cfg.FeedInterval, a.pollFeed)
 	start("inventory", a.cfg.InventoryInterval, a.pollInventory)
+	start("gram", a.cfg.GramQuoteInterval, a.pollGram)
 	start("maintenance", time.Hour, a.maintenance)
 
 	wg.Add(1)
@@ -321,7 +342,7 @@ func (a *App) onAuthExpired(err error) {
 	_ = a.rm.Disarm(context.Background(), "Tonnel session rejected")
 	if a.throttle("auth", 30*time.Minute) {
 		a.notify("🔑 <b>Tonnel session rejected</b>\n" + bot.Esc(err.Error()) +
-			"\n\nGrab a fresh authData from LocalStorage of market.tonnel.network and send:\n<code>/auth &lt;authData&gt;</code>")
+			"\n\nOpen the Tonnel mini app with DevTools, copy Telegram.WebApp.initData (or user_auth from a gifts2.tonnel.network request), then send:\n<code>/auth &lt;authData&gt;</code>")
 	}
 }
 

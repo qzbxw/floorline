@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"floorline/internal/store"
 	"floorline/internal/tonnel"
 )
 
@@ -225,6 +226,41 @@ func TestDiscountToFloorIsDisplayOnly(t *testing.T) {
 	}
 }
 
+func TestSparseAttributesShrinkToModelMedian(t *testing.T) {
+	sales := []store.SaleRow{{Price: 200, Backdrop: "Rare", Symbol: "Moon"}}
+	a := ComputeAttributeValue(sales, "Rare", "Moon", 100)
+	if a.Valid {
+		t.Error("one exact trade must not make an attribute valuation valid")
+	}
+	if a.Premium >= .35 {
+		t.Errorf("sparse premium was not shrunk: %.2f", a.Premium)
+	}
+}
+
+func TestPatientExitRequiresEvidenceAndCanWinOnProfitPerDay(t *testing.T) {
+	sales := make([]store.SaleRow, 0, 40)
+	for i := 0; i < 40; i++ {
+		p := 100.0
+		bd, sy := "Plain", "Dot"
+		if i < 20 {
+			p = 130
+			bd, sy = "Gold", "Moon"
+		}
+		sales = append(sales, store.SaleRow{Price: p, Backdrop: bd, Symbol: sy})
+	}
+	attr := ComputeAttributeValue(sales, "Gold", "Moon", 100)
+	if !attr.Valid || attr.Fair <= 100 {
+		t.Fatalf("attribute value = %+v", attr)
+	}
+	v := Evaluate(Input{GiftID: 42, Key: testKey, Price: 70, Backdrop: "Gold", Symbol: "Moon", Attribute: attr, Book: bookOf(42, 70, 140), Liq: liqOf(100, 40), Params: Params{Fee: testFee, Undercut: testUndercut}})
+	if v.PatientExit <= v.FastExit {
+		t.Errorf("patient %.2f should exceed fast %.2f", v.PatientExit, v.FastExit)
+	}
+	if v.Confidence <= 0 {
+		t.Error("confidence should be populated")
+	}
+}
+
 func TestBookExcludesBundlesAndPremarket(t *testing.T) {
 	gifts := []tonnel.Gift{
 		{GiftID: 1, Price: 100},
@@ -243,5 +279,34 @@ func TestBookExcludesBundlesAndPremarket(t *testing.T) {
 	}
 	if best, ok := b.BestExcluding(5); !ok || best != 100 {
 		t.Errorf("BestExcluding(5) = (%v, %v), want (100, true)", best, ok)
+	}
+}
+
+func TestScoreRanksFastMicroEdgeAboveSlowLargeEdge(t *testing.T) {
+	fast := Valuation{Valid: true, Edge: .03, Net: 3, ExpectedDays: .5, Confidence: .8, Liq: Liquidity{Sales: 20, MADRatio: .02}}
+	slow := Valuation{Valid: true, Edge: .10, Net: 10, ExpectedDays: 8, Confidence: .8, Liq: Liquidity{Sales: 20, MADRatio: .02}}
+	fastScore := BuildScore(fast, 1)
+	slowScore := BuildScore(slow, 1)
+	if fastScore.Total <= slowScore.Total {
+		t.Fatalf("fast micro-edge score %.2f should beat slow large-edge %.2f", fastScore.Total, slowScore.Total)
+	}
+}
+
+func TestScoreRejectsFragileSubPercentEdge(t *testing.T) {
+	v := Valuation{Valid: true, Edge: .009, Net: .9, ExpectedDays: 1, Confidence: .9, Liq: Liquidity{Sales: 20, MADRatio: .10}, CompetitorsNear: 2}
+	s := BuildScore(v, 1)
+	if s.RiskAdjustedEdge != 0 || s.Total != 0 {
+		t.Fatalf("uncertainty should consume fragile edge: %+v", s)
+	}
+}
+
+func TestScorePenalizesStaleExpensiveFloorAndVolatileGram(t *testing.T) {
+	base := Valuation{Valid: true, Edge: .05, Net: 5, ExpectedDays: 1, Confidence: .8, Liq: Liquidity{Sales: 20, MADRatio: .02}}
+	calm := base
+	calm.FX = FXContext{Valid: true, FloorLag: 0, Move15m: 0}
+	risky := base
+	risky.FX = FXContext{Valid: true, FloorLag: .12, Move15m: .04}
+	if BuildScore(risky, 1).Total >= BuildScore(calm, 1).Total {
+		t.Fatal("stale-expensive floor during GRAM volatility should reduce score")
 	}
 }

@@ -48,17 +48,19 @@ type Detector struct {
 	// is not understated while the database is still filling up.
 	Coverage func() time.Duration
 	// Warm reports whether the history is deep enough to trust for auto-buying.
-	Warm func() bool
+	Warm             func() bool
+	CalibrationReady func() bool
 }
 
 // New builds a Detector.
 func New(st *store.Store, books *pricing.BookCache, cfg *config.Config) *Detector {
 	return &Detector{
-		st:       st,
-		books:    books,
-		cfg:      cfg,
-		Coverage: func() time.Duration { return time.Duration(cfg.LookbackDays) * 24 * time.Hour },
-		Warm:     func() bool { return true },
+		st:               st,
+		books:            books,
+		cfg:              cfg,
+		Coverage:         func() time.Duration { return time.Duration(cfg.LookbackDays) * 24 * time.Hour },
+		Warm:             func() bool { return true },
+		CalibrationReady: func() bool { return true },
 	}
 }
 
@@ -99,11 +101,28 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		return nil, nil
 	}
 
-	sales, err := d.st.SalesSince(ctx, key, now.Add(-d.window()))
+	attrDays := d.cfg.AttributeLookbackDays
+	if attrDays < d.cfg.LookbackDays {
+		attrDays = d.cfg.LookbackDays
+	}
+	since := now.Add(-time.Duration(attrDays) * 24 * time.Hour)
+	sales, err := d.st.SalesSince(ctx, key, since)
 	if err != nil {
 		return nil, fmt.Errorf("load sales: %w", err)
 	}
-	liq := pricing.ComputeLiquidity(sales, now, d.window(), d.Coverage())
+	rawLiq := pricing.ComputeLiquidity(sales, now, d.window(), d.Coverage())
+	fxSales, fxCoverage := sales, 0.0
+	if cur, ok, _ := d.st.LatestGramQuote(ctx); ok && cur.USD > 0 {
+		if qs, e := d.st.GramQuotesSince(ctx, since.Add(-2*time.Hour)); e == nil {
+			rates := make([]pricing.RatePoint, 0, len(qs))
+			for _, q := range qs {
+				rates = append(rates, pricing.RatePoint{TS: q.TS, USD: q.USD})
+			}
+			fxSales, fxCoverage = pricing.NormalizeSalesForRate(sales, rates, cur.USD)
+		}
+	}
+	liq := pricing.ComputeLiquidity(fxSales, now, d.window(), d.Coverage())
+	liq.RawMedian, liq.FXCoverage = rawLiq.Median, fxCoverage
 
 	// Cheap pre-filter. The exit price can never exceed the median of recent
 	// trades, so this ceiling on the achievable edge is exact — and it rejects
@@ -123,8 +142,17 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	}
 	var floor, rarity float64
 	var supply int
+	var snapshotAt time.Time
+	var fxContext pricing.FXContext
 	if stat != nil {
 		floor, supply, rarity = stat.Floor, stat.Supply, stat.Rarity
+		snapshotAt = stat.TS
+		if cur, ok, _ := d.st.LatestGramQuote(ctx); ok {
+			q15, _, _ := d.st.GramQuoteAt(ctx, now.Add(-15*time.Minute))
+			q1, _, _ := d.st.GramQuoteAt(ctx, now.Add(-time.Hour))
+			floor1, _, _ := d.st.FloorAt(ctx, key, now.Add(-time.Hour))
+			fxContext = pricing.ComputeFXContext(now, floor, pricing.RatePoint{TS: cur.TS, USD: cur.USD}, pricing.RatePoint{TS: q15.TS, USD: q15.USD}, pricing.RatePoint{TS: q1.TS, USD: q1.USD}, floor1)
+		}
 	}
 
 	book, err := d.books.Get(ctx, key)
@@ -133,15 +161,21 @@ func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	}
 
 	val := pricing.Evaluate(pricing.Input{
-		GiftID: g.GiftID.Int(),
-		Key:    key,
-		Price:  price,
-		Book:   book,
-		Liq:    liq,
-		Floor:  floor,
-		Supply: supply,
-		Rarity: rarity,
-		Params: d.params(),
+		GiftID:     g.GiftID.Int(),
+		Key:        key,
+		Price:      price,
+		Book:       book,
+		Liq:        liq,
+		Floor:      floor,
+		Supply:     supply,
+		Rarity:     rarity,
+		Backdrop:   tonnel.BaseAttr(g.Backdrop),
+		Symbol:     tonnel.BaseAttr(g.Symbol),
+		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
+		SnapshotAt: snapshotAt,
+		Now:        now,
+		FX:         fxContext,
+		Params:     d.params(),
 	})
 
 	dec := &Decision{Gift: g, Val: val}
@@ -203,7 +237,7 @@ func (d *Detector) tradable(g tonnel.Gift) bool {
 	if g.Refunded.Bool() || g.Buyer != nil {
 		return false
 	}
-	if g.Asset != "" && g.Asset != tonnel.AssetTON {
+	if g.Asset != "" && g.Asset != tonnel.AssetGRAM {
 		return false // USDT listings are a separate book with a separate floor
 	}
 	p := g.Price.Float()
@@ -221,8 +255,8 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	g := d.cfg.Sig
 	var fails []string
 
-	if v.Edge < g.MinEdge {
-		fails = append(fails, fmt.Sprintf("edge %.1f%% below %.1f%%", v.Edge*100, g.MinEdge*100))
+	if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
+		fails = append(fails, fmt.Sprintf("risk-adjusted edge %.1f%% below %.1f%% (raw %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
 	}
 	if v.Liq.Velocity < g.MinVelocity {
 		fails = append(fails, fmt.Sprintf("velocity %.2f/day below %.2f", v.Liq.Velocity, g.MinVelocity))
@@ -248,8 +282,13 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	if d.Warm != nil && !d.Warm() {
 		fails = append(fails, "trade history still warming up")
 	}
-	if v.Edge < a.MinEdge {
-		fails = append(fails, fmt.Sprintf("edge %.1f%% below auto threshold %.1f%%", v.Edge*100, a.MinEdge*100))
+	if d.cfg.ShadowMode {
+		fails = append(fails, "shadow mode is enabled")
+	} else if d.CalibrationReady != nil && !d.CalibrationReady() {
+		fails = append(fails, "score calibration has not reached its minimum sample")
+	}
+	if v.ScoreBreakdown.RiskAdjustedEdge < a.MinEdge {
+		fails = append(fails, fmt.Sprintf("risk-adjusted edge %.1f%% below auto threshold %.1f%%", v.ScoreBreakdown.RiskAdjustedEdge*100, a.MinEdge*100))
 	}
 	if v.Liq.Velocity < a.MinVelocity {
 		fails = append(fails, fmt.Sprintf("velocity %.2f/day below auto threshold %.2f", v.Liq.Velocity, a.MinVelocity))
@@ -272,19 +311,27 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 		fails = append(fails, fmt.Sprintf("expected time to sell %s above max_exit_days %.1f",
 			days(v.ExpectedDays), limits.MaxExitDays))
 	}
+	if a.MaxDataAge > 0 && v.DataAge > a.MaxDataAge {
+		fails = append(fails, fmt.Sprintf("market data age %s above auto max %s", v.DataAge.Round(time.Second), a.MaxDataAge))
+	}
+	if !v.FX.Valid {
+		fails = append(fails, "GRAM reference is unavailable or stale")
+	} else if a.MaxGramMove15m > 0 && math.Abs(v.FX.Move15m) > a.MaxGramMove15m {
+		fails = append(fails, fmt.Sprintf("GRAM moved %+.1f%% in 15m; auto limit %.1f%%", v.FX.Move15m*100, a.MaxGramMove15m*100))
+	}
 	if v.ExitBasis == "median (sole ask)" {
 		fails = append(fails, "no competing ask to price against")
 	}
 	return fails
 }
 
-// Score ranks simultaneous signals: bigger edge, faster market and larger
-// ticket first, so the expensive liquid opportunity is not buried under dust.
+// Score ranks simultaneous signals by risk-adjusted daily ROI, fill probability
+// and confidence, so a quick real 3% exit can beat a slow theoretical 10% one.
 func Score(v pricing.Valuation) float64 {
 	if !v.Valid || v.Price <= 0 {
 		return 0
 	}
-	return v.Edge * math.Min(v.Liq.Velocity, 5) * math.Log(1+v.Price)
+	return pricing.BuildScore(v, 1).Total
 }
 
 func days(d float64) string {

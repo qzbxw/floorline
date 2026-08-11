@@ -17,7 +17,7 @@ import (
 
 // SignalGates decides what gets pushed to Telegram as an actionable card.
 type SignalGates struct {
-	MinEdge     float64 // net profit / entry price, after the exit price is modelled honestly
+	MinEdge     float64 // risk-adjusted net edge after fees and uncertainty buffer
 	MinVelocity float64 // sales per day over the lookback window
 	MinSales    int     // absolute number of sales over the lookback window
 	MaxMADRatio float64 // median absolute deviation / median — price stability
@@ -34,10 +34,11 @@ type AutoGates struct {
 	// MinTurnover is distinct gifts divided by trades. The endpoint exposes no
 	// counterparties, so this is the wash-trading guard: a tape made of one
 	// gift changing hands repeatedly must not qualify for unattended buying.
-	MinTurnover float64
-	MaxMADRatio float64
-	MinTrend    float64
-	MaxDataAge  time.Duration // refuse to act on stale market data
+	MinTurnover    float64
+	MaxMADRatio    float64
+	MinTrend       float64
+	MaxDataAge     time.Duration // refuse to act on stale market data
+	MaxGramMove15m float64       // pause unattended buys during sharp GRAM moves
 }
 
 // Config is immutable for the lifetime of the process.
@@ -67,7 +68,8 @@ type Config struct {
 	Sig  SignalGates
 	Auto AutoGates
 
-	LookbackDays int
+	LookbackDays          int
+	AttributeLookbackDays int
 
 	FeedInterval      time.Duration
 	StatsInterval     time.Duration
@@ -87,8 +89,13 @@ type Config struct {
 	ReadRPS   float64
 	ReadBurst int
 
-	HTTPTimeout  time.Duration
-	CrossMarkTTL time.Duration
+	HTTPTimeout           time.Duration
+	CrossMarkTTL          time.Duration
+	ShadowMode            bool
+	CalibrationMinSignals int
+	CalibrationMinDays    int
+	GramQuoteURL          string
+	GramQuoteInterval     time.Duration
 }
 
 // LoadDotEnv reads KEY=VALUE lines from path into the environment.
@@ -146,25 +153,27 @@ func Load() (*Config, error) {
 		Undercut:   envFloat("UNDERCUT", 0.01),
 
 		Sig: SignalGates{
-			MinEdge:     envFloat("SIG_MIN_EDGE", 0.05),
-			MinVelocity: envFloat("SIG_MIN_VELOCITY", 1.0),
-			MinSales:    envInt("SIG_MIN_SALES", 10),
+			MinEdge:     envFloat("SIG_MIN_EDGE", 0.01),
+			MinVelocity: envFloat("SIG_MIN_VELOCITY", 0.5),
+			MinSales:    envInt("SIG_MIN_SALES", 6),
 			MaxMADRatio: envFloat("SIG_MAX_MAD_RATIO", 0.35),
 			MinTrend:    envFloat("SIG_MIN_TREND", 0.90),
 			MinPrice:    envFloat("SIG_MIN_PRICE", 1),
 			MaxPrice:    envFloat("SIG_MAX_PRICE", 0),
 		},
 		Auto: AutoGates{
-			MinEdge:     envFloat("AUTOBUY_MIN_EDGE", 0.10),
-			MinVelocity: envFloat("AUTOBUY_MIN_VELOCITY", 2.0),
-			MinSales:    envInt("AUTOBUY_MIN_SALES", 20),
-			MinTurnover: envFloat("AUTOBUY_MIN_TURNOVER", 0.6),
-			MaxMADRatio: envFloat("AUTOBUY_MAX_MAD_RATIO", 0.25),
-			MinTrend:    envFloat("AUTOBUY_MIN_TREND", 0.95),
-			MaxDataAge:  envDur("AUTOBUY_MAX_DATA_AGE", 5*time.Minute),
+			MinEdge:        envFloat("AUTOBUY_MIN_EDGE", 0.03),
+			MinVelocity:    envFloat("AUTOBUY_MIN_VELOCITY", 1.0),
+			MinSales:       envInt("AUTOBUY_MIN_SALES", 10),
+			MinTurnover:    envFloat("AUTOBUY_MIN_TURNOVER", 0.6),
+			MaxMADRatio:    envFloat("AUTOBUY_MAX_MAD_RATIO", 0.25),
+			MinTrend:       envFloat("AUTOBUY_MIN_TREND", 0.95),
+			MaxDataAge:     envDur("AUTOBUY_MAX_DATA_AGE", 5*time.Minute),
+			MaxGramMove15m: envFloat("AUTOBUY_MAX_GRAM_MOVE_15M", .03),
 		},
 
-		LookbackDays: envInt("LOOKBACK_DAYS", 14),
+		LookbackDays:          envInt("LOOKBACK_DAYS", 14),
+		AttributeLookbackDays: envInt("ATTRIBUTE_LOOKBACK_DAYS", 60),
 
 		FeedInterval:      envDur("POLL_FEED", 2*time.Second),
 		StatsInterval:     envDur("POLL_STATS", 60*time.Second),
@@ -178,8 +187,13 @@ func Load() (*Config, error) {
 		ReadRPS:   envFloat("READ_RPS", 2),
 		ReadBurst: envInt("READ_BURST", 5),
 
-		HTTPTimeout:  envDur("HTTP_TIMEOUT", 20*time.Second),
-		CrossMarkTTL: envDur("CROSS_MARKET_TTL", 5*time.Minute),
+		HTTPTimeout:           envDur("HTTP_TIMEOUT", 20*time.Second),
+		CrossMarkTTL:          envDur("CROSS_MARKET_TTL", 5*time.Minute),
+		ShadowMode:            envBool("SHADOW_MODE", true),
+		CalibrationMinSignals: envInt("CALIBRATION_MIN_SIGNALS", 200),
+		CalibrationMinDays:    envInt("CALIBRATION_MIN_DAYS", 14),
+		GramQuoteURL:          envStr("GRAM_QUOTE_URL", "https://api.gateio.ws/api/v4"),
+		GramQuoteInterval:     envDur("POLL_GRAM", 30*time.Second),
 	}
 
 	if c.Undercut < 0 || c.Undercut >= 0.5 {
@@ -188,10 +202,25 @@ func Load() (*Config, error) {
 	if c.LookbackDays < 1 {
 		return nil, fmt.Errorf("LOOKBACK_DAYS must be >= 1")
 	}
+	if c.AttributeLookbackDays < c.LookbackDays {
+		return nil, fmt.Errorf("ATTRIBUTE_LOOKBACK_DAYS must be >= LOOKBACK_DAYS")
+	}
 	if c.ReadRPS <= 0 {
 		return nil, fmt.Errorf("READ_RPS must be > 0")
 	}
 	return c, nil
+}
+
+func envBool(k string, def bool) bool {
+	v, ok := os.LookupEnv(k)
+	if !ok || v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 // RequireBot reports whether the settings needed to actually run the bot are present.
