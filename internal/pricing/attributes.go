@@ -7,6 +7,23 @@ import (
 	"floorline/internal/store"
 )
 
+// MinAttributeSamples is the smallest bucket allowed to move a price at all.
+// Below it, a "premium" is the sampling noise of two or three prints: the
+// n/(n+k) shrinkage still leaves a fraction of a percent on the table, and that
+// fraction then travels into an exit price and out into an exit recommendation
+// as though it were evidence. Under this many samples the premium is exactly
+// zero and the model median stands.
+const MinAttributeSamples = 5
+
+const (
+	// marginalPrior is the empirical-Bayes prior weight for the single-attribute
+	// (backdrop-only, symbol-only) premiums.
+	marginalPrior = 10.0
+	// interactionPrior is heavier because the exact backdrop+symbol combination
+	// is always the sparsest bucket and the easiest one to overfit.
+	interactionPrior = 20.0
+)
+
 // AttributeValue is an empirical-Bayes premium for backdrop, symbol and their
 // interaction. Sparse combinations shrink back to the model median.
 type AttributeValue struct {
@@ -56,20 +73,20 @@ func ComputeAttributeValue(sales []store.SaleRow, backdrop, symbol string, model
 			exact = append(exact, r)
 		}
 	}
-	bp := shrunkMedian(bd, 10)
-	sp := shrunkMedian(sy, 10)
+	bp := shrunkMedian(bd, marginalPrior)
+	sp := shrunkMedian(sy, marginalPrior)
 	interaction := 0.0
-	if len(exact) > 0 {
-		interaction = (medianFloat(exact) - bp - sp) * float64(len(exact)) / float64(len(exact)+20)
+	if len(exact) >= MinAttributeSamples {
+		interaction = (medianFloat(exact) - bp - sp) * float64(len(exact)) / (float64(len(exact)) + interactionPrior)
 	}
 	logPremium := clamp(bp+sp+interaction, math.Log(.65), math.Log(1.35))
 	out.BackdropSamples, out.SymbolSamples, out.ExactSamples = len(bd), len(sy), len(exact)
 	out.ExactShare = float64(len(exact)) / float64(len(sales))
 	sample := math.Min(float64(len(sales))/20, 1)
-	out.Confidence = clamp(.35*sample+.2*reliability(len(bd), 10)+.2*reliability(len(sy), 10)+.25*reliability(len(exact), 20), 0, 1)
+	out.Confidence = clamp(.35*sample+.2*reliability(len(bd), marginalPrior)+.2*reliability(len(sy), marginalPrior)+.25*reliability(len(exact), interactionPrior), 0, 1)
 	out.Premium = math.Exp(logPremium) - 1
 	out.Fair = modelMedian * math.Exp(logPremium)
-	out.Valid = len(bd) >= 3 || len(sy) >= 3 || len(exact) >= 3
+	out.Valid = len(bd) >= MinAttributeSamples || len(sy) >= MinAttributeSamples || len(exact) >= MinAttributeSamples
 	return out
 }
 
@@ -120,7 +137,7 @@ func confidence(l Liquidity, a AttributeValue) float64 {
 }
 
 func shrunkMedian(xs []float64, prior float64) float64 {
-	if len(xs) == 0 {
+	if len(xs) < MinAttributeSamples {
 		return 0
 	}
 	return medianFloat(xs) * float64(len(xs)) / (float64(len(xs)) + prior)

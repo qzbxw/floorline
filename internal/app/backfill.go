@@ -117,7 +117,7 @@ func (a *App) backfillIfNeeded(ctx context.Context) {
 	}
 
 	a.notify(fmt.Sprintf(
-		"⏳ Downloading %d days of trade history for model liquidity and attribute premiums. Signals stay conservative and auto-buy is held back until this finishes.",
+		"⏳ Качаю историю сделок за %d дней — нужна для ликвы и премий за атрибуты. Пока не докачаю, сигналы держу консервативными, а автобай заблокирован.",
 		a.cfg.AttributeLookbackDays))
 
 	start := time.Now()
@@ -130,19 +130,19 @@ func (a *App) backfillIfNeeded(ctx context.Context) {
 		log.Info().Int("collections", p.Done).Int("of", p.Total).
 			Int("trades", p.Inserted).Str("current", p.Collection).
 			Msg("backfilling trade history")
-		a.notify(fmt.Sprintf("⏳ History %d/%d collections · %d trades so far", p.Done, p.Total, p.Inserted))
+		a.notify(fmt.Sprintf("⏳ История: %d/%d коллекций · %d сделок пока", p.Done, p.Total, p.Inserted))
 	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return
 		}
 		log.Error().Err(err).Msg("backfill failed")
-		a.notify("⚠️ History download failed: " + err.Error() +
-			"\nAuto-buy stays held back. Retry with <code>floorline backfill</code>.")
+		a.notify("⚠️ Не смог скачать историю: " + err.Error() +
+			"\nАвтобай остаётся заблокированным. Повтори через <code>floorline backfill</code>.")
 		return
 	}
 
 	count, _ := a.st.CountSales(ctx)
-	a.notify(fmt.Sprintf("✅ History ready — %d trades covering %s, downloaded in %s.\nAuto-buy gates are now live.",
+	a.notify(fmt.Sprintf("✅ История готова — %d сделок за %s, скачал за %s.\nФильтры автобая включены.",
 		count, dur(a.Coverage()), dur(time.Since(start))))
 }

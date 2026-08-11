@@ -7,6 +7,37 @@ import (
 	"floorline/internal/tonnel"
 )
 
+const (
+	// supportAgreement is how far above the snapshot floor the live book may
+	// sit and still be describing the same market. A book far above the floor
+	// means the floor is stale or was filtered out, so the two do not
+	// corroborate each other.
+	supportAgreement = 0.15
+	// supportBand is the width of the shelf we look for at the support level.
+	supportBand = 0.10
+	// supportSellers is how many live offers must hold that shelf before it may
+	// overrule the trade history. One offer is a listing; two is a market.
+	supportSellers = 2
+)
+
+// liveSupport is the cheapest price the market is currently offering, returned
+// only when the order book and the market snapshot independently agree on it.
+// Two sources are required because this number is allowed to overrule realised
+// trades, and a single stale ask must never be able to do that.
+func liveSupport(in Input, v Valuation) (float64, bool) {
+	if in.Book == nil || !v.HasCompetingAsk || in.Floor <= 0 {
+		return 0, false
+	}
+	if v.CompetingAsk > in.Floor*(1+supportAgreement) {
+		return 0, false
+	}
+	support := math.Min(in.Floor, v.CompetingAsk)
+	if in.Book.CountBetween(support, support*(1+supportBand), in.GiftID) < supportSellers {
+		return 0, false
+	}
+	return support, true
+}
+
 // Params are the economics of a round trip.
 type Params struct {
 	// Fee is the fraction of the sale price that does not reach you. Tonnel
@@ -64,6 +95,20 @@ type Valuation struct {
 	Proceeds  float64 // exit net of fees
 	Net       float64 // proceeds minus entry
 	Edge      float64 // net / entry
+
+	// Liquidation is the "out today" price: undercut everything the market is
+	// currently showing, the visible book and the snapshot floor alike. It is a
+	// fact about live offers and is deliberately kept separate from Exit, which
+	// is a modelled opinion built partly on trade history.
+	Liquidation      float64
+	LiquidationBasis string
+
+	// Support is the cheapest price the live market is actually offering, and
+	// is only populated when two independent readings agree on it: the
+	// market-snapshot floor and a book with more than one seller holding that
+	// shelf. SupportGuarded records that it had to overrule the trade history.
+	Support        float64
+	SupportGuarded bool
 
 	DiscountToFloor float64 // headline "-22%", for display only
 
@@ -126,16 +171,32 @@ func Evaluate(in Input) Valuation {
 	}
 	med := in.Liq.Median
 
+	undercutPrice := 0.0
+	if v.HasCompetingAsk {
+		undercutPrice = v.CompetingAsk * (1 - undercut)
+	}
+	// The liquidation price answers a different question from the exit: not
+	// "what is this worth" but "what do I have to ask to be the cheapest offer
+	// on screen right now". It undercuts every live reference we hold.
+	switch {
+	case v.HasCompetingAsk && in.Floor > 0:
+		v.Liquidation = math.Min(v.CompetingAsk, in.Floor) * (1 - undercut)
+		v.LiquidationBasis = "undercut of live ask depth"
+	case v.HasCompetingAsk:
+		v.Liquidation, v.LiquidationBasis = undercutPrice, "undercut of best competing ask"
+	case in.Floor > 0:
+		v.Liquidation, v.LiquidationBasis = in.Floor*(1-undercut), "undercut of the model floor"
+	}
+
 	switch {
 	case v.HasCompetingAsk && med > 0:
-		undercutPrice := v.CompetingAsk * (1 - undercut)
 		if undercutPrice <= med {
 			v.Exit, v.ExitBasis = undercutPrice, "undercut"
 		} else {
 			v.Exit, v.ExitBasis = med, "median"
 		}
 	case v.HasCompetingAsk:
-		v.Exit, v.ExitBasis = v.CompetingAsk*(1-undercut), "undercut"
+		v.Exit, v.ExitBasis = undercutPrice, "undercut"
 	case med > 0:
 		// Nobody else is offering this model. We would be the only ask, so the
 		// trade history is the only defensible reference.
@@ -143,6 +204,18 @@ func Evaluate(in Input) Valuation {
 	default:
 		v.Reason = "no exit reference: neither a competing ask nor any trade history"
 		return v
+	}
+
+	// The median is a statistic about the past. When every live offer sits
+	// above it — the order book and the snapshot floor both — the median is
+	// stale rather than conservative, and pricing off it means listing under a
+	// market that never actually dropped. That is how a held position gets a
+	// "target" 11% below the floor it could sell at today.
+	if support, ok := liveSupport(in, v); ok {
+		v.Support = support
+		if guard := math.Min(undercutPrice, support); v.Exit < guard {
+			v.Exit, v.ExitBasis, v.SupportGuarded = guard, "live support", true
+		}
 	}
 
 	if v.Exit <= 0 {
@@ -167,8 +240,21 @@ func Evaluate(in Input) Valuation {
 		v.DaysOfSupply = math.Inf(1)
 		v.ExpectedDays = math.Inf(1)
 	}
+	// A fast exit means "priced to be lifted against the book that is on screen
+	// right now", i.e. just under live ask depth — not "the low end of a sparse
+	// sale history". Without a corroborated support level there is no live depth
+	// to anchor to and the modelled exit is all there is.
 	v.FastExit = v.Exit
+	if v.Support > 0 && undercutPrice > 0 {
+		if anchored := math.Min(undercutPrice, v.Support); anchored > v.FastExit {
+			v.FastExit = anchored
+		}
+	}
 	v.FastExpectedDays = v.ExpectedDays
+	if v.FastExit != v.Exit && in.Book != nil && in.Liq.Velocity > 0 {
+		queue := in.Book.CountBetween(v.FastExit, v.FastExit*1.05, in.GiftID)
+		v.FastExpectedDays = float64(1+queue) / in.Liq.Velocity
+	}
 	v.ChosenExit = "fast"
 	v.Confidence = confidence(in.Liq, in.Attribute)
 

@@ -263,7 +263,7 @@ func TestGramVolatilityBlocksAutoButKeepsManualSignal(t *testing.T) {
 	if err != nil || dec == nil || !dec.Signal {
 		t.Fatalf("manual signal = %+v, err=%v", dec, err)
 	}
-	if dec.Auto || !containsSubstring(dec.AutoFails, "GRAM moved") {
+	if dec.Auto || !containsSubstring(dec.AutoFails, "GRAM сходил") {
 		t.Fatalf("volatile GRAM must block auto only: %+v", dec.AutoFails)
 	}
 }

@@ -9,7 +9,26 @@ const (
 	cbSettings  = "m_settings"  // settings submenu
 	cbAuto      = "m_auto"      // auto-buy settings
 	cbHelp      = "m_help"      // help menu
+	cbPick      = "m_pick"      // collection picker for a drill-down view
 )
+
+// back appends a navigation row to a Reply built by the backend.
+//
+// Backend views carry their own action buttons but know nothing about the menu
+// they were opened from, so without this every data screen is a dead end that
+// can only be escaped by typing /start again.
+func back(r Reply, target, label string) Reply {
+	return backWith(r, target, "", label)
+}
+
+// backWith is back for targets that need a payload, such as the collection
+// picker, which must be told which view to return to.
+func backWith(r Reply, target, data, label string) Reply {
+	if r.Empty() {
+		return r
+	}
+	return r.WithRow(Callback(label, target, data), Callback("🏠 Меню", cbMenu, ""))
+}
 
 // mainMenu returns the main dashboard with category buttons
 func mainMenu() Reply {
@@ -33,10 +52,8 @@ func marketMenu() Reply {
 			"Что хочешь посмотреть?",
 		Rows: [][]Button{
 			{Callback("💹 GRAM/USDT", cbRefresh, "gram")},
-			{Callback("📈 Полы", cbMarket, "floor")},
-			{Callback("📖 Лесенка", cbMarket, "book")},
-			{Callback("🔄 Сделки", cbMarket, "hist")},
-			{Callback("💰 Оценка лота", cbMarket, "val")},
+			{Callback("📈 Флор", cbPick, "floor"), Callback("📖 Стакан", cbPick, "book")},
+			{Callback("🕒 Сделки", cbPick, "hist"), Callback("💰 Оценка лота", cbMarket, "val")},
 			{Callback("🔙 Назад", cbMenu, "")},
 		},
 	}
@@ -149,35 +166,18 @@ func autoMenu() Reply {
 	}
 }
 
-// marketActionMenu returns instruction for market data input
+// marketActionMenu covers the one market view that needs a number typed in:
+// a gift id cannot be offered as a button because it is not in any list.
 func marketActionMenu(action string) Reply {
-	texts := map[string]string{
-		"floor": "📈 <b>Полы коллекции</b>\n\n" +
-			"Введи: <code>/floor Коллекция [/ Модель]</code>\n\n" +
-			"Примеры:\n" +
-			"<code>/floor Plush</code> — все модели в Plush\n" +
-			"<code>/floor Plush Pepe / Pink Diamond</code> — конкретный вариант",
-		"book": "📖 <b>Лесенка ордеров</b>\n\n" +
-			"Введи: <code>/book Коллекция / Модель</code>\n\n" +
-			"Пример:\n" +
-			"<code>/book Plush Pepe / Pink Diamond</code>",
-		"hist": "🔄 <b>История сделок</b>\n\n" +
-			"Введи: <code>/hist Коллекция / Модель</code>\n\n" +
-			"Пример:\n" +
-			"<code>/hist Plush Pepe / Pink Diamond</code>",
-		"val": "💰 <b>Оценка лота</b>\n\n" +
-			"Введи: <code>/val ID</code>\n\n" +
-			"Пример:\n" +
-			"<code>/val 123456</code> — ID из Tonnel",
-	}
-	text := texts[action]
-	if text == "" {
-		text = "Введи команду"
+	if action != "val" {
+		return marketMenu()
 	}
 	return Reply{
-		Text: text,
+		Text: "💰 <b>Оценка лота</b>\n\n" +
+			"Пришли <code>/val ID</code> — ID видно в ссылке лота на Tonnel.\n\n" +
+			"Например: <code>/val 10368454</code>",
 		Rows: [][]Button{
-			{Callback("🔙 Назад", cbMarket, "")},
+			{Callback("🔙 Назад", cbMarket, ""), Callback("🏠 Меню", cbMenu, "")},
 		},
 	}
 }

@@ -69,12 +69,79 @@ func (n *navRefs) get(ref string) (tonnel.ModelKey, bool) {
 // Status reports the health of every moving part.
 func (a *App) Status(ctx context.Context) bot.Reply {
 	return bot.Text(a.statusText(ctx)).
-		WithRow(bot.Callback("🔄 Refresh", cbRefresh, "status"))
+		WithRow(bot.Callback("🔄 Обновить", cbRefresh, "status"))
 }
 
 // Gram shows the external GRAM/USDT rate and floors that have not caught up.
 func (a *App) Gram(ctx context.Context) bot.Reply {
-	return bot.Text(a.gramText(ctx)).WithRow(bot.Callback("🔄 Refresh", cbRefresh, "gram"))
+	return bot.Text(a.gramText(ctx)).WithRow(bot.Callback("🔄 Обновить", cbRefresh, "gram"))
+}
+
+// Collections renders every tracked collection as a button, so browsing never
+// requires typing a name. The handle carries the target view, which the model
+// picker then inherits.
+func (a *App) Collections(ctx context.Context, view string) bot.Reply {
+	names, err := a.st.CollectionNames(ctx)
+	if err != nil {
+		return bot.Text("Не смог прочитать список коллекций: " + bot.Esc(err.Error()))
+	}
+	if len(names) == 0 {
+		return bot.Text("Коллекций пока нет — снапшот рынка ещё не загрузился. Глянь <code>/status</code>.")
+	}
+
+	r := bot.Text(viewTitle(view) + " — выбери коллекцию:")
+	var line []bot.Button
+	for i, n := range names {
+		if i >= 24 {
+			break // a longer keyboard is unusable on a phone
+		}
+		ref := a.nav.put(tonnel.ModelKey{Name: n})
+		line = append(line, bot.Callback(truncate(n, 18), cbModel, ref+"|"+view))
+		if len(line) == 2 {
+			r = r.WithRow(line...)
+			line = nil
+		}
+	}
+	return r.WithRow(line...)
+}
+
+// viewTitle names a drill-down target for the picker headings.
+func viewTitle(view string) string {
+	switch view {
+	case "book":
+		return "📖 Стакан"
+	case "hist":
+		return "🕒 Сделки"
+	default:
+		return "📈 Флор"
+	}
+}
+
+// modelPicker lists a collection's models as buttons, all pointing at one view.
+func (a *App) modelPicker(ctx context.Context, collection, view string) bot.Reply {
+	rows, err := a.st.ModelsForCollection(ctx, collection)
+	if err != nil || len(rows) == 0 {
+		return bot.Text("По " + bot.Esc(collection) + " моделей пока нет.")
+	}
+
+	r := bot.Text(viewTitle(view) + " · <b>" + bot.Esc(collection) + "</b> — выбери модель:")
+	var line []bot.Button
+	shown := 0
+	for _, row := range rows {
+		if row.Floor <= 0 || row.Supply == 0 {
+			continue // nothing to look at
+		}
+		ref := a.nav.put(row.Key)
+		line = append(line, bot.Callback(truncate(row.Key.Model, 18), cbModel, ref+"|"+view))
+		if len(line) == 2 {
+			r = r.WithRow(line...)
+			line = nil
+		}
+		if shown++; shown >= 16 {
+			break
+		}
+	}
+	return r.WithRow(line...)
 }
 
 // Floor shows a collection's models, or one model in detail.
@@ -144,9 +211,9 @@ func (a *App) withModelNav(r bot.Reply, key tonnel.ModelKey, current string) bot
 	ref := a.nav.put(key)
 	var row []bot.Button
 	for _, v := range []struct{ id, label string }{
-		{"floor", "📉 Floor"},
-		{"book", "📊 Book"},
-		{"hist", "🕒 Trades"},
+		{"floor", "📉 Флор"},
+		{"book", "📊 Стакан"},
+		{"hist", "🕒 Сделки"},
 	} {
 		if v.id == current {
 			continue
@@ -157,10 +224,19 @@ func (a *App) withModelNav(r bot.Reply, key tonnel.ModelKey, current string) bot
 }
 
 // ModelByRef resolves a keyboard handle minted by a list view.
+//
+// A handle with no model is a collection the operator picked, so the answer is
+// the model picker for the same view rather than a dead end.
 func (a *App) ModelByRef(ctx context.Context, ref, view string) bot.Reply {
 	key, ok := a.nav.get(ref)
 	if !ok {
-		return bot.Text("That button has expired — run the command again.")
+		return bot.Text("Кнопка протухла — открой раздел заново.")
+	}
+	if key.Model == "" {
+		if view == "floor" {
+			return a.Floor(ctx, key.Name, "")
+		}
+		return a.modelPicker(ctx, key.Name, view)
 	}
 	switch view {
 	case "book":
@@ -175,7 +251,7 @@ func (a *App) ModelByRef(ctx context.Context, ref, view string) bot.Reply {
 // Val prices one listing in full, including the gates it fails.
 func (a *App) Val(ctx context.Context, giftID int64) bot.Reply {
 	return bot.Text(a.valText(ctx, giftID)).
-		WithRow(bot.Link("🔗 Open on Tonnel", bot.TonnelGiftURL(giftID)))
+		WithRow(bot.Link("🔗 Открыть в Tonnel", bot.TonnelGiftURL(giftID)))
 }
 
 // ---- book ---------------------------------------------------------------
@@ -192,23 +268,23 @@ func (a *App) Positions(ctx context.Context) bot.Reply {
 		if i >= 8 {
 			break // a keyboard longer than this is unusable on a phone
 		}
-		label := fmt.Sprintf("♻️ Relist %s", truncate(p.Key.Model, 14))
+		label := fmt.Sprintf("♻️ Переставить %s", truncate(p.Key.Model, 14))
 		r = r.WithRow(
 			bot.Callback(label, cbRelist, p.GiftID),
 			bot.Link("🔗", bot.TonnelGiftURL(p.GiftID)),
 		)
 	}
-	return r.WithRow(bot.Callback("🔄 Refresh", cbRefresh, "pos"))
+	return r.WithRow(bot.Callback("🔄 Обновить", cbRefresh, "pos"))
 }
 
 func (a *App) Portfolio(ctx context.Context) bot.Reply {
-	return bot.Text(a.portfolioText(ctx)).WithRow(bot.Callback("🔄 Refresh", cbRefresh, "portfolio"))
+	return bot.Text(a.portfolioText(ctx)).WithRow(bot.Callback("🔄 Обновить", cbRefresh, "portfolio"))
 }
 func (a *App) Advice(ctx context.Context, giftID int64) bot.Reply {
-	return bot.Text(a.adviceText(ctx, giftID)).WithRow(bot.Callback("♻️ Relist", cbRelist, giftID), bot.Link("🔗", bot.TonnelGiftURL(giftID)))
+	return bot.Text(a.adviceText(ctx, giftID)).WithRow(bot.Callback("♻️ Переставить", cbRelist, giftID), bot.Link("🔗", bot.TonnelGiftURL(giftID)))
 }
 func (a *App) PositionHistory(ctx context.Context, giftID int64) bot.Reply {
-	return bot.Text(a.positionHistoryText(ctx, giftID)).WithRow(bot.Link("🔗 Open on Tonnel", bot.TonnelGiftURL(giftID)))
+	return bot.Text(a.positionHistoryText(ctx, giftID)).WithRow(bot.Link("🔗 Открыть в Tonnel", bot.TonnelGiftURL(giftID)))
 }
 func (a *App) SetCost(ctx context.Context, giftID int64, price float64) bot.Reply {
 	return bot.Text(a.setCostText(ctx, giftID, price))
@@ -220,7 +296,7 @@ func (a *App) ExitAt(ctx context.Context, giftID int64, price float64, confirm s
 // PnL reports realised and unrealised profit, net of fees.
 func (a *App) PnL(ctx context.Context) bot.Reply {
 	return bot.Text(a.pnlText(ctx)).
-		WithRow(bot.Callback("🔄 Refresh", cbRefresh, "pnl"))
+		WithRow(bot.Callback("🔄 Обновить", cbRefresh, "pnl"))
 }
 
 // BalanceText reports the account balance.
@@ -304,7 +380,7 @@ func (a *App) BuySignal(ctx context.Context, signalID int64) bot.Reply {
 	text, giftID := a.buySignal(ctx, signalID)
 	r := bot.Text(text)
 	if giftID > 0 {
-		r = r.WithRow(bot.Link("🔗 Open on Tonnel", bot.TonnelGiftURL(giftID)))
+		r = r.WithRow(bot.Link("🔗 Открыть в Tonnel", bot.TonnelGiftURL(giftID)))
 	}
 	return r
 }
@@ -313,7 +389,7 @@ func (a *App) BuySignal(ctx context.Context, signalID int64) bot.Reply {
 func (a *App) BookForSignal(ctx context.Context, signalID int64) bot.Reply {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil || sig == nil {
-		return bot.Text("That signal is gone.")
+		return bot.Text("Этого сигнала уже нет.")
 	}
 	a.books.Invalidate(sig.Key)
 	return a.BookText(ctx, sig.Key.Name, sig.Key.Model)
@@ -330,13 +406,13 @@ func (a *App) MuteSignal(ctx context.Context, signalID int64, d time.Duration) b
 // It is shared by the Buy button, which replaces the card with it, and by
 // auto-buy, which has no card and pushes it as a notification.
 func (a *App) renderPurchase(ctx context.Context, sigID int64, out *exec.Outcome, err error, auto bool) string {
-	kind := "Manual buy"
+	kind := "Ручная покупка"
 	if auto {
-		kind = "Auto-buy"
+		kind = "Автобай"
 	}
 
 	if err != nil || out == nil || !out.Bought {
-		msg := fmt.Sprintf("❌ <b>%s failed</b>", kind)
+		msg := fmt.Sprintf("❌ <b>%s — не прошло</b>", kind)
 		if out != nil {
 			msg += "\n" + bot.Esc(out.Key.String())
 			if out.Note != "" {
@@ -353,18 +429,18 @@ func (a *App) renderPurchase(ctx context.Context, sigID int64, out *exec.Outcome
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "✅ <b>%s</b> — %s\nBought at %s", kind, bot.Esc(out.Key.String()), num(out.BuyPrice))
+	fmt.Fprintf(&b, "✅ <b>%s</b> — %s\nКупил по %s", kind, bot.Esc(out.Key.String()), num(out.BuyPrice))
 	if out.Listed {
 		gain := out.ListPrice*(1-a.cfg.TonnelFee) - out.BuyPrice
-		fmt.Fprintf(&b, "\nRelisted at %s → net %s if it fills (%+.1f%%)",
+		fmt.Fprintf(&b, "\nВыставил по %s → нет %s если заберут (%+.1f%%)",
 			num(out.ListPrice), num(gain), gain/out.BuyPrice*100)
 	} else {
-		b.WriteString("\n⚠️ <b>Not relisted.</b>")
+		b.WriteString("\n⚠️ <b>Не выставил.</b>")
 	}
 	if out.Note != "" {
 		fmt.Fprintf(&b, "\n<i>%s</i>", bot.Esc(out.Note))
 	}
-	fmt.Fprintf(&b, "\n\nManage it with <code>/pos</code>.")
+	fmt.Fprintf(&b, "\n\nУправление — <code>/pos</code>.")
 
 	if sigID > 0 {
 		_ = a.st.SetSignalAction(ctx, sigID, "bought")

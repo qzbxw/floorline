@@ -85,7 +85,7 @@ func TestAllowRefusesWhenDisarmed(t *testing.T) {
 	if ok {
 		t.Error("a disarmed manager must not allow a purchase")
 	}
-	if !strings.Contains(why, "disarmed") {
+	if !strings.Contains(why, "выключен") {
 		t.Errorf("reason = %q, want it to mention being disarmed", why)
 	}
 }
@@ -140,7 +140,7 @@ func TestDailyBudgetIsEnforcedAndSurvivesRestart(t *testing.T) {
 	// ceiling on committed spend, not a threshold you may cross once.
 	if ok, why := m.Allow(ctx, key, 100, now); ok {
 		t.Error("the daily budget was not enforced")
-	} else if !strings.Contains(why, "budget") {
+	} else if !strings.Contains(why, "бюджет") {
 		t.Errorf("reason = %q, want it to mention the budget", why)
 	}
 	if ok, why := m.Allow(ctx, key, 50, now); !ok {
@@ -182,7 +182,7 @@ func TestAllowEnforcesOpenPositionCeiling(t *testing.T) {
 	if ok {
 		t.Error("the open-position ceiling was not enforced")
 	}
-	if !strings.Contains(why, "open positions") {
+	if !strings.Contains(why, "открытых позиций") {
 		t.Errorf("reason = %q, want it to mention open positions", why)
 	}
 }
@@ -205,7 +205,7 @@ func TestAllowEnforcesHourlyBuyLimit(t *testing.T) {
 	if ok {
 		t.Error("the hourly cascade brake was not enforced")
 	}
-	if !strings.Contains(why, "last hour") {
+	if !strings.Contains(why, "за последний час") {
 		t.Errorf("reason = %q, want it to mention the hourly limit", why)
 	}
 }
@@ -227,7 +227,7 @@ func TestAllowEnforcesModelCooldown(t *testing.T) {
 	if ok {
 		t.Error("the per-model cooldown was not enforced")
 	}
-	if !strings.Contains(why, "cooldown") {
+	if !strings.Contains(why, "кулдаун") {
 		t.Errorf("reason = %q, want it to mention the cooldown", why)
 	}
 
@@ -254,7 +254,7 @@ func TestAllowRespectsBalanceReserve(t *testing.T) {
 	m.SetBalance(5)
 	if ok, why := m.Allow(ctx, key, 10, time.Now()); ok {
 		t.Error("a purchase larger than the balance must be refused")
-	} else if !strings.Contains(why, "balance") {
+	} else if !strings.Contains(why, "баланс") {
 		t.Errorf("reason = %q, want it to mention the balance", why)
 	}
 }
@@ -273,7 +273,7 @@ func TestConcentrationBlocksAfterPortfolioBootstrap(t *testing.T) {
 		}
 	}
 	ok, why := m.Allow(ctx, tonnel.ModelKey{Name: "A", Model: "1"}, 100, time.Now())
-	if ok || !strings.Contains(why, "model exposure") {
+	if ok || !strings.Contains(why, "доля модели") {
 		t.Fatalf("concentration allowed: %v %q", ok, why)
 	}
 }
@@ -295,7 +295,7 @@ func TestThreeFailuresDisarm(t *testing.T) {
 	if m.Armed() {
 		t.Error("three consecutive failures must disarm")
 	}
-	if !strings.Contains(reason, "row") {
+	if !strings.Contains(reason, "подряд") {
 		t.Errorf("disarm reason = %q, want it to explain the failure run", reason)
 	}
 }
@@ -327,7 +327,7 @@ func TestPauseBlocksTemporarily(t *testing.T) {
 	if ok {
 		t.Error("a paused manager must refuse purchases")
 	}
-	if !strings.Contains(why, "paused") {
+	if !strings.Contains(why, "на паузе") {
 		t.Errorf("reason = %q, want it to mention the pause", why)
 	}
 
@@ -400,5 +400,78 @@ func TestDescribeMentionsUnsetLimits(t *testing.T) {
 	out := m.Describe(context.Background(), time.Now())
 	if !strings.Contains(out, "not set") {
 		t.Errorf("Describe should flag unset money limits:\n%s", out)
+	}
+}
+
+// The three positions the desk was told to dump, with the numbers the operator
+// read off the live market. Each one is a case where the model's own
+// cross-market input disagreed with the model's own recommendation, and the
+// recommendation won anyway. Floor is the model floor the valuation carries
+// (Bluebell 3.30, Cat Food 3.85, Choco Kush 5.09), not the collection floor.
+func TestExitGuardRefusesToSellUnderAFloorTheMarketIsHolding(t *testing.T) {
+	cases := []struct {
+		name             string
+		check            ExitCheck
+		wantContradicted bool
+		why              string
+	}{
+		{
+			name:  "Instant Ramen Cat Food",
+			check: ExitCheck{Ask: 3.75, Target: 3.14, Floor: 3.85, ExternalRef: 3.91},
+			// External depth is well above our ask; nothing dropped.
+			wantContradicted: true,
+			why:              "external depth above the ask must veto the sell",
+		},
+		{
+			name:  "Swag Bag Choco Kush",
+			check: ExitCheck{Ask: 5.03, Target: 4.71, Floor: 5.09, ExternalRef: 5.01},
+			// 5.01 against a 5.03 ask is the same price on another venue, not a
+			// market that fell — the slack in the comparison has to absorb it.
+			wantContradicted: true,
+			why:              "a 0.4% cross-venue gap is not evidence of a drop",
+		},
+		{
+			name:  "Snake Box Bluebell",
+			check: ExitCheck{Ask: 3.29, Target: 2.93, Floor: 3.30, ExternalRef: 3.23},
+			// The external reference really is under our ask here, so this guard
+			// stays out of the way; the live-support floor in pricing is what
+			// catches this one.
+			wantContradicted: false,
+			why:              "external depth below the ask leaves the decision to the model",
+		},
+		{
+			name:  "genuine drop",
+			check: ExitCheck{Ask: 5.03, Target: 4.10, Floor: 4.20, ExternalRef: 4.05},
+			// Floor and external depth both moved: this is a real decline and the
+			// guard must not block the exit.
+			wantContradicted: false,
+			why:              "a market that actually fell must still be exitable",
+		},
+		{
+			name:             "no cross-market reference",
+			check:            ExitCheck{Ask: 3.75, Target: 3.14, Floor: 3.85},
+			wantContradicted: false,
+			why:              "an unknown reference disables the guard rather than tripping it",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, reason := c.check.ContradictsMarket()
+			if got != c.wantContradicted {
+				t.Fatalf("ContradictsMarket() = %v (%q), want %v — %s", got, reason, c.wantContradicted, c.why)
+			}
+			if got && reason == "" {
+				t.Error("a withheld sell must explain itself to the operator")
+			}
+		})
+	}
+}
+
+// A target at or just under the floor is ordinary undercutting, not a panic
+// sell, and must pass through untouched.
+func TestExitGuardIgnoresNormalUndercutting(t *testing.T) {
+	c := ExitCheck{Ask: 3.29, Target: 3.25, Floor: 3.28, ExternalRef: 3.40}
+	if got, reason := c.ContradictsMarket(); got {
+		t.Errorf("undercutting the floor by 1%% was treated as a panic sell: %s", reason)
 	}
 }

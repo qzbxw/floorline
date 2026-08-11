@@ -19,7 +19,7 @@ import (
 func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pricing.Valuation, error) {
 	key := g.Key()
 	if key.Name == "" || key.Model == "" {
-		return pricing.Valuation{Reason: "listing has no collection or model"}, nil
+		return pricing.Valuation{Reason: "у лота нет коллекции или модели"}, nil
 	}
 
 	attrDays := a.cfg.AttributeLookbackDays
@@ -73,63 +73,63 @@ func (a *App) statusText(ctx context.Context) string {
 	var b strings.Builder
 
 	b.WriteString("<b>Floorline</b>\n")
-	fmt.Fprintf(&b, "Uptime %s\n", dur(now.Sub(a.startedAt)))
+	fmt.Fprintf(&b, "Аптайм %s\n", dur(now.Sub(a.startedAt)))
 
-	armed := "🔴 disarmed"
+	armed := "🔴 выключен"
 	if a.rm.Armed() {
-		armed = "🟢 ARMED"
+		armed = "🟢 ВКЛЮЧЁН"
 	}
-	fmt.Fprintf(&b, "Auto-buy %s", armed)
+	fmt.Fprintf(&b, "Автобай %s", armed)
 	if reason := a.rm.LastReason(); reason != "" {
 		fmt.Fprintf(&b, " — %s", bot.Esc(reason))
 	}
 	b.WriteString("\n")
 	n, first, _ := a.st.CalibrationStats(ctx)
-	mode := "live"
+	mode := "боевой"
 	if a.cfg.ShadowMode {
-		mode = "SHADOW — no unattended purchases"
+		mode = "SHADOW — сам ничего не покупает"
 	}
-	fmt.Fprintf(&b, "Scoring %s · calibration %d/%d signals", mode, n, a.cfg.CalibrationMinSignals)
+	fmt.Fprintf(&b, "Скоринг %s · калибровка %d/%d сигналов", mode, n, a.cfg.CalibrationMinSignals)
 	if !first.IsZero() {
-		fmt.Fprintf(&b, " · %s/%dd", dur(now.Sub(first)), a.cfg.CalibrationMinDays)
+		fmt.Fprintf(&b, " · %s/%dд", dur(now.Sub(first)), a.cfg.CalibrationMinDays)
 	}
 	b.WriteString("\n")
 	if until := a.rm.DisabledUntil(); until.After(now) {
-		fmt.Fprintf(&b, "Paused for another %s\n", dur(until.Sub(now)))
+		fmt.Fprintf(&b, "На паузе ещё %s\n", dur(until.Sub(now)))
 	}
 
-	warm := "warming up"
+	warm := "прогрев"
 	if a.Warm() {
-		warm = "ready"
+		warm = "готов"
 	}
 	count, _ := a.st.CountSales(ctx)
 	oldest, _ := a.st.OldestSaleTime(ctx)
 	newest, _ := a.st.NewestSaleTime(ctx)
-	fmt.Fprintf(&b, "\n<b>Data</b>\nHistory %s (%s) · %d trades stored\n", dur(a.Coverage()), warm, count)
+	fmt.Fprintf(&b, "\n<b>Данные</b>\nИстория %s (%s) · %d сделок в базе\n", dur(a.Coverage()), warm, count)
 	if !oldest.IsZero() {
-		fmt.Fprintf(&b, "Oldest %s · newest %s\n", ago(oldest), ago(newest))
+		fmt.Fprintf(&b, "Самая старая %s · свежая %s\n", ago(oldest), ago(newest))
 	}
 	if cols, err := a.st.CollectionNames(ctx); err == nil {
-		fmt.Fprintf(&b, "Collections tracked: %d\n", len(cols))
+		fmt.Fprintf(&b, "Коллекций отслеживаем: %d\n", len(cols))
 	}
 	if q, ok, _ := a.st.LatestGramQuote(ctx); ok {
-		fmt.Fprintf(&b, "GRAM/USDT %s · quote %s\n", num(q.USD), ago(q.TS))
+		fmt.Fprintf(&b, "GRAM/USDT %s · котировка %s\n", num(q.USD), ago(q.TS))
 	} else {
-		b.WriteString("⚠️ GRAM/USDT reference unavailable\n")
+		b.WriteString("⚠️ Курс GRAM/USDT недоступен\n")
 	}
 	if last := a.api.LastSuccess(); !last.IsZero() {
-		fmt.Fprintf(&b, "Last successful API call %s\n", ago(last))
+		fmt.Fprintf(&b, "Последний удачный запрос к API %s\n", ago(last))
 	}
 	if n := a.api.BlockedStreak(); n > 0 {
-		fmt.Fprintf(&b, "⚠️ %d consecutive anti-bot rejections\n", n)
+		fmt.Fprintf(&b, "⚠️ %d отказов антибота подряд\n", n)
 	}
 	if venues := a.cross.Venues(); len(venues) > 0 {
-		fmt.Fprintf(&b, "Cross-market ask depth: %s\n", strings.Join(venues, ", "))
+		fmt.Fprintf(&b, "Кроссмаркет: %s\n", strings.Join(venues, ", "))
 	} else {
-		b.WriteString("Cross-market ask depth: none configured\n")
+		b.WriteString("Кроссмаркет: не настроен\n")
 	}
 
-	b.WriteString("\n<b>Pollers</b>\n")
+	b.WriteString("\n<b>Поллеры</b>\n")
 	a.mu.RLock()
 	names := make([]string, 0, len(a.pollers))
 	for n := range a.pollers {
@@ -138,7 +138,7 @@ func (a *App) statusText(ctx context.Context) string {
 	sort.Strings(names)
 	for _, n := range names {
 		ps := a.pollers[n]
-		line := fmt.Sprintf("%-11s runs %d · last %s", n, ps.Runs, ago(ps.LastRun))
+		line := fmt.Sprintf("%-11s запусков %d · последний %s", n, ps.Runs, ago(ps.LastRun))
 		if ps.LastErr != "" {
 			line += " · ❌ " + truncate(ps.LastErr, 90)
 		}
@@ -147,10 +147,10 @@ func (a *App) statusText(ctx context.Context) string {
 	a.mu.RUnlock()
 
 	stats, _ := a.st.SignalStatsSince(ctx, now.Add(-24*time.Hour))
-	fmt.Fprintf(&b, "\n<b>Last 24h</b>\n%d signals · %d sent · %d bought\n", stats.Total, stats.Sent, stats.Bought)
+	fmt.Fprintf(&b, "\n<b>За 24 часа</b>\n%d сигналов · %d отправлено · %d куплено\n", stats.Total, stats.Sent, stats.Bought)
 
 	if bal, ok := a.rm.Balance(); ok {
-		fmt.Fprintf(&b, "\nBalance %s GRAM\n", num(bal))
+		fmt.Fprintf(&b, "\nБаланс %s GRAM\n", num(bal))
 	}
 	return b.String()
 }
@@ -165,16 +165,16 @@ func (a *App) floorText(ctx context.Context, collection, model string) string {
 	if model == "" {
 		rows, err := a.st.ModelsForCollection(ctx, name)
 		if err != nil {
-			return "Could not read the market snapshot: " + bot.Esc(err.Error())
+			return "Не смог прочитать снапшот рынка: " + bot.Esc(err.Error())
 		}
 		if len(rows) == 0 {
-			return "No models recorded for " + bot.Esc(name) + " yet."
+			return "По " + bot.Esc(name) + " моделей пока нет."
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "<b>%s</b> — %d models, cheapest first\n\n", bot.Esc(name), len(rows))
+		fmt.Fprintf(&b, "<b>%s</b> — %d моделей, сначала дешёвые\n\n", bot.Esc(name), len(rows))
 		for i, r := range rows {
 			if i >= 25 {
-				fmt.Fprintf(&b, "…and %d more\n", len(rows)-i)
+				fmt.Fprintf(&b, "…и ещё %d\n", len(rows)-i)
 				break
 			}
 			fmt.Fprintf(&b, "%-28s %8s  ×%d\n",
@@ -186,7 +186,7 @@ func (a *App) floorText(ctx context.Context, collection, model string) string {
 	key := tonnel.ModelKey{Name: name, Model: tonnel.TitleCase(model)}
 	stat, err := a.st.ModelStat(ctx, key)
 	if err != nil {
-		return "Could not read the market snapshot: " + bot.Esc(err.Error())
+		return "Не смог прочитать снапшот рынка: " + bot.Esc(err.Error())
 	}
 	if stat == nil {
 		if resolved, ok := a.resolveModel(ctx, name, model); ok {
@@ -195,17 +195,17 @@ func (a *App) floorText(ctx context.Context, collection, model string) string {
 		}
 	}
 	if stat == nil {
-		return fmt.Sprintf("No snapshot for %s. Try <code>/floor %s</code> to list its models.",
+		return fmt.Sprintf("Нет снапшота по %s. Открой <code>/floor %s</code> — там список моделей.",
 			bot.Esc(key.String()), bot.Esc(name))
 	}
 
 	book, err := a.books.Get(ctx, key)
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%s</b>\nFloor %s · supply %d · rarity %.1f%%\n",
+	fmt.Fprintf(&b, "<b>%s</b>\nФлор %s · саплай %d · рарность %.1f%%\n",
 		bot.Esc(key.String()), num(stat.Floor), stat.Supply, stat.Rarity)
 
 	if err == nil && book.Len() > 0 {
-		b.WriteString("\nCheapest asks:\n")
+		b.WriteString("\nСамые дешёвые аски:\n")
 		for i, ask := range book.Asks {
 			if i >= 5 {
 				break
@@ -224,36 +224,36 @@ func (a *App) bookText(ctx context.Context, collection, model string) string {
 	}
 	book, err := a.books.Get(ctx, key)
 	if err != nil {
-		return "Could not read the order book: " + bot.Esc(err.Error())
+		return "Не смог прочитать стакан: " + bot.Esc(err.Error())
 	}
 	if book.Len() == 0 {
-		return "Nothing listed for " + bot.Esc(key.String()) + "."
+		return "По " + bot.Esc(key.String()) + " ничего не выставлено."
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%s</b> — ask ladder\n\n", bot.Esc(key.String()))
+	fmt.Fprintf(&b, "<b>%s</b> — стакан\n\n", bot.Esc(key.String()))
 	var cum float64
 	var rows strings.Builder
 	best := book.Asks[0].Price
 	for i, ask := range book.Asks {
 		cum += ask.Price
-		fmt.Fprintf(&rows, "%2d %8s  %+5.0f%%  cum %8s  #%d\n",
+		fmt.Fprintf(&rows, "%2d %8s  %+5.0f%%  накопл %8s  #%d\n",
 			i+1, num(ask.Price), (ask.Price/best-1)*100, num(cum), ask.GiftNum)
 	}
 	b.WriteString("<pre>" + rows.String() + "</pre>")
 
 	within10 := book.CountBetween(best, best*1.1, 0)
-	fmt.Fprintf(&b, "\n%d asks within 10%% of the floor.", within10)
+	fmt.Fprintf(&b, "\n%d асков в пределах 10%% от флора.", within10)
 	if a.cross.Enabled() {
 		qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 		quotes := a.cross.Quotes(qctx, key.Name, key.Model)
 		cancel()
 		if len(quotes) > 0 {
-			b.WriteString("\n\n<b>Other market sell queues</b>\n")
+			b.WriteString("\n\n<b>Очереди на других площадках</b>\n")
 			for _, q := range quotes {
-				fmt.Fprintf(&b, "%s: %s · depth ref %s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor), num(q.Reference()))
+				fmt.Fprintf(&b, "%s: %s · глубина %s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor), num(q.Reference()))
 				if q.Fee > 0 {
-					fmt.Fprintf(&b, " · net %s", num(q.NetReference()))
+					fmt.Fprintf(&b, " · нет %s", num(q.NetReference()))
 				}
 				b.WriteString("\n")
 			}
@@ -271,28 +271,28 @@ func (a *App) histText(ctx context.Context, collection, model string) string {
 	now := time.Now()
 	sales, err := a.st.SalesSince(ctx, key, now.Add(-a.window()))
 	if err != nil {
-		return "Could not read the trade history: " + bot.Esc(err.Error())
+		return "Не смог прочитать историю сделок: " + bot.Esc(err.Error())
 	}
 	liq := pricing.ComputeLiquidity(sales, now, a.window(), a.Coverage())
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%s</b> — last %d days\n", bot.Esc(key.String()), a.cfg.LookbackDays)
+	fmt.Fprintf(&b, "<b>%s</b> — за %d дней\n", bot.Esc(key.String()), a.cfg.LookbackDays)
 	if liq.Sales == 0 {
-		b.WriteString("\nNo recorded trades. This model is not liquid enough to flip.")
+		b.WriteString("\nСделок нет. Модель неликвид — флипать нечего.")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%d trades · %.2f/day · %d different gifts (turnover %.2f)\n",
+	fmt.Fprintf(&b, "%d сделок · %.2f/день · %d разных гифтов (оборот %.2f)\n",
 		liq.Sales, liq.Velocity, liq.DistinctGifts, liq.Turnover)
-	fmt.Fprintf(&b, "Median %s · 7d median %s · trend %+.0f%%\n",
+	fmt.Fprintf(&b, "Медиана %s · за 7д %s · тренд %+.0f%%\n",
 		num(liq.Median), num(liq.Median7), (liq.Trend-1)*100)
-	fmt.Fprintf(&b, "Dispersion %.0f%% · last trade %s\n", liq.MADRatio*100, ago(liq.LastSale))
+	fmt.Fprintf(&b, "Разброс %.0f%% · последняя сделка %s\n", liq.MADRatio*100, ago(liq.LastSale))
 
 	if stat, err := a.st.ModelStat(ctx, key); err == nil && stat != nil && stat.Floor > 0 {
-		fmt.Fprintf(&b, "\nFloor %s is %+.0f%% versus the median trade.\n",
+		fmt.Fprintf(&b, "\nФлор %s — это %+.0f%% к медиане сделок.\n",
 			num(stat.Floor), (stat.Floor/liq.Median-1)*100)
 	}
 
-	b.WriteString("\nRecent trades:\n<pre>")
+	b.WriteString("\nПоследние сделки:\n<pre>")
 	shown := 0
 	for i := len(sales) - 1; i >= 0 && shown < 12; i-- {
 		fmt.Fprintf(&b, "%8s   %s\n", num(sales[i].Price), sales[i].TS.Format("02 Jan 15:04"))
@@ -306,7 +306,7 @@ func (a *App) histText(ctx context.Context, collection, model string) string {
 func (a *App) valText(ctx context.Context, giftID int64) string {
 	g, err := a.api.GiftData(ctx, giftID)
 	if err != nil {
-		return "Could not fetch that listing: " + bot.Esc(err.Error())
+		return "Не смог достать этот лот: " + bot.Esc(err.Error())
 	}
 	if g.GiftID.Int() == 0 {
 		g.GiftID = tonnel.FlexInt(giftID)
@@ -315,7 +315,7 @@ func (a *App) valText(ctx context.Context, giftID int64) string {
 	now := time.Now()
 	v, err := a.priceGift(ctx, *g, now)
 	if err != nil {
-		return "Could not value that listing: " + bot.Esc(err.Error())
+		return "Не смог оценить лот: " + bot.Esc(err.Error())
 	}
 
 	dec, err := a.det.Evaluate(ctx, *g, a.rm.Limits(), now)
@@ -334,30 +334,30 @@ func (a *App) valText(ctx context.Context, giftID int64) string {
 func (a *App) positionsText(ctx context.Context) string {
 	positions, err := a.st.TrackedPositions(ctx)
 	if err != nil {
-		return "Could not read positions: " + bot.Esc(err.Error())
+		return "Не смог прочитать позиции: " + bot.Esc(err.Error())
 	}
 	if len(positions) == 0 {
-		return "No open positions."
+		return "Открытых позиций нет."
 	}
 
 	now := time.Now()
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>%d tracked positions</b>\n", len(positions))
+	fmt.Fprintf(&b, "<b>Позиций на контроле: %d</b>\n", len(positions))
 	for _, p := range positions {
 		if p.Status == store.StatusMissing {
-			fmt.Fprintf(&b, "\n<b>%s</b>\n⚠️ missing since %s; no sale booked · entry %s\n<code>/history %d</code>\n", bot.Esc(p.Key.String()), p.MissingSince.Format("02 Jan 15:04"), num(p.BuyPrice), p.GiftID)
+			fmt.Fprintf(&b, "\n<b>%s</b>\n⚠️ пропал с %s, продажа не зафиксирована · вход %s\n<code>/history %d</code>\n", bot.Esc(p.Key.String()), dt(p.MissingSince), num(p.BuyPrice), p.GiftID)
 			continue
 		}
 		ad := a.advisePosition(ctx, p, now)
 		fmt.Fprintf(&b, "\n<b>%s</b>\n", bot.Esc(p.Key.String()))
-		fmt.Fprintf(&b, "entry %s · held %s · %s\n", num(p.BuyPrice), dur(now.Sub(p.BoughtAt)), p.Status)
+		fmt.Fprintf(&b, "вход %s · держим %s · %s\n", num(p.BuyPrice), dur(now.Sub(p.BoughtAt)), p.Status)
 		if p.ListPrice > 0 {
-			fmt.Fprintf(&b, "asking %s\n", num(p.ListPrice))
+			fmt.Fprintf(&b, "аск %s\n", num(p.ListPrice))
 		}
 		if ad.Val.Valid {
-			fmt.Fprintf(&b, "recommended %s · %s · executable net %s (%+.1f%%)\n", num(ad.Val.Exit), ad.Action, num(ad.Val.Net), ad.Val.Edge*100)
+			fmt.Fprintf(&b, "рекомендую %s · %s · реальный нет %s (%+.1f%%)\n", num(ad.Val.Exit), ad.Action, num(ad.Val.Net), ad.Val.Edge*100)
 			if ad.CrossReference > 0 {
-				fmt.Fprintf(&b, "external ask-depth ref %s\n", num(ad.CrossReference))
+				fmt.Fprintf(&b, "внешняя глубина асков %s\n", num(ad.CrossReference))
 			}
 		}
 		if p.Note != "" {
@@ -372,11 +372,11 @@ func (a *App) positionsText(ctx context.Context) string {
 func (a *App) pnlText(ctx context.Context) string {
 	closed, err := a.st.PositionTrades(ctx, 500)
 	if err != nil {
-		return "Could not read closed positions: " + bot.Esc(err.Error())
+		return "Не смог прочитать закрытые позиции: " + bot.Esc(err.Error())
 	}
 	open, err := a.st.OpenPositions(ctx)
 	if err != nil {
-		return "Could not read open positions: " + bot.Esc(err.Error())
+		return "Не смог прочитать открытые позиции: " + bot.Esc(err.Error())
 	}
 
 	var realised, invested float64
@@ -421,30 +421,30 @@ func (a *App) pnlText(ctx context.Context) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("<b>PnL</b> <i>(net of fees)</i>\n\n")
-	fmt.Fprintf(&b, "Realised   <b>%s</b> GRAM over %d trades\n", num(realised), wins+losses)
+	b.WriteString("<b>PnL</b> <i>(за вычетом комиссий)</i>\n\n")
+	fmt.Fprintf(&b, "Зафиксировано  <b>%s</b> GRAM за %d сделок\n", num(realised), wins+losses)
 	if invested > 0 {
-		fmt.Fprintf(&b, "           %+.1f%% on %s deployed · %d win / %d loss\n",
+		fmt.Fprintf(&b, "               %+.1f%% на %s вложенных · %d в плюс / %d в минус\n",
 			realised/invested*100, num(invested), wins, losses)
 	}
-	fmt.Fprintf(&b, "Unrealised <b>%s</b> GRAM across %d open\n", num(unrealised), len(open))
-	fmt.Fprintf(&b, "At risk    %s GRAM\n", num(atRisk))
+	fmt.Fprintf(&b, "Бумажный       <b>%s</b> GRAM по %d открытым\n", num(unrealised), len(open))
+	fmt.Fprintf(&b, "В риске        %s GRAM\n", num(atRisk))
 	if missing > 0 {
-		fmt.Fprintf(&b, "Unresolved %s GRAM across %d missing gifts (excluded, not booked sold)\n", num(missingCost), missing)
+		fmt.Fprintf(&b, "Подвисло       %s GRAM по %d пропавшим гифтам (не считаем проданными)\n", num(missingCost), missing)
 	}
-	fmt.Fprintf(&b, "\nTotal      <b>%s</b> GRAM\n", num(realised+unrealised))
+	fmt.Fprintf(&b, "\nИтого          <b>%s</b> GRAM\n", num(realised+unrealised))
 
 	if unknown > 0 || unmarked > 0 {
 		b.WriteString("\n<i>")
 		if unknown > 0 {
-			fmt.Fprintf(&b, "%d closed positions have no recorded prices. ", unknown)
+			fmt.Fprintf(&b, "У %d закрытых позиций нет цен в базе. ", unknown)
 		}
 		if unmarked > 0 {
-			fmt.Fprintf(&b, "%d open positions could not be marked (imported or no floor). ", unmarked)
+			fmt.Fprintf(&b, "%d открытых не удалось оценить (импорт или нет флора). ", unmarked)
 		}
-		b.WriteString("Those are excluded above.</i>\n")
+		b.WriteString("Они выше не учтены.</i>\n")
 	}
-	fmt.Fprintf(&b, "\n<i>Open marks use the executable fast exit from the live ask book and a %.1f%% fee, not headline floor.</i>", a.cfg.TonnelFee*100)
+	fmt.Fprintf(&b, "\n<i>Открытые считаем по реальному быстрому выходу из живого стакана и комиссии %.1f%%, а не по витринному флору.</i>", a.cfg.TonnelFee*100)
 	return b.String()
 }
 
@@ -452,12 +452,12 @@ func (a *App) pnlText(ctx context.Context) string {
 func (a *App) balanceText(ctx context.Context) string {
 	bal, err := a.api.Balance(ctx)
 	if err != nil {
-		return "Could not read the balance: " + bot.Esc(err.Error())
+		return "Не смог прочитать баланс: " + bot.Esc(err.Error())
 	}
 	a.rm.SetBalance(bal.GRAM)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>Balance</b>\nGRAM %s\n", num(bal.GRAM))
+	fmt.Fprintf(&b, "<b>Баланс</b>\nGRAM %s\n", num(bal.GRAM))
 	if bal.USDT > 0 {
 		fmt.Fprintf(&b, "USDT %s\n", num(bal.USDT))
 	}
@@ -471,31 +471,31 @@ func (a *App) balanceText(ctx context.Context) string {
 func (a *App) relistText(ctx context.Context, giftID int64) string {
 	p, err := a.st.GetPosition(ctx, giftID)
 	if err != nil {
-		return "Could not read that position: " + bot.Esc(err.Error())
+		return "Не смог прочитать позицию: " + bot.Esc(err.Error())
 	}
 	if p == nil {
-		return fmt.Sprintf("No position for gift %d. Check <code>/pos</code>.", giftID)
+		return fmt.Sprintf("По гифту %d позиции нет. Смотри <code>/pos</code>.", giftID)
 	}
 	a.books.Invalidate(p.Key)
 	if p.BuyPrice <= 0 {
-		return "Cost basis is unknown. Set it first with <code>/cost " + fmt.Sprint(giftID) + " 4.25</code>."
+		return "Цена входа неизвестна. Задай её: <code>/cost " + fmt.Sprint(giftID) + " 4.25</code>."
 	}
 	now := time.Now()
 	ad := a.advisePosition(ctx, *p, now)
 	if !ad.Val.Valid {
-		return "Could not compute a safe target: " + bot.Esc(ad.Reason)
+		return "Не смог посчитать безопасную цену: " + bot.Esc(ad.Reason)
 	}
 	price, note, err := a.ex.ListAt(ctx, giftID, p.Key, ad.Val.Exit, p.BuyPrice, now)
 	if err != nil {
-		return "Relisting failed: " + bot.Esc(err.Error())
+		return "Релист не прошёл: " + bot.Esc(err.Error())
 	}
 	if price <= 0 {
-		return "Not relisted.\n" + bot.Esc(note)
+		return "Не переставил.\n" + bot.Esc(note)
 	}
 	_ = a.st.RecordReprice(ctx, giftID, p.ListPrice, price, "manual portfolio recommendation", now)
 	_ = a.st.RecordPositionEvent(ctx, giftID, "repriced", p.ListPrice, price, "manual portfolio recommendation", now)
 	net := price*(1-a.cfg.TonnelFee) - p.BuyPrice
-	return fmt.Sprintf("✅ Listed <b>%s</b> at <b>%s</b>\nEntry %s → net %s if it fills (%+.1f%%)",
+	return fmt.Sprintf("✅ Выставил <b>%s</b> по <b>%s</b>\nВход %s → нет %s если заберут (%+.1f%%)",
 		bot.Esc(p.Key.String()), num(price), num(p.BuyPrice), num(net), net/p.BuyPrice*100)
 }
 
@@ -505,24 +505,24 @@ func (a *App) armText(ctx context.Context) string {
 		return "❌ " + bot.Esc(err.Error())
 	}
 	if !a.Warm() {
-		return "🟢 Auto-buy armed — but the trade history is still warming up, so nothing will be bought until it is ready.\n\n<pre>" +
+		return "🟢 Автобай включён — но история сделок ещё прогревается, так что до готовности он ничего не купит.\n\n<pre>" +
 			bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>"
 	}
-	return "🟢 <b>Auto-buy armed.</b>\n\n<pre>" + bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>"
+	return "🟢 <b>Автобай включён.</b>\n\n<pre>" + bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>"
 }
 
 // Disarm stops unattended buying.
 func (a *App) disarmText(ctx context.Context) string {
-	if err := a.rm.Disarm(ctx, "disarmed manually"); err != nil {
+	if err := a.rm.Disarm(ctx, "выключен вручную"); err != nil {
 		return "❌ " + bot.Esc(err.Error())
 	}
-	return "🔴 Auto-buy disarmed."
+	return "🔴 Автобай выключен."
 }
 
 // LimitsText shows the limits and today's usage.
 func (a *App) limitsText(ctx context.Context) string {
-	return "<b>Limits</b>\n<pre>" + bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>" +
-		"\nChange one with <code>/limits set max_ticket 50</code>"
+	return "<b>Лимиты</b>\n<pre>" + bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>" +
+		"\nПоменять: <code>/limits set max_ticket 50</code>"
 }
 
 // SetLimit updates one limit.
@@ -541,12 +541,12 @@ func (a *App) watchText(ctx context.Context, collection, model string, maxPrice 
 		return msg
 	}
 	if err := a.st.AddWatch(ctx, key, maxPrice, time.Now()); err != nil {
-		return "Could not save the watch: " + bot.Esc(err.Error())
+		return "Не смог сохранить подписку: " + bot.Esc(err.Error())
 	}
 	if maxPrice > 0 {
-		return fmt.Sprintf("👁 Watching <b>%s</b> under %s", bot.Esc(key.String()), num(maxPrice))
+		return fmt.Sprintf("👁 Слежу за <b>%s</b> дешевле %s", bot.Esc(key.String()), num(maxPrice))
 	}
-	return fmt.Sprintf("👁 Watching <b>%s</b> at any price", bot.Esc(key.String()))
+	return fmt.Sprintf("👁 Слежу за <b>%s</b> по любой цене", bot.Esc(key.String()))
 }
 
 // Unwatch removes a subscription.
@@ -556,29 +556,29 @@ func (a *App) unwatchText(ctx context.Context, collection, model string) string 
 		key = resolved
 	}
 	if err := a.st.RemoveWatch(ctx, key); err != nil {
-		return "Could not remove the watch: " + bot.Esc(err.Error())
+		return "Не смог удалить подписку: " + bot.Esc(err.Error())
 	}
-	return "Removed " + bot.Esc(key.String()) + " from the watchlist."
+	return "Убрал " + bot.Esc(key.String()) + " из вотчлиста."
 }
 
 // Watchlist lists subscriptions with their current floors.
 func (a *App) watchlistText(ctx context.Context) string {
 	watches, err := a.st.Watches(ctx)
 	if err != nil {
-		return "Could not read the watchlist: " + bot.Esc(err.Error())
+		return "Не смог прочитать вотчлист: " + bot.Esc(err.Error())
 	}
 	if len(watches) == 0 {
-		return "Watchlist is empty. Add one with <code>/watch Plush Pepe / Pink Diamond 1200</code>"
+		return "Вотчлист пуст. Добавь: <code>/watch Plush Pepe / Pink Diamond 1200</code>"
 	}
 	var b strings.Builder
-	b.WriteString("<b>Watchlist</b>\n")
+	b.WriteString("<b>Вотчлист</b>\n")
 	for _, w := range watches {
 		line := "• " + bot.Esc(w.Key.String())
 		if w.MaxPrice > 0 {
-			line += fmt.Sprintf(" under %s", num(w.MaxPrice))
+			line += fmt.Sprintf(" дешевле %s", num(w.MaxPrice))
 		}
 		if stat, err := a.st.ModelStat(ctx, w.Key); err == nil && stat != nil && stat.Floor > 0 {
-			line += fmt.Sprintf(" · floor %s", num(stat.Floor))
+			line += fmt.Sprintf(" · флор %s", num(stat.Floor))
 		}
 		b.WriteString(line + "\n")
 	}
@@ -590,18 +590,18 @@ func (a *App) muteText(ctx context.Context, collection, model string, d time.Dur
 	scope, label := a.muteScope(ctx, collection, model)
 	until := time.Now().Add(d)
 	if err := a.st.SetMute(ctx, scope, until); err != nil {
-		return "Could not set the mute: " + bot.Esc(err.Error())
+		return "Не смог поставить мьют: " + bot.Esc(err.Error())
 	}
-	return fmt.Sprintf("🔕 Muted <b>%s</b> for %s", bot.Esc(label), dur(d))
+	return fmt.Sprintf("🔕 Замьютил <b>%s</b> на %s", bot.Esc(label), dur(d))
 }
 
 // Unmute clears a mute.
 func (a *App) unmuteText(ctx context.Context, collection, model string) string {
 	scope, label := a.muteScope(ctx, collection, model)
 	if err := a.st.ClearMute(ctx, scope); err != nil {
-		return "Could not clear the mute: " + bot.Esc(err.Error())
+		return "Не смог снять мьют: " + bot.Esc(err.Error())
 	}
-	return "🔔 Unmuted " + bot.Esc(label)
+	return "🔔 Размьютил " + bot.Esc(label)
 }
 
 func (a *App) muteScope(ctx context.Context, collection, model string) (scope, label string) {
@@ -627,12 +627,12 @@ func (a *App) setAuthText(ctx context.Context, authData string) string {
 
 	if _, err := a.api.Balance(ctx); err != nil {
 		a.api.SetAuth(prev)
-		return "❌ That authData was rejected, keeping the old one:\n<code>" + bot.Esc(err.Error()) + "</code>"
+		return "❌ Этот authData не принят, оставляю старый:\n<code>" + bot.Esc(err.Error()) + "</code>"
 	}
 	if err := a.st.SetKV(ctx, "tonnel.auth", authData); err != nil {
-		return "Session works, but saving it failed: " + bot.Esc(err.Error())
+		return "Сессия рабочая, но сохранить не вышло: " + bot.Esc(err.Error())
 	}
-	return fmt.Sprintf("✅ Tonnel session updated (user %d).", a.api.UserID())
+	return fmt.Sprintf("✅ Сессия Tonnel обновлена (юзер %d).", a.api.UserID())
 }
 
 // buySignal executes a confirmed purchase and returns the message to show plus
@@ -644,37 +644,37 @@ func (a *App) setAuthText(ctx context.Context, authData string) string {
 func (a *App) buySignal(ctx context.Context, signalID int64) (string, int64) {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil {
-		return "Could not read that signal: " + bot.Esc(err.Error()), 0
+		return "Не смог прочитать сигнал: " + bot.Esc(err.Error()), 0
 	}
 	if sig == nil {
-		return "That signal is gone.", 0
+		return "Этого сигнала уже нет.", 0
 	}
 
 	g, err := a.api.GiftData(ctx, sig.GiftID)
 	if err != nil {
-		return "Could not re-read the listing: " + bot.Esc(err.Error()), sig.GiftID
+		return "Не смог перечитать лот: " + bot.Esc(err.Error()), sig.GiftID
 	}
 	if g.GiftID.Int() == 0 {
 		g.GiftID = tonnel.FlexInt(sig.GiftID)
 	}
 	if g.Buyer != nil {
-		return "🏃 Too late — that listing has already been bought.", sig.GiftID
+		return "🏃 Поздно — лот уже забрали.", sig.GiftID
 	}
 
 	price := g.Price.Float()
 	if price <= 0 {
-		return "That listing is no longer for sale.", sig.GiftID
+		return "Лот больше не продаётся.", sig.GiftID
 	}
 	if price > sig.Price {
 		return fmt.Sprintf(
-			"⚠️ Price moved up from %s to %s since the alert, so nothing was bought.\nRun <code>/val %d</code> if you still want it.",
+			"⚠️ Цена выросла с %s до %s после алерта, поэтому ничего не купил.\nЕсли всё ещё нужен — <code>/val %d</code>.",
 			num(sig.Price), num(price), sig.GiftID), sig.GiftID
 	}
 
 	now := time.Now()
 	v, err := a.priceGift(ctx, *g, now)
 	if err != nil {
-		return "Could not value the listing before buying: " + bot.Esc(err.Error()), sig.GiftID
+		return "Не смог оценить лот перед покупкой: " + bot.Esc(err.Error()), sig.GiftID
 	}
 
 	out, buyErr := a.ex.Buy(ctx, v, *g, "manual", now)
@@ -685,7 +685,7 @@ func (a *App) buySignal(ctx context.Context, signalID int64) (string, int64) {
 func (a *App) bookForSignalText(ctx context.Context, signalID int64) string {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil || sig == nil {
-		return "That signal is gone."
+		return "Этого сигнала уже нет."
 	}
 	a.books.Invalidate(sig.Key)
 	return a.bookText(ctx, sig.Key.Name, sig.Key.Model)
@@ -695,12 +695,12 @@ func (a *App) bookForSignalText(ctx context.Context, signalID int64) string {
 func (a *App) muteSignalText(ctx context.Context, signalID int64, d time.Duration) string {
 	sig, err := a.st.GetSignal(ctx, signalID)
 	if err != nil || sig == nil {
-		return "That signal is gone."
+		return "Этого сигнала уже нет."
 	}
 	if err := a.st.SetMute(ctx, sig.Key.ID(), time.Now().Add(d)); err != nil {
-		return "Could not set the mute: " + bot.Esc(err.Error())
+		return "Не смог поставить мьют: " + bot.Esc(err.Error())
 	}
-	return fmt.Sprintf("🔕 Muted <b>%s</b> for %s", bot.Esc(sig.Key.String()), dur(d))
+	return fmt.Sprintf("🔕 Замьютил <b>%s</b> на %s", bot.Esc(sig.Key.String()), dur(d))
 }
 
 // ---- name resolution ----------------------------------------------------
@@ -773,17 +773,17 @@ func (a *App) mustResolve(ctx context.Context, collection, model string) (tonnel
 		return key, ""
 	}
 	return tonnel.ModelKey{Name: name, Model: tonnel.TitleCase(model)},
-		fmt.Sprintf("No model matching %q in %s. Run <code>/floor %s</code> to see them.",
-			bot.Esc(model), bot.Esc(name), bot.Esc(name))
+		fmt.Sprintf("В %s нет модели по запросу %q. Открой <code>/floor %s</code> — там весь список.",
+			bot.Esc(name), bot.Esc(model), bot.Esc(name))
 }
 
 func (a *App) unknownCollection(ctx context.Context, input string) string {
 	matches, err := a.st.SearchCollections(ctx, input, 8)
 	if err != nil || len(matches) == 0 {
-		return fmt.Sprintf("Unknown collection %q. The market snapshot may not have loaded yet — check <code>/status</code>.", bot.Esc(input))
+		return fmt.Sprintf("Не знаю коллекцию %q. Возможно, снапшот рынка ещё не загрузился — глянь <code>/status</code>.", bot.Esc(input))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%q matches several collections:\n", bot.Esc(input))
+	fmt.Fprintf(&b, "%q подходит под несколько коллекций:\n", bot.Esc(input))
 	for _, m := range matches {
 		b.WriteString("• " + bot.Esc(m) + "\n")
 	}

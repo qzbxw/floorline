@@ -256,19 +256,19 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	var fails []string
 
 	if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
-		fails = append(fails, fmt.Sprintf("risk-adjusted edge %.1f%% below %.1f%% (raw %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
 	}
 	if v.Liq.Velocity < g.MinVelocity {
-		fails = append(fails, fmt.Sprintf("velocity %.2f/day below %.2f", v.Liq.Velocity, g.MinVelocity))
+		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже %.2f", v.Liq.Velocity, g.MinVelocity))
 	}
 	if v.Liq.Sales < g.MinSales {
-		fails = append(fails, fmt.Sprintf("only %d trades in %dd, need %d", v.Liq.Sales, d.cfg.LookbackDays, g.MinSales))
+		fails = append(fails, fmt.Sprintf("всего %d сделок за %dд, нужно %d", v.Liq.Sales, d.cfg.LookbackDays, g.MinSales))
 	}
 	if v.Liq.MADRatio > g.MaxMADRatio {
-		fails = append(fails, fmt.Sprintf("price dispersion %.0f%% above %.0f%%", v.Liq.MADRatio*100, g.MaxMADRatio*100))
+		fails = append(fails, fmt.Sprintf("разброс цен %.0f%% выше %.0f%%", v.Liq.MADRatio*100, g.MaxMADRatio*100))
 	}
 	if v.Liq.Trend < g.MinTrend {
-		fails = append(fails, fmt.Sprintf("trend %.2f below %.2f (falling)", v.Liq.Trend, g.MinTrend))
+		fails = append(fails, fmt.Sprintf("тренд %.2f ниже %.2f (падает)", v.Liq.Trend, g.MinTrend))
 	}
 	return fails
 }
@@ -280,21 +280,21 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	var fails []string
 
 	if d.Warm != nil && !d.Warm() {
-		fails = append(fails, "trade history still warming up")
+		fails = append(fails, "история сделок ещё прогревается")
 	}
 	if d.cfg.ShadowMode {
-		fails = append(fails, "shadow mode is enabled")
+		fails = append(fails, "включён shadow-режим")
 	} else if d.CalibrationReady != nil && !d.CalibrationReady() {
-		fails = append(fails, "score calibration has not reached its minimum sample")
+		fails = append(fails, "калибровка скоринга не набрала минимум выборки")
 	}
 	if v.ScoreBreakdown.RiskAdjustedEdge < a.MinEdge {
-		fails = append(fails, fmt.Sprintf("risk-adjusted edge %.1f%% below auto threshold %.1f%%", v.ScoreBreakdown.RiskAdjustedEdge*100, a.MinEdge*100))
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже порога автобая %.1f%%", v.ScoreBreakdown.RiskAdjustedEdge*100, a.MinEdge*100))
 	}
 	if v.Liq.Velocity < a.MinVelocity {
-		fails = append(fails, fmt.Sprintf("velocity %.2f/day below auto threshold %.2f", v.Liq.Velocity, a.MinVelocity))
+		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже порога автобая %.2f", v.Liq.Velocity, a.MinVelocity))
 	}
 	if v.Liq.Sales < a.MinSales {
-		fails = append(fails, fmt.Sprintf("%d trades in %dd, auto needs %d", v.Liq.Sales, d.cfg.LookbackDays, a.MinSales))
+		fails = append(fails, fmt.Sprintf("%d сделок за %dд, автобаю нужно %d", v.Liq.Sales, d.cfg.LookbackDays, a.MinSales))
 	}
 	if v.Liq.Turnover < a.MinTurnover {
 		fails = append(fails, fmt.Sprintf(
@@ -302,25 +302,25 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 			v.Liq.DistinctGifts, v.Liq.Sales, v.Liq.Turnover, a.MinTurnover))
 	}
 	if v.Liq.MADRatio > a.MaxMADRatio {
-		fails = append(fails, fmt.Sprintf("price dispersion %.0f%% above auto max %.0f%%", v.Liq.MADRatio*100, a.MaxMADRatio*100))
+		fails = append(fails, fmt.Sprintf("разброс цен %.0f%% выше максимума автобая %.0f%%", v.Liq.MADRatio*100, a.MaxMADRatio*100))
 	}
 	if v.Liq.Trend < a.MinTrend {
-		fails = append(fails, fmt.Sprintf("trend %.2f below auto min %.2f", v.Liq.Trend, a.MinTrend))
+		fails = append(fails, fmt.Sprintf("тренд %.2f ниже минимума автобая %.2f", v.Liq.Trend, a.MinTrend))
 	}
 	if limits.MaxExitDays > 0 && v.ExpectedDays > limits.MaxExitDays {
-		fails = append(fails, fmt.Sprintf("expected time to sell %s above max_exit_days %.1f",
+		fails = append(fails, fmt.Sprintf("ожидаемая продажа %s дольше max_exit_days %.1f",
 			days(v.ExpectedDays), limits.MaxExitDays))
 	}
 	if a.MaxDataAge > 0 && v.DataAge > a.MaxDataAge {
-		fails = append(fails, fmt.Sprintf("market data age %s above auto max %s", v.DataAge.Round(time.Second), a.MaxDataAge))
+		fails = append(fails, fmt.Sprintf("данные рынка устарели на %s, максимум для автобая %s", v.DataAge.Round(time.Second), a.MaxDataAge))
 	}
 	if !v.FX.Valid {
-		fails = append(fails, "GRAM reference is unavailable or stale")
+		fails = append(fails, "курс GRAM недоступен или протух")
 	} else if a.MaxGramMove15m > 0 && math.Abs(v.FX.Move15m) > a.MaxGramMove15m {
-		fails = append(fails, fmt.Sprintf("GRAM moved %+.1f%% in 15m; auto limit %.1f%%", v.FX.Move15m*100, a.MaxGramMove15m*100))
+		fails = append(fails, fmt.Sprintf("GRAM сходил на %+.1f%% за 15м; лимит автобая %.1f%%", v.FX.Move15m*100, a.MaxGramMove15m*100))
 	}
 	if v.ExitBasis == "median (sole ask)" {
-		fails = append(fails, "no competing ask to price against")
+		fails = append(fails, "не от чего отталкиваться — конкурентов в стакане нет")
 	}
 	return fails
 }

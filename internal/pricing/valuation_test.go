@@ -237,6 +237,30 @@ func TestSparseAttributesShrinkToModelMedian(t *testing.T) {
 	}
 }
 
+// Production reported "attribute premium +0.6% from 2 exact sales" and priced
+// against it. Two or three prints cannot tell a half-percent premium from
+// nothing, so below the minimum sample count the premium must be exactly zero
+// rather than merely small.
+func TestTinySamplesProduceNoAttributePremiumAtAll(t *testing.T) {
+	// Three exact sales, each a few percent off the model median — the shape of
+	// the noise that produced the +0.6% / -0.7% / -0.5% readings.
+	sales := []store.SaleRow{
+		{Price: 3.32, Backdrop: "Azure Blue", Symbol: "Spades"},
+		{Price: 3.24, Backdrop: "Azure Blue", Symbol: "Spades"},
+		{Price: 3.30, Backdrop: "Azure Blue", Symbol: "Spades"},
+	}
+	a := ComputeAttributeValue(sales, "Azure Blue", "Spades", 3.28)
+	if a.Premium != 0 {
+		t.Errorf("premium = %+.4f from %d exact sales, want exactly 0", a.Premium, a.ExactSamples)
+	}
+	if a.Fair != 3.28 {
+		t.Errorf("fair value = %.4f, want the untouched model median 3.28", a.Fair)
+	}
+	if a.Valid {
+		t.Error("three prints must not qualify as attribute evidence")
+	}
+}
+
 func TestPatientExitRequiresEvidenceAndCanWinOnProfitPerDay(t *testing.T) {
 	sales := make([]store.SaleRow, 0, 40)
 	for i := 0; i < 40; i++ {
@@ -258,6 +282,99 @@ func TestPatientExitRequiresEvidenceAndCanWinOnProfitPerDay(t *testing.T) {
 	}
 	if v.Confidence <= 0 {
 		t.Error("confidence should be populated")
+	}
+}
+
+// The three positions the desk actually held when it advised REDUCE/EXIT on all
+// of them at targets below the live floor. Every number below is the one the
+// operator read off the market, so a regression here is a regression that costs
+// money: a target under the collection floor, while the bot's own cross-market
+// reference sits at or above the current ask, is a panic sell.
+func TestHeldPositionsAreNotPricedBelowTheLiveFloor(t *testing.T) {
+	cases := []struct {
+		name string
+		// entry is the cost basis; ask is what we are currently listed at.
+		entry, ask float64
+		// floor is the live collection floor; asks are the competing offers.
+		floor       float64
+		competing   []float64
+		median      float64 // trade-history median, i.e. the stale reference
+		externalRef float64 // cross-market ask-depth reference
+		breakEven   float64
+	}{
+		{
+			name: "Snake Box Bluebell", entry: 3.09, ask: 3.29, floor: 3.28,
+			competing: []float64{3.28, 3.30, 3.31}, median: 2.93,
+			externalRef: 3.23, breakEven: 3.11,
+		},
+		{
+			name: "Instant Ramen Cat Food", entry: 3.39, ask: 3.75, floor: 3.75,
+			competing: []float64{3.80, 3.85, 3.90}, median: 3.14,
+			externalRef: 3.91, breakEven: 3.41,
+		},
+		{
+			name: "Swag Bag Choco Kush", entry: 4.89, ask: 5.03, floor: 5.03,
+			competing: []float64{5.09, 5.15, 5.20}, median: 4.71,
+			externalRef: 5.01, breakEven: 4.91,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			book := bookOf(42, append([]float64{c.ask}, c.competing...)...)
+			v := evalPrice(t, c.entry, book, liqOf(c.median, 30), c.floor, 20)
+			if !v.Valid {
+				t.Fatalf("valuation is invalid: %s", v.Reason)
+			}
+			// The whole live book, floor included, is above the trade-history
+			// median, so the median is stale and must not set the target.
+			if v.Exit < c.floor*(1-.03) {
+				t.Errorf("target %.4f is more than 3%% below the live floor %.2f — that is a panic sell, not an exit",
+					v.Exit, c.floor)
+			}
+			if !v.SupportGuarded {
+				t.Errorf("the live support guard did not engage: basis %q, exit %.4f, median %.2f",
+					v.ExitBasis, v.Exit, c.median)
+			}
+			// A target under break-even is what produced REDUCE/EXIT in
+			// production; with the guard the position is profitable to hold.
+			if v.Exit <= c.breakEven {
+				t.Errorf("target %.4f is at or below break-even %.2f", v.Exit, c.breakEven)
+			}
+			if v.Net <= 0 {
+				t.Errorf("net %.4f must be positive, or the desk is told to sell at a loss", v.Net)
+			}
+			// The bot must not contradict its own cross-market input: when
+			// external ask depth is at or above our ask, the exit cannot be
+			// priced far under it.
+			if c.externalRef >= c.ask*(1-.01) && v.Exit < c.externalRef*(1-.05) {
+				t.Errorf("target %.4f is 5%% under the external ask-depth reference %.2f that the model itself reported",
+					v.Exit, c.externalRef)
+			}
+			// The liquidation price is a separate, live-market number: what we
+			// must ask to be the cheapest offer on screen right now.
+			if v.Liquidation <= 0 || v.Liquidation > c.floor {
+				t.Errorf("liquidation %.4f must be a positive price under the live floor %.2f", v.Liquidation, c.floor)
+			}
+			if v.Liquidation <= c.breakEven {
+				t.Errorf("liquidation %.4f is below break-even %.2f; the position is not underwater against the live book",
+					v.Liquidation, c.breakEven)
+			}
+		})
+	}
+}
+
+// The mirror of the case above: a single ask far above a thin book must never be
+// mistaken for support, or the guard becomes a way to inflate every valuation.
+func TestLiveSupportNeedsTwoAgreeingSources(t *testing.T) {
+	// One competing ask, and it is nowhere near the floor.
+	lonely := evalPrice(t, 500, bookOf(42, 500, 5000), liqOf(600, 30), 500, 10)
+	if lonely.SupportGuarded || lonely.Exit != 600 {
+		t.Errorf("one fantasy ask must not overrule the median: exit %.2f, guarded %v", lonely.Exit, lonely.SupportGuarded)
+	}
+	// Book agrees with the floor, but only one seller holds the level.
+	thin := evalPrice(t, 3.09, bookOf(42, 3.29, 3.28), liqOf(2.93, 30), 3.28, 10)
+	if thin.SupportGuarded {
+		t.Errorf("a single offer is a listing, not a support level: exit %.4f", thin.Exit)
 	}
 }
 

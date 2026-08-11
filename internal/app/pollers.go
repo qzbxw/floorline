@@ -113,7 +113,7 @@ func (a *App) applyCrossMarketDecision(ctx context.Context, dec *signal.Decision
 	switch {
 	case diff > .30:
 		dec.Auto = false
-		dec.AutoFails = append(dec.AutoFails, fmt.Sprintf("external ask books differ by %.0f%% (auto veto)", diff*100))
+		dec.AutoFails = append(dec.AutoFails, fmt.Sprintf("внешние стаканы расходятся на %.0f%% (вето автобая)", diff*100))
 		dec.Val.Confidence *= .5
 	case diff > .15:
 		dec.Val.Confidence *= .75
@@ -159,9 +159,9 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 			a.notify(a.renderPurchase(ctx, sigID, out, buyErr, true))
 			return nil
 		}
-		note = "auto-buy blocked: " + why
+		note = "автобай заблокирован: " + why
 	} else if len(dec.AutoFails) > 0 {
-		note = "manual only — " + dec.AutoFails[0]
+		note = "только вручную — " + dec.AutoFails[0]
 	}
 
 	if dec.Suppressed {
@@ -224,7 +224,7 @@ func (a *App) detectNewCollections(stats []tonnel.ModelStat) {
 		return
 	}
 	sort.Strings(fresh)
-	msg := "🆕 <b>New collection on Tonnel</b>\n"
+	msg := "🆕 <b>Новая коллекция на Tonnel</b>\n"
 	for _, n := range fresh {
 		msg += "• " + bot.Esc(n) + "\n"
 	}
@@ -256,7 +256,7 @@ func (a *App) detectFloorDrops(ctx context.Context, now time.Time) {
 			continue
 		}
 		a.notify(fmt.Sprintf(
-			"📉 <b>Floor drop</b> — %s\n%s → %s in an hour (−%.0f%%)\nSupply %d",
+			"📉 <b>Флор упал</b> — %s\n%s → %s за час (−%.0f%%)\nСаплай %d",
 			bot.Esc(key.String()), num(before), num(cur.Floor), drop*100, cur.Supply))
 	}
 }
@@ -353,12 +353,12 @@ func (a *App) detectSweeps(ctx context.Context, now time.Time) {
 			continue
 		}
 		stat, _ := a.st.ModelStat(ctx, r.Key)
-		floorTxt := "unknown"
+		floorTxt := "неизвестен"
 		if stat != nil && stat.Floor > 0 {
 			floorTxt = num(stat.Floor)
 		}
 		a.notify(fmt.Sprintf(
-			"🌊 <b>Sweep</b> — %s\n%d trades in 30 min across %d different gifts\nRange %s – %s · floor now %s",
+			"🌊 <b>Скупка</b> — %s\n%d сделок за 30 минут по %d разным гифтам\nДиапазон %s – %s · флор сейчас %s",
 			bot.Esc(r.Key.String()), r.Count, r.Gifts, num(r.MinPrice), num(r.MaxPrice), floorTxt))
 	}
 }
@@ -436,9 +436,9 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 			return lookupErr
 		}
 		costSource, costConfidence := "unknown", 0.0
-		note := "imported from inventory; entry price unknown — set with /cost"
+		note := "импортирован из инвентаря; цена входа неизвестна — задай через /cost"
 		if found {
-			costSource, costConfidence, note = "sale_history", .85, "imported from inventory; cost recovered from trade history"
+			costSource, costConfidence, note = "sale_history", .85, "импортирован из инвентаря; цену входа восстановил по истории сделок"
 		} else {
 			boughtAt = now
 		}
@@ -546,8 +546,8 @@ func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time
 			if err := a.st.SetPositionMissing(ctx, p.GiftID, now); err != nil {
 				return
 			}
-			_ = a.st.RecordPositionEvent(ctx, p.GiftID, "missing", p.ListPrice, 0, "left Tonnel inventory; no matching sale yet", now)
-			a.notify(fmt.Sprintf("🔎 <b>Inventory change</b> — %s\nGift left Tonnel inventory, but no sale is confirmed. It is marked missing, not sold; Floorline will keep checking history.\n<code>/history %d</code>", bot.Esc(p.Key.String()), p.GiftID))
+			_ = a.st.RecordPositionEvent(ctx, p.GiftID, "missing", p.ListPrice, 0, "пропал из инвентаря Tonnel, продажа не найдена", now)
+			a.notify(fmt.Sprintf("🔎 <b>Изменение в инвентаре</b> — %s\nГифт пропал из инвентаря Tonnel, но продажа не подтверждена. Помечаю пропавшим, не проданным — буду дальше сверять историю.\n<code>/history %d</code>", bot.Esc(p.Key.String()), p.GiftID))
 		}
 		return
 	}
@@ -558,11 +558,11 @@ func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time
 	}
 	_ = a.st.RecordPositionEvent(ctx, p.GiftID, "sold", p.ListPrice, price, "confirmed by Tonnel sale history", soldAt)
 
-	msg := fmt.Sprintf("💰 <b>Sold</b> — %s\nEntry %s → exit %s",
+	msg := fmt.Sprintf("💰 <b>Продано</b> — %s\nВход %s → выход %s",
 		bot.Esc(p.Key.String()), num(p.BuyPrice), num(price))
 	if p.BuyPrice > 0 && price > 0 {
 		net := price*(1-a.cfg.TonnelFee) - p.BuyPrice
-		msg += fmt.Sprintf("\nNet %s (%+.1f%%) after %.1f%% fee, held %s",
+		msg += fmt.Sprintf("\nНет %s (%+.1f%%) после %.1f%% комиссии, держали %s",
 			num(net), net/p.BuyPrice*100, a.cfg.TonnelFee*100, dur(soldAt.Sub(p.BoughtAt)))
 	}
 	a.notify(msg)
@@ -632,7 +632,7 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 					if actual, _, err := a.ex.ListAt(ctx, p.GiftID, p.Key, target, p.BuyPrice, now); err == nil && actual > 0 {
 						_ = a.st.RecordReprice(ctx, p.GiftID, p.ListPrice, actual, "safe undercut response", now)
 						_ = a.st.RecordPositionEvent(ctx, p.GiftID, "repriced", p.ListPrice, actual, "safe automatic undercut response", now)
-						a.notify(fmt.Sprintf("♻️ <b>Auto-repriced</b> — %s\n%s → %s", bot.Esc(p.Key.String()), num(p.ListPrice), num(actual)))
+						a.notify(fmt.Sprintf("♻️ <b>Автопереставил</b> — %s\n%s → %s", bot.Esc(p.Key.String()), num(p.ListPrice), num(actual)))
 						return
 					}
 				}
@@ -640,7 +640,7 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 		}
 	}
 	a.notify(fmt.Sprintf(
-		"🥊 <b>Undercut</b> — %s\nYour ask %s · floor now %s (−%.1f%%)\nEntry %s · <code>/relist %d</code>",
+		"🥊 <b>Тебя андеркатнули</b> — %s\nТвой аск %s · флор сейчас %s (−%.1f%%)\nВход %s · <code>/relist %d</code>",
 		bot.Esc(p.Key.String()), num(p.ListPrice), num(stat.Floor),
 		(p.ListPrice-stat.Floor)/p.ListPrice*100, num(p.BuyPrice), p.GiftID))
 }
@@ -668,7 +668,7 @@ func (a *App) checkStale(ctx context.Context, p store.Position, now time.Time) {
 		return
 	}
 	a.notify(fmt.Sprintf(
-		"🕸 <b>Stale position</b> — %s\nHeld %s; this model trades %.1f×/day, so it should have gone in ~%s.\nEntry %s · ask %s · <code>/relist %d</code>",
+		"🕸 <b>Позиция залежалась</b> — %s\nДержим %s, а модель торгуется %.1f×/день — должна была уйти за ~%s.\nВход %s · аск %s · <code>/relist %d</code>",
 		bot.Esc(p.Key.String()), dur(held), liq.Velocity, dur(expected/3), num(p.BuyPrice), num(p.ListPrice), p.GiftID))
 }
 
@@ -689,7 +689,7 @@ func (a *App) checkWatch(g tonnel.Gift, watches []store.Watch) {
 			continue
 		}
 		a.notify(fmt.Sprintf(
-			"👁 <b>Watchlist</b> — %s\nListed at %s\n<code>/val %d</code>",
+			"👁 <b>Вотчлист</b> — %s\nВыставили по %s\n<code>/val %d</code>",
 			bot.Esc(key.String()), num(price), g.GiftID.Int()))
 		return
 	}

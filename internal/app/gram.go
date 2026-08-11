@@ -100,10 +100,10 @@ func (a *App) gramText(ctx context.Context) string {
 	now := time.Now()
 	q, ok, err := a.st.LatestGramQuote(ctx)
 	if err != nil {
-		return "Could not read GRAM rate: " + bot.Esc(err.Error())
+		return "Не смог прочитать курс GRAM: " + bot.Esc(err.Error())
 	}
 	if !ok {
-		return "GRAM rate has not been loaded yet."
+		return "Курс GRAM ещё не загрузился."
 	}
 	q15, _, _ := a.st.GramQuoteAt(ctx, now.Add(-15*time.Minute))
 	q1, _, _ := a.st.GramQuoteAt(ctx, now.Add(-time.Hour))
@@ -118,22 +118,22 @@ func (a *App) gramText(ctx context.Context) string {
 		spread = (q.Ask/q.Bid - 1) * 100
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>GRAM/USDT %s</b>\n15m %+.2f%% · 1h %+.2f%% · 24h %+.2f%% · spread %.2f%%\nQuote %s\n", num(q.USD), move(q15, now.Add(-15*time.Minute), 10*time.Minute)*100, move(q1, now.Add(-time.Hour), 15*time.Minute)*100, q.Change24*100, spread, ago(q.TS))
+	fmt.Fprintf(&b, "<b>GRAM/USDT %s</b>\n15м %+.2f%% · 1ч %+.2f%% · 24ч %+.2f%% · спред %.2f%%\nКотировка %s\n", num(q.USD), move(q15, now.Add(-15*time.Minute), 10*time.Minute)*100, move(q1, now.Add(-time.Hour), 15*time.Minute)*100, q.Change24*100, spread, ago(q.TS))
 	if now.Sub(q.TS) > 5*time.Minute {
-		b.WriteString("⚠️ Quote is stale; auto-buy is blocked.\n")
+		b.WriteString("⚠️ Котировка протухла, автобай заблокирован.\n")
 	}
 	lags, _ := a.floorLags(ctx, now)
 	if len(lags) > 0 {
-		b.WriteString("\n<b>Tracked floor lag</b>\n")
+		b.WriteString("\n<b>Лаг флоров</b>\n")
 		for i, r := range lags {
 			if i >= 10 {
 				break
 			}
-			side := "stale expensive"
+			side := "не успел подешеветь"
 			if r.Lag < 0 {
-				side = "stale cheap"
+				side = "не успел подорожать"
 			}
-			fmt.Fprintf(&b, "%s · floor %s vs FX %s · %+.1f%% (%s)\n", bot.Esc(r.Key.String()), num(r.Floor), num(r.Expected), r.Lag*100, side)
+			fmt.Fprintf(&b, "%s · флор %s против FX %s · %+.1f%% (%s)\n", bot.Esc(r.Key.String()), num(r.Floor), num(r.Expected), r.Lag*100, side)
 		}
 	}
 	return b.String()
@@ -161,7 +161,7 @@ func (a *App) detectGramVolatility(ctx context.Context, now time.Time) {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "🌪 <b>GRAM volatility</b>\nGRAM/USDT %s · 15m %+.1f%% · 1h %+.1f%%\n", num(q.USD), m15*100, m1*100)
+	fmt.Fprintf(&b, "🌪 <b>Волатильность GRAM</b>\nGRAM/USDT %s · 15м %+.1f%% · 1ч %+.1f%%\n", num(q.USD), m15*100, m1*100)
 	lags, _ := a.floorLags(ctx, now)
 	shown := 0
 	for _, row := range lags {
@@ -171,13 +171,13 @@ func (a *App) detectGramVolatility(ctx context.Context, now time.Time) {
 		if math.Abs(row.Lag) < .05 {
 			continue
 		}
-		fmt.Fprintf(&b, "%s floor lag %+.1f%%\n", bot.Esc(row.Key.String()), row.Lag*100)
+		fmt.Fprintf(&b, "%s лаг флора %+.1f%%\n", bot.Esc(row.Key.String()), row.Lag*100)
 		shown++
 	}
 	if shown == 0 {
-		b.WriteString("Tracked floors have no confirmed 5%+ lag yet.\n")
+		b.WriteString("Ни у одного отслеживаемого флора пока нет подтверждённого лага 5%+.\n")
 	}
-	b.WriteString("Open /gram before trading; auto-buy is blocked during sharp 15m moves.")
+	b.WriteString("Загляни в /gram перед сделкой: на резких движениях за 15м автобай блокируется.")
 	a.notify(b.String())
 }
 

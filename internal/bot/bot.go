@@ -56,6 +56,8 @@ type Backend interface {
 	MuteSignal(ctx context.Context, signalID int64, d time.Duration) Reply
 	// ModelByRef resolves a keyboard reference produced by a list view.
 	ModelByRef(ctx context.Context, ref string, view string) Reply
+	// Collections renders the collection picker for a drill-down view.
+	Collections(ctx context.Context, view string) Reply
 }
 
 // Callback routes. Payloads stay short because Telegram caps callback data at
@@ -113,11 +115,8 @@ func New(token string, ownerID int64, back Backend) (*Bot, error) {
 	})
 
 	b.register()
-	// Minimal menu: just the entry point. Everything else is buttons.
-	if err := tb.SetCommands([]tele.Command{
-		{Text: "start", Description: "Главное меню"},
-		{Text: "help", Description: "Справка"},
-	}); err != nil {
+	if err := tb.SetCommands(commandMenu); err != nil {
+		// A missing menu is cosmetic; it must not stop the desk from running.
 		log.Warn().Err(err).Msg("could not publish the command menu")
 	}
 	return b, nil
@@ -149,13 +148,13 @@ func (b *Bot) Notify(text string) { b.send(Text(text)) }
 // able to spend money on its own.
 func (b *Bot) NotifySignal(text string, signalID, giftID int64, price float64) {
 	b.send(Reply{Text: text}.
-		WithRow(Callback(fmt.Sprintf("⚡️ Buy %s", trimNum(price)), cbBuy, signalID)).
+		WithRow(Callback(fmt.Sprintf("⚡️ Купить за %s", trimNum(price)), cbBuy, signalID)).
 		WithRow(
-			Link("🔗 Open on Tonnel", TonnelGiftURL(giftID)),
-			Callback("📊 Book", cbBook, signalID),
+			Link("🔗 Открыть в Tonnel", TonnelGiftURL(giftID)),
+			Callback("📊 Стакан", cbBook, signalID),
 		).
 		WithRow(
-			Callback("🔕 Mute 1h", cbMute, signalID),
+			Callback("🔕 Мьют 1ч", cbMute, signalID),
 			Callback("🗑", cbDrop, signalID),
 		))
 }
@@ -218,7 +217,7 @@ func (b *Bot) register() {
 	tb.Handle("/floor", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" {
-			return Text("Usage: <code>/floor Plush Pepe</code> or <code>/floor Plush Pepe / Pink Diamond</code>")
+			return Text("Формат: <code>/floor Plush Pepe</code> или <code>/floor Plush Pepe / Pink Diamond</code>\n\nПроще — через кнопки: /start → 📊 Рынок → 📈 Флор")
 		}
 		return b.back.Floor(ctx, col, model)
 	}))
@@ -226,7 +225,7 @@ func (b *Bot) register() {
 	tb.Handle("/book", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" || model == "" {
-			return Text("Usage: <code>/book Plush Pepe / Pink Diamond</code>")
+			return Text("Формат: <code>/book Plush Pepe / Pink Diamond</code>\n\nПроще — через кнопки: /start → 📊 Рынок → 📖 Стакан")
 		}
 		return b.back.BookText(ctx, col, model)
 	}))
@@ -234,7 +233,7 @@ func (b *Bot) register() {
 	tb.Handle("/hist", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" || model == "" {
-			return Text("Usage: <code>/hist Plush Pepe / Pink Diamond</code>")
+			return Text("Формат: <code>/hist Plush Pepe / Pink Diamond</code>\n\nПроще — через кнопки: /start → 📊 Рынок → 🕒 Сделки")
 		}
 		return b.back.Hist(ctx, col, model)
 	}))
@@ -242,7 +241,7 @@ func (b *Bot) register() {
 	tb.Handle("/val", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
 		if err != nil {
-			return Text("Usage: <code>/val 123456</code> (Tonnel gift id)")
+			return Text("Формат: <code>/val 123456</code> — ID лота на Tonnel")
 		}
 		return b.back.Val(ctx, id)
 	}))
@@ -254,38 +253,38 @@ func (b *Bot) register() {
 	tb.Handle("/advice", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
 		if err != nil {
-			return Text("Usage: <code>/advice 123456</code>")
+			return Text("Формат: <code>/advice 123456</code> — ID гифта из <code>/pos</code>")
 		}
 		return b.back.Advice(ctx, id)
 	}))
 	tb.Handle("/history", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
 		if err != nil {
-			return Text("Usage: <code>/history 123456</code>")
+			return Text("Формат: <code>/history 123456</code> — ID гифта из <code>/pos</code>")
 		}
 		return b.back.PositionHistory(ctx, id)
 	}))
 	tb.Handle("/cost", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		f := strings.Fields(c.Message().Payload)
 		if len(f) != 2 {
-			return Text("Usage: <code>/cost 123456 4.25</code>")
+			return Text("Формат: <code>/cost 123456 4.25</code> — ID гифта и цена входа")
 		}
 		id, e1 := strconv.ParseInt(f[0], 10, 64)
 		price, e2 := strconv.ParseFloat(f[1], 64)
 		if e1 != nil || e2 != nil {
-			return Text("Usage: <code>/cost 123456 4.25</code>")
+			return Text("Формат: <code>/cost 123456 4.25</code> — ID гифта и цена входа")
 		}
 		return b.back.SetCost(ctx, id, price)
 	}))
 	tb.Handle("/exit", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		f := strings.Fields(c.Message().Payload)
 		if len(f) < 2 {
-			return Text("Usage: <code>/exit 123456 3.25</code> (then confirm)")
+			return Text("Формат: <code>/exit 123456 3.25</code>, потом подтвердить")
 		}
 		id, e1 := strconv.ParseInt(f[0], 10, 64)
 		price, e2 := strconv.ParseFloat(f[1], 64)
 		if e1 != nil || e2 != nil {
-			return Text("Usage: <code>/exit 123456 3.25</code>")
+			return Text("Формат: <code>/exit 123456 3.25</code>")
 		}
 		confirm := ""
 		if len(f) == 3 {
@@ -303,7 +302,7 @@ func (b *Bot) register() {
 	tb.Handle("/relist", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Message().Payload), 10, 64)
 		if err != nil {
-			return Text("Usage: <code>/relist 123456</code> — or just tap the button under <code>/pos</code>")
+			return Text("Формат: <code>/relist 123456</code> — или просто жми кнопку под <code>/pos</code>")
 		}
 		return b.back.Relist(ctx, id)
 	}))
@@ -326,7 +325,7 @@ func (b *Bot) register() {
 			// "/limits max_ticket 50" is the obvious typo; accept it.
 			return b.back.SetLimit(ctx, f[0], f[1])
 		default:
-			return Text("Usage: <code>/limits</code> or <code>/limits set max_ticket 50</code>")
+			return Text("Формат: <code>/limits</code> или <code>/limits set max_ticket 50</code>")
 		}
 	}))
 
@@ -334,7 +333,7 @@ func (b *Bot) register() {
 		target, maxPrice := splitTrailingNumber(c.Message().Payload)
 		col, model := splitTarget(target)
 		if col == "" || model == "" {
-			return Text("Usage: <code>/watch Plush Pepe / Pink Diamond [max price]</code>")
+			return Text("Формат: <code>/watch Plush Pepe / Pink Diamond [макс. цена]</code>")
 		}
 		return b.back.Watch(ctx, col, model, maxPrice)
 	}))
@@ -342,7 +341,7 @@ func (b *Bot) register() {
 	tb.Handle("/unwatch", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" || model == "" {
-			return Text("Usage: <code>/unwatch Plush Pepe / Pink Diamond</code>")
+			return Text("Формат: <code>/unwatch Plush Pepe / Pink Diamond</code>")
 		}
 		return b.back.Unwatch(ctx, col, model)
 	}))
@@ -355,7 +354,7 @@ func (b *Bot) register() {
 		target, hours := splitTrailingNumber(c.Message().Payload)
 		col, model := splitTarget(target)
 		if col == "" {
-			return Text("Usage: <code>/mute Plush Pepe [hours]</code> or <code>/mute Plush Pepe / Pink Diamond 4</code>")
+			return Text("Формат: <code>/mute Plush Pepe [часы]</code> или <code>/mute Plush Pepe / Pink Diamond 4</code>")
 		}
 		if hours <= 0 {
 			hours = 1
@@ -366,7 +365,7 @@ func (b *Bot) register() {
 	tb.Handle("/unmute", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		col, model := splitTarget(c.Message().Payload)
 		if col == "" {
-			return Text("Usage: <code>/unmute Plush Pepe</code>")
+			return Text("Формат: <code>/unmute Plush Pepe</code>")
 		}
 		return b.back.Unmute(ctx, col, model)
 	}))
@@ -374,7 +373,7 @@ func (b *Bot) register() {
 	tb.Handle("/auth", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		raw := strings.TrimSpace(c.Message().Payload)
 		if raw == "" {
-			return Text("Usage: <code>/auth &lt;authData&gt;</code> — the initData string from LocalStorage of market.tonnel.network")
+			return Text("Формат: <code>/auth &lt;authData&gt;</code>\n\nЭто строка initData из мини-аппа Tonnel. В LocalStorage её нет — открой мини-апп с DevTools и в консоли выполни <code>copy(Telegram.WebApp.initData)</code>.")
 		}
 		// The credential must not stay visible in the chat history.
 		if err := c.Delete(); err != nil {
@@ -444,7 +443,10 @@ func (b *Bot) registerCallbacks() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		return b.deliver(c, b.back.ModelByRef(ctx, parts[0], parts[1]))
+		// Editing in place keeps the drill-down on one message instead of
+		// leaving a trail of dead pickers up the chat.
+		r := b.back.ModelByRef(ctx, parts[0], parts[1])
+		return b.editWith(c, backWith(r, cbPick, parts[1], "🔙 Коллекции"))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbRefresh}, func(c tele.Context) error {
@@ -452,32 +454,45 @@ func (b *Bot) registerCallbacks() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
+		// Every branch returns the backend's own view, which carries action
+		// buttons but no navigation — so each one gets a way back to the menu
+		// it was opened from.
 		var r Reply
 		switch strings.TrimSpace(c.Data()) {
 		case "pos":
-			r = b.back.Positions(ctx)
+			r = back(b.back.Positions(ctx), cbPortfolio, "🔙 Портфель")
 		case "status":
-			r = b.back.Status(ctx)
+			r = back(b.back.Status(ctx), cbPortfolio, "🔙 Портфель")
 		case "pnl":
-			r = b.back.PnL(ctx)
+			r = back(b.back.PnL(ctx), cbPortfolio, "🔙 Портфель")
 		case "portfolio":
-			r = b.back.Portfolio(ctx)
-		case "gram":
-			r = b.back.Gram(ctx)
+			r = back(b.back.Portfolio(ctx), cbPortfolio, "🔙 Портфель")
 		case "balance":
-			r = b.back.BalanceText(ctx)
-		case "limits":
-			r = b.back.LimitsText(ctx)
-		case "arm":
-			r = b.back.Arm(ctx)
-		case "disarm":
-			r = b.back.Disarm(ctx)
+			r = back(b.back.BalanceText(ctx), cbPortfolio, "🔙 Портфель")
+		case "gram":
+			r = back(b.back.Gram(ctx), cbMarket, "🔙 Рынок")
 		case "watchlist":
-			r = b.back.Watchlist(ctx)
+			r = back(b.back.Watchlist(ctx), cbAlerts, "🔙 Алерты")
+		case "limits":
+			r = back(b.back.LimitsText(ctx), cbSettings, "🔙 Настройки")
+		case "arm":
+			r = back(b.back.Arm(ctx), cbAuto, "🔙 Автобай")
+		case "disarm":
+			r = back(b.back.Disarm(ctx), cbAuto, "🔙 Автобай")
 		default:
 			return nil
 		}
 		return b.editWith(c, r)
+	})
+
+	// The collection picker: the entry point for floor, book and history, so a
+	// model can be reached by tapping instead of typing a name with a slash.
+	tb.Handle(&tele.Btn{Unique: cbPick}, func(c tele.Context) error {
+		view := strings.TrimSpace(c.Data())
+		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return b.editWith(c, back(b.back.Collections(ctx, view), cbMarket, "🔙 Рынок"))
 	})
 
 	// Menu navigation
@@ -678,31 +693,14 @@ func Esc(s string) string { return html.EscapeString(s) }
 func trimNum(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 
 // commandMenu is what Telegram shows when the operator types "/".
+//
+// It is deliberately two entries long. Every view is reachable by tapping, so
+// advertising two dozen commands would only ask the operator to memorise what
+// the keyboard already offers. The typed commands still work — they are the
+// fast path for anyone who knows them, and the way to pass an id or a price —
+// and /help documents all of them.
 var commandMenu = []tele.Command{
-	{Text: "status", Description: "pollers, data freshness, auto-buy state"},
-	{Text: "gram", Description: "GRAM rate and gift-floor lag"},
-	{Text: "pos", Description: "open positions"},
-	{Text: "portfolio", Description: "actions and risk-adjusted exits"},
-	{Text: "advice", Description: "gift_id — detailed position advice"},
-	{Text: "history", Description: "gift_id — full position lifecycle"},
-	{Text: "cost", Description: "gift_id price — set missing cost basis"},
-	{Text: "exit", Description: "gift_id price — manually confirmed loss exit"},
-	{Text: "pnl", Description: "realised and unrealised profit"},
-	{Text: "balance", Description: "account balance"},
-	{Text: "floor", Description: "Collection [/ Model] — floors and cheapest asks"},
-	{Text: "book", Description: "Collection / Model — the ask ladder"},
-	{Text: "hist", Description: "Collection / Model — real trades and velocity"},
-	{Text: "val", Description: "gift_id — full valuation of one listing"},
-	{Text: "watch", Description: "Collection / Model [max price] — alert on any listing"},
-	{Text: "unwatch", Description: "Collection / Model"},
-	{Text: "watchlist", Description: "show subscriptions"},
-	{Text: "mute", Description: "Collection [/ Model] [hours] — silence alerts"},
-	{Text: "unmute", Description: "Collection [/ Model]"},
-	{Text: "relist", Description: "gift_id — reprice an owned gift"},
-	{Text: "arm", Description: "enable auto-buy"},
-	{Text: "disarm", Description: "stop auto-buy"},
-	{Text: "limits", Description: "show or change the money limits"},
-	{Text: "auth", Description: "replace an expired Tonnel session"},
-	{Text: "help", Description: "command reference"},
+	{Text: "start", Description: "главное меню"},
+	{Text: "help", Description: "все команды"},
 }
 

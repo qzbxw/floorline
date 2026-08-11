@@ -170,8 +170,75 @@ func TestCommandMenuIsComplete(t *testing.T) {
 		if strings.HasPrefix(c.Text, "/") {
 			t.Errorf("menu entry %q must not include the slash", c.Text)
 		}
-		if !strings.Contains(helpText, "/"+c.Text) {
-			t.Errorf("command /%s is in the menu but not documented in /help", c.Text)
+	}
+}
+
+// The typed commands are no longer advertised by Telegram, so /help is the only
+// place they are discoverable. A command that still has a handler but has
+// fallen out of the reference is invisible to the operator.
+func TestHelpDocumentsEveryTypedCommand(t *testing.T) {
+	help := helpMenuReply().Text
+	for _, cmd := range []string{
+		"gram", "floor", "book", "hist", "val",
+		"pos", "portfolio", "advice", "history", "cost", "exit", "pnl", "balance", "relist",
+		"watch", "unwatch", "watchlist", "mute", "unmute",
+		"arm", "disarm", "limits", "status", "auth",
+	} {
+		if !strings.Contains(help, "/"+cmd) {
+			t.Errorf("command /%s has a handler but is not documented in /help", cmd)
 		}
+	}
+}
+
+// Every menu must offer a way out. A screen whose only escape is retyping
+// /start is the dead end this keyboard exists to avoid.
+func TestEveryMenuHasAWayBack(t *testing.T) {
+	menus := map[string]Reply{
+		"market":    marketMenu(),
+		"portfolio": portfolioMenu(),
+		"alerts":    alertsMenu(),
+		"settings":  settingsMenu(),
+		"auto":      autoMenu(),
+		"help":      helpMenuReply(),
+		"val":       marketActionMenu("val"),
+	}
+	for name, m := range menus {
+		var found bool
+		for _, row := range m.Rows {
+			for _, btn := range row {
+				if btn.Unique == cbMenu || btn.Unique == cbMarket || btn.Unique == cbSettings || btn.Unique == cbAlerts {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("menu %q has no button leading back", name)
+		}
+	}
+}
+
+// A backend view carries its own actions but no navigation, so back() is what
+// keeps it from becoming a dead end.
+func TestBackAddsNavigationWithoutLosingActions(t *testing.T) {
+	view := Text("positions").WithRow(Callback("♻️ Переставить", "fl_relist", int64(7)))
+	got := back(view, cbPortfolio, "🔙 Портфель")
+
+	if len(got.Rows) != 2 {
+		t.Fatalf("rows = %d, want the action row plus a nav row", len(got.Rows))
+	}
+	if got.Rows[0][0].Unique != "fl_relist" {
+		t.Error("the view's own action button must survive")
+	}
+	nav := got.Rows[1]
+	if nav[0].Unique != cbPortfolio || nav[1].Unique != cbMenu {
+		t.Errorf("nav row = %+v, want back-to-section then home", nav)
+	}
+}
+
+// An empty reply must not grow a keyboard: the bot sends nothing at all for it,
+// and a keyboard attached to no text would be dropped anyway.
+func TestBackLeavesAnEmptyReplyAlone(t *testing.T) {
+	if got := back(Reply{}, cbMenu, "🔙"); !got.Empty() {
+		t.Errorf("back() on an empty reply produced %+v", got)
 	}
 }

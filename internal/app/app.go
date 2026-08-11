@@ -114,7 +114,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		return nil, err
 	}
 	a.rm.OnDisarm = func(reason string) {
-		a.notify("🛑 <b>Auto-buy disarmed</b>\n" + bot.Esc(reason))
+		a.notify("🛑 <b>Автобай выключен</b>\n" + bot.Esc(reason))
 	}
 
 	a.det = signal.New(st, a.books, cfg)
@@ -218,7 +218,7 @@ func (a *App) Run(ctx context.Context) error {
 		a.backfillIfNeeded(ctx)
 	}()
 
-	a.notify(fmt.Sprintf("✅ <b>Floorline is up</b>\n%s", bot.Esc(a.statusLine())))
+	a.notify(fmt.Sprintf("✅ <b>Floorline поднялся</b>\n%s", bot.Esc(a.statusLine())))
 	log.Info().Str("bot", a.tg.Username()).Msg("floorline running")
 
 	a.tg.Start(ctx)
@@ -330,19 +330,19 @@ func (a *App) throttle(key string, every time.Duration) bool {
 }
 
 func (a *App) onBlocked(err error) {
-	a.rm.Pause(5*time.Minute, "anti-bot block")
+	a.rm.Pause(5*time.Minute, "блок антибота")
 	if a.throttle("blocked", 15*time.Minute) {
-		a.notify("⚠️ <b>Tonnel is refusing requests</b> (Cloudflare or rate limit).\n" +
+		a.notify("⚠️ <b>Tonnel режет запросы</b> (Cloudflare или рейт-лимит).\n" +
 			bot.Esc(err.Error()) +
-			"\n\nPollers are backing off. Auto-buy is paused for 5 minutes.")
+			"\n\nПоллеры сбавляют темп. Автобай на паузе 5 минут.")
 	}
 }
 
 func (a *App) onAuthExpired(err error) {
-	_ = a.rm.Disarm(context.Background(), "Tonnel session rejected")
+	_ = a.rm.Disarm(context.Background(), "сессия Tonnel отклонена")
 	if a.throttle("auth", 30*time.Minute) {
-		a.notify("🔑 <b>Tonnel session rejected</b>\n" + bot.Esc(err.Error()) +
-			"\n\nOpen the Tonnel mini app with DevTools, copy Telegram.WebApp.initData (or user_auth from a gifts2.tonnel.network request), then send:\n<code>/auth &lt;authData&gt;</code>")
+		a.notify("🔑 <b>Сессия Tonnel отклонена</b>\n" + bot.Esc(err.Error()) +
+			"\n\nОткрой мини-апп Tonnel с DevTools, скопируй Telegram.WebApp.initData (или user_auth из запроса к gifts2.tonnel.network) и пришли:\n<code>/auth &lt;authData&gt;</code>")
 	}
 }
 

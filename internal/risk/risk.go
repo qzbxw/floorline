@@ -60,6 +60,52 @@ func DefaultLimits() Limits {
 	}
 }
 
+const (
+	// FloorGuardTolerance is how far under the live floor a modelled target may
+	// sit before it stops being an opinion about the market and becomes a bet
+	// against it. Selling a few tenths of a percent below the floor is normal
+	// undercutting; several percent below it is a panic sell.
+	FloorGuardTolerance = 0.03
+	// externalSlack is the tolerance on the cross-market comparison. Quotes from
+	// another venue carry their own fees, rounding and refresh lag, so a 5.01
+	// reference against a 5.03 ask is the same price, not a market that dropped.
+	externalSlack = 0.01
+)
+
+// ExitCheck is the live evidence surrounding one modelled exit recommendation.
+// Every field is in GRAM; a zero means "not known", which disables the guard
+// rather than tripping it.
+type ExitCheck struct {
+	Ask         float64 // our current ask
+	Target      float64 // the modelled recommended exit
+	Floor       float64 // live collection/model floor
+	ExternalRef float64 // cross-market ask-depth reference
+}
+
+// ContradictsMarket reports whether acting on this recommendation would mean
+// arguing with the market instead of reading it.
+//
+// A target well under the live floor is only credible if something else has
+// also moved. When the cross-market ask depth is still sitting at or above our
+// own ask, nothing has: the model is the only participant claiming the price
+// fell, and it is quoting its own trade history back at itself. In that state
+// the model must not originate a sell on its own authority — the operator can
+// still exit deliberately.
+func (c ExitCheck) ContradictsMarket() (bool, string) {
+	if c.Ask <= 0 || c.Target <= 0 || c.Floor <= 0 || c.ExternalRef <= 0 {
+		return false, ""
+	}
+	if c.Target >= c.Floor*(1-FloorGuardTolerance) {
+		return false, ""
+	}
+	if c.ExternalRef < c.Ask*(1-externalSlack) {
+		return false, "" // external depth agrees the market moved down
+	}
+	return true, fmt.Sprintf(
+		"target %.2f is %.0f%% below the live floor %.2f while external ask depth holds at %.2f against our ask %.2f — the market has not dropped",
+		c.Target, (1-c.Target/c.Floor)*100, c.Floor, c.ExternalRef, c.Ask)
+}
+
 // Manager enforces the limits and holds the armed/disarmed state.
 type Manager struct {
 	st *store.Store
@@ -184,7 +230,7 @@ func (m *Manager) RecordFailure(ctx context.Context) {
 	m.mu.Unlock()
 
 	if n >= 3 {
-		_ = m.Disarm(ctx, fmt.Sprintf("%d purchases failed in a row", n))
+		_ = m.Disarm(ctx, fmt.Sprintf("%d покупок подряд провалились", n))
 	}
 }
 
@@ -225,16 +271,16 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 	m.mu.RUnlock()
 
 	if !armed {
-		return false, "auto-buy disarmed"
+		return false, "автобай выключен"
 	}
 	if now.Before(disabledUntil) {
-		return false, fmt.Sprintf("paused for another %s", disabledUntil.Sub(now).Round(time.Second))
+		return false, fmt.Sprintf("на паузе ещё %s", disabledUntil.Sub(now).Round(time.Second))
 	}
 	if l.MaxTicket <= 0 || l.DailyBudget <= 0 {
-		return false, "limits not configured"
+		return false, "лимиты не настроены"
 	}
 	if price > l.MaxTicket {
-		return false, fmt.Sprintf("price %.2f above max_ticket %.2f", price, l.MaxTicket)
+		return false, fmt.Sprintf("цена %.2f выше max_ticket %.2f", price, l.MaxTicket)
 	}
 
 	day := now.UTC().Format("2006-01-02")
@@ -243,7 +289,7 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 		return false, "ledger unavailable: " + err.Error()
 	}
 	if spend.Spent+price > l.DailyBudget {
-		return false, fmt.Sprintf("daily budget exhausted (%.2f of %.2f spent)", spend.Spent, l.DailyBudget)
+		return false, fmt.Sprintf("дневной бюджет исчерпан (потрачено %.2f из %.2f)", spend.Spent, l.DailyBudget)
 	}
 
 	if l.MaxOpenPositions > 0 {
@@ -252,7 +298,7 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 			return false, "position count unavailable: " + err.Error()
 		}
 		if open >= l.MaxOpenPositions {
-			return false, fmt.Sprintf("%d open positions, limit %d", open, l.MaxOpenPositions)
+			return false, fmt.Sprintf("открытых позиций %d, лимит %d", open, l.MaxOpenPositions)
 		}
 	}
 
@@ -262,7 +308,7 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 			return false, "buy count unavailable: " + err.Error()
 		}
 		if n >= l.MaxBuysPerHour {
-			return false, fmt.Sprintf("%d buys in the last hour, limit %d", n, l.MaxBuysPerHour)
+			return false, fmt.Sprintf("%d покупок за последний час, лимит %d", n, l.MaxBuysPerHour)
 		}
 	}
 
@@ -272,7 +318,7 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 			return false, "cooldown check unavailable: " + err.Error()
 		}
 		if !last.IsZero() && now.Sub(last) < l.ModelCooldown {
-			return false, fmt.Sprintf("bought this model %s ago, cooldown %s",
+			return false, fmt.Sprintf("эту модель брали %s назад, кулдаун %s",
 				now.Sub(last).Round(time.Second), l.ModelCooldown)
 		}
 	}
@@ -285,10 +331,10 @@ func (m *Manager) Allow(ctx context.Context, key tonnel.ModelKey, price float64,
 	}
 
 	if balanceKnown && l.MinBalanceReserve > 0 && balance-price < l.MinBalanceReserve {
-		return false, fmt.Sprintf("balance %.2f would drop below reserve %.2f", balance, l.MinBalanceReserve)
+		return false, fmt.Sprintf("баланс %.2f упадёт ниже резерва %.2f", balance, l.MinBalanceReserve)
 	}
 	if balanceKnown && balance < price {
-		return false, fmt.Sprintf("balance %.2f is below the price %.2f", balance, price)
+		return false, fmt.Sprintf("баланса %.2f не хватает на цену %.2f", balance, price)
 	}
 
 	return true, ""
@@ -339,10 +385,10 @@ func (m *Manager) portfolioFit(ctx context.Context, key tonnel.ModelKey, price f
 	mPct := (mv + price) / nav
 	cPct := (cv + price) / nav
 	if l.MaxModelExposurePct > 0 && mPct > l.MaxModelExposurePct {
-		return 0, fmt.Sprintf("model exposure %.0f%% above %.0f%%", mPct*100, l.MaxModelExposurePct*100), nil
+		return 0, fmt.Sprintf("доля модели %.0f%% выше %.0f%%", mPct*100, l.MaxModelExposurePct*100), nil
 	}
 	if l.MaxCollectionExposurePct > 0 && cPct > l.MaxCollectionExposurePct {
-		return 0, fmt.Sprintf("collection exposure %.0f%% above %.0f%%", cPct*100, l.MaxCollectionExposurePct*100), nil
+		return 0, fmt.Sprintf("доля коллекции %.0f%% выше %.0f%%", cPct*100, l.MaxCollectionExposurePct*100), nil
 	}
 	fit := 1.0
 	if l.MaxModelExposurePct > 0 {
