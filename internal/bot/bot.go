@@ -389,26 +389,24 @@ func (b *Bot) register() {
 func (b *Bot) registerCallbacks() {
 	tb := b.tb
 
-	// Tapping Buy only swaps the keyboard for a confirmation. The card text is
-	// left alone so the numbers stay on screen while deciding.
 	tb.Handle(&tele.Btn{Unique: cbBuy}, func(c tele.Context) error {
 		id := strings.TrimSpace(c.Data())
-		_ = c.Respond(&tele.CallbackResponse{Text: "confirm to buy"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "подтверди"})
 		return c.Edit(&tele.ReplyMarkup{InlineKeyboard: markup([][]Button{
-			{Callback("✅ Confirm purchase", cbConfirm, id)},
-			{Callback("✖️ Cancel", cbCancel, id)},
+			{Callback("✅ Подтвердить", cbConfirm, id)},
+			{Callback("✖️ Отмена", cbCancel, id)},
 		}).InlineKeyboard})
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbCancel}, func(c tele.Context) error {
 		sigID, err := strconv.ParseInt(strings.TrimSpace(c.Data()), 10, 64)
 		if err != nil {
-			return c.Respond(&tele.CallbackResponse{Text: "malformed button", ShowAlert: true})
+			return c.Respond(&tele.CallbackResponse{Text: "ошибка", ShowAlert: true})
 		}
-		_ = c.Respond(&tele.CallbackResponse{Text: "cancelled"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "отменено"})
 		return c.Edit(&tele.ReplyMarkup{InlineKeyboard: markup([][]Button{
-			{Callback("⚡️ Buy", cbBuy, sigID)},
-			{Callback("📊 Book", cbBook, sigID), Callback("🔕 Mute 1h", cbMute, sigID), Callback("🗑", cbDrop, sigID)},
+			{Callback("⚡️ Купить", cbBuy, sigID)},
+			{Callback("📊 Лесенка", cbBook, sigID), Callback("🔕 Тишина 1ч", cbMute, sigID), Callback("🗑", cbDrop, sigID)},
 		}).InlineKeyboard})
 	})
 
@@ -440,9 +438,9 @@ func (b *Bot) registerCallbacks() {
 	tb.Handle(&tele.Btn{Unique: cbModel}, func(c tele.Context) error {
 		parts := strings.SplitN(c.Data(), "|", 2)
 		if len(parts) != 2 {
-			return c.Respond(&tele.CallbackResponse{Text: "malformed button", ShowAlert: true})
+			return c.Respond(&tele.CallbackResponse{Text: "ошибка кнопки", ShowAlert: true})
 		}
-		_ = c.Respond(&tele.CallbackResponse{Text: "loading…"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -450,7 +448,7 @@ func (b *Bot) registerCallbacks() {
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbRefresh}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "refreshing…"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
@@ -489,32 +487,50 @@ func (b *Bot) registerCallbacks() {
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbMarket}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "market"})
-		return b.editWith(c, marketMenu())
+		action := strings.TrimSpace(c.Data())
+		if action == "" {
+			_ = c.Respond(&tele.CallbackResponse{Text: "рынок"})
+			return b.editWith(c, marketMenu())
+		}
+		// Submenu for market actions (floor, book, hist, val)
+		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
+		return b.editWith(c, marketActionMenu(action))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbPortfolio}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "portfolio"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "портфель"})
 		return b.editWith(c, portfolioMenu())
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbAlerts}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "alerts"})
-		return b.editWith(c, alertsMenu())
+		action := strings.TrimSpace(c.Data())
+		if action == "" {
+			_ = c.Respond(&tele.CallbackResponse{Text: "алерты"})
+			return b.editWith(c, alertsMenu())
+		}
+		// Submenu for alert actions (watch, mute)
+		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
+		return b.editWith(c, alertsActionMenu(action))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbSettings}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "settings"})
-		return b.editWith(c, settingsMenu())
+		action := strings.TrimSpace(c.Data())
+		if action == "" {
+			_ = c.Respond(&tele.CallbackResponse{Text: "настройки"})
+			return b.editWith(c, settingsMenu())
+		}
+		// Submenu for settings actions (auth)
+		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
+		return b.editWith(c, settingsActionMenu(action))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbAuto}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "auto-buy"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "автокупля"})
 		return b.editWith(c, autoMenu())
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbHelp}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "help"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "справка"})
 		return b.editWith(c, helpMenuReply())
 	})
 }
@@ -543,7 +559,7 @@ func (b *Bot) callback(fn func(context.Context, int64, tele.Context) Reply, edit
 	return func(c tele.Context) error {
 		id, err := strconv.ParseInt(strings.TrimSpace(c.Data()), 10, 64)
 		if err != nil {
-			return c.Respond(&tele.CallbackResponse{Text: "malformed button", ShowAlert: true})
+			return c.Respond(&tele.CallbackResponse{Text: "ошибка кнопки", ShowAlert: true})
 		}
 		// Acknowledge immediately so the button stops spinning while a purchase
 		// is in flight.

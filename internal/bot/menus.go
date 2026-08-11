@@ -33,9 +33,10 @@ func marketMenu() Reply {
 			"Что хочешь посмотреть?",
 		Rows: [][]Button{
 			{Callback("💹 GRAM/USDT", cbRefresh, "gram")},
-			{Callback("📈 Полы", cbRefresh, "floor_list")},
-			{Callback("📖 Лесенка", cbRefresh, "book_list")},
-			{Callback("🔄 Сделки", cbRefresh, "hist_list")},
+			{Callback("📈 Полы", cbMarket, "floor")},
+			{Callback("📖 Лесенка", cbMarket, "book")},
+			{Callback("🔄 Сделки", cbMarket, "hist")},
+			{Callback("💰 Оценка лота", cbMarket, "val")},
 			{Callback("🔙 Назад", cbMenu, "")},
 		},
 	}
@@ -61,12 +62,38 @@ func portfolioMenu() Reply {
 func alertsMenu() Reply {
 	return Reply{
 		Text: "⏰ <b>Алерты</b>\n\n" +
-			"Следи за тем, что интересует:",
+			"Следи за интересным:",
 		Rows: [][]Button{
 			{Callback("👁️ Мой список", cbRefresh, "watchlist")},
-			{Callback("📌 Добавить", cbRefresh, "watch_add")},
-			{Callback("🔕 Отключить звук", cbRefresh, "mute_menu")},
+			{Callback("📌 Подписаться", cbAlerts, "watch")},
+			{Callback("🔕 Отключить звук", cbAlerts, "mute")},
 			{Callback("🔙 Назад", cbMenu, "")},
+		},
+	}
+}
+
+// alertsActionMenu returns instruction for alerts
+func alertsActionMenu(action string) Reply {
+	texts := map[string]string{
+		"watch": "📌 <b>Подписаться на коллекцию</b>\n\n" +
+			"Введи: <code>/watch Коллекция / Модель [цена]</code>\n\n" +
+			"Примеры:\n" +
+			"<code>/watch Plush Pepe / Pink Diamond</code>\n" +
+			"<code>/watch Plush Pepe / Pink Diamond 50</code> — до цены 50 USDT",
+		"mute": "🔕 <b>Отключить звук</b>\n\n" +
+			"Введи: <code>/mute Коллекция [/ Модель] [часы]</code>\n\n" +
+			"Примеры:\n" +
+			"<code>/mute Plush</code> — 1 час\n" +
+			"<code>/mute Plush Pepe / Pink Diamond 4</code> — 4 часа",
+	}
+	text := texts[action]
+	if text == "" {
+		text = "Введи команду"
+	}
+	return Reply{
+		Text: text,
+		Rows: [][]Button{
+			{Callback("🔙 Назад", cbAlerts, "")},
 		},
 	}
 }
@@ -75,12 +102,35 @@ func alertsMenu() Reply {
 func settingsMenu() Reply {
 	return Reply{
 		Text: "⚙️ <b>Настройки</b>\n\n" +
-			"Настрой бота под себя:",
+			"Настрой под себя:",
 		Rows: [][]Button{
 			{Callback("⚡ Автокупля", cbAuto, "")},
 			{Callback("💰 Лимиты", cbRefresh, "limits")},
-			{Callback("🔐 Авторизация", cbRefresh, "auth")},
+			{Callback("🔐 Сессия", cbSettings, "auth")},
 			{Callback("🔙 Назад", cbMenu, "")},
+		},
+	}
+}
+
+// settingsActionMenu returns instruction for settings
+func settingsActionMenu(action string) Reply {
+	texts := map[string]string{
+		"auth": "🔐 <b>Обновить сессию Tonnel</b>\n\n" +
+			"Сессия протухла? Берёшь новую initData из Tonnel мини-апп:\n\n" +
+			"DevTools → Console → выполни:\n" +
+			"<code>copy(Telegram.WebApp.initData)</code>\n\n" +
+			"Потом отправь:\n" +
+			"<code>/auth &lt;authData&gt;</code>\n\n" +
+			"<i>Сообщение удалится автоматом (в истории чата не останется).</i>",
+	}
+	text := texts[action]
+	if text == "" {
+		text = "Введи команду"
+	}
+	return Reply{
+		Text: text,
+		Rows: [][]Button{
+			{Callback("🔙 Назад", cbSettings, "")},
 		},
 	}
 }
@@ -99,6 +149,39 @@ func autoMenu() Reply {
 	}
 }
 
+// marketActionMenu returns instruction for market data input
+func marketActionMenu(action string) Reply {
+	texts := map[string]string{
+		"floor": "📈 <b>Полы коллекции</b>\n\n" +
+			"Введи: <code>/floor Коллекция [/ Модель]</code>\n\n" +
+			"Примеры:\n" +
+			"<code>/floor Plush</code> — все модели в Plush\n" +
+			"<code>/floor Plush Pepe / Pink Diamond</code> — конкретный вариант",
+		"book": "📖 <b>Лесенка ордеров</b>\n\n" +
+			"Введи: <code>/book Коллекция / Модель</code>\n\n" +
+			"Пример:\n" +
+			"<code>/book Plush Pepe / Pink Diamond</code>",
+		"hist": "🔄 <b>История сделок</b>\n\n" +
+			"Введи: <code>/hist Коллекция / Модель</code>\n\n" +
+			"Пример:\n" +
+			"<code>/hist Plush Pepe / Pink Diamond</code>",
+		"val": "💰 <b>Оценка лота</b>\n\n" +
+			"Введи: <code>/val ID</code>\n\n" +
+			"Пример:\n" +
+			"<code>/val 123456</code> — ID из Tonnel",
+	}
+	text := texts[action]
+	if text == "" {
+		text = "Введи команду"
+	}
+	return Reply{
+		Text: text,
+		Rows: [][]Button{
+			{Callback("🔙 Назад", cbMarket, "")},
+		},
+	}
+}
+
 // helpMenuReply returns help/reference information
 func helpMenuReply() Reply {
 	return Reply{
@@ -106,33 +189,33 @@ func helpMenuReply() Reply {
 			"<b>📊 Рынок:</b>\n" +
 			"<code>/gram</code> — курс GRAM и лаги\n" +
 			"<code>/floor Коллекция [/Модель]</code> — полы и предложения\n" +
-			"<code>/book Коллекция/Модель</code> — лесенка цен\n" +
-			"<code>/hist Коллекция/Модель</code> — история сделок\n" +
+			"<code>/book Коллекция/Модель</code> — лесенка\n" +
+			"<code>/hist Коллекция/Модель</code> — сделки\n" +
 			"<code>/val ID</code> — оценка лота\n\n" +
 			"<b>💼 Портфель:</b>\n" +
-			"<code>/pos</code> — твои позиции\n" +
-			"<code>/portfolio</code> — рекомендации\n" +
+			"<code>/pos</code> — позиции\n" +
+			"<code>/portfolio</code> — советы\n" +
 			"<code>/advice ID</code> — как выходить\n" +
-			"<code>/history ID</code> — история позиции\n" +
-			"<code>/cost ID цена</code> — установить цену\n" +
+			"<code>/history ID</code> — история\n" +
+			"<code>/cost ID цена</code> — цена покупки\n" +
 			"<code>/exit ID цена</code> — выход\n" +
-			"<code>/pnl</code> — твоя прибыль\n" +
+			"<code>/pnl</code> — профит/убыток\n" +
 			"<code>/balance</code> — баланс\n" +
 			"<code>/relist ID</code> — переоценить\n\n" +
 			"<b>⏰ Алерты:</b>\n" +
-			"<code>/watch Коллекция/Модель [цена]</code> — добавить в список\n" +
-			"<code>/unwatch Коллекция/Модель</code> — удалить\n" +
-			"<code>/watchlist</code> — твой список\n" +
-			"<code>/mute Коллекция [часы]</code> — отключить звук\n" +
-			"<code>/unmute Коллекция</code> — включить обратно\n\n" +
+			"<code>/watch Коллекция/Модель [цена]</code> — подписаться\n" +
+			"<code>/unwatch Коллекция/Модель</code> — отписаться\n" +
+			"<code>/watchlist</code> — подписки\n" +
+			"<code>/mute Коллекция [часы]</code> — тишина\n" +
+			"<code>/unmute Коллекция</code> — звук обратно\n\n" +
 			"<b>⚡ Автокупля:</b>\n" +
-			"<code>/arm</code> — включить автопилот\n" +
+			"<code>/arm</code> — включить\n" +
 			"<code>/disarm</code> — выключить\n" +
-			"<code>/limits</code> — показать лимиты\n" +
+			"<code>/limits</code> — лимиты\n" +
 			"<code>/limits set ключ значение</code> — <code>/limits set max_ticket 50</code>\n\n" +
-			"<b>⚙️ Прочее:</b>\n" +
-			"<code>/status</code> — состояние системы\n" +
-			"<code>/auth authData</code> — обновить авторизацию\n\n" +
+			"<b>⚙️ Система:</b>\n" +
+			"<code>/status</code> — состояние\n" +
+			"<code>/auth authData</code> — сессия\n\n" +
 			"<i>Коллекция и модель разделены слешем: </i><code>/book Plush Pepe / Pink Diamond</code>",
 		Rows: [][]Button{
 			{Callback("🔙 Назад", cbMenu, "")},
