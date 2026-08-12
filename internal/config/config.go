@@ -24,6 +24,14 @@ type SignalGates struct {
 	MinTrend    float64 // median(7d) / median(14d) — reject falling knives
 	MinPrice    float64 // ignore dust
 	MaxPrice    float64 // 0 = unlimited
+	// MinNet is the absolute profit a trade has to be worth in GRAM. A
+	// percentage on its own cannot tell +0.07 on a 3-GRAM lot apart from a
+	// trade, and the chat filled with the former.
+	MinNet float64
+	// MaxExitDays rejects the warehouse. Several cards in the 12 Aug log
+	// projected "быстро за ~8.8д" and one at ~10д; that is not a flip, and
+	// holding a thin model for a fortnight is how a small bank stops working.
+	MaxExitDays float64
 }
 
 // AutoGates is layered strictly on top of SignalGates for unattended buying.
@@ -171,16 +179,22 @@ func Load() (*Config, error) {
 		Undercut:   envFloat("UNDERCUT", 0.01),
 
 		Sig: SignalGates{
-			MinEdge:     envFloat("SIG_MIN_EDGE", 0.01),
+			// 1% was set when the exit was overstated by roughly a factor of
+			// two, so it was really admitting anything above break-even. With
+			// the exit honest, most of what it let through is now negative and
+			// disappears on its own; this is the bar for what is left.
+			MinEdge:     envFloat("SIG_MIN_EDGE", 0.045),
 			MinVelocity: envFloat("SIG_MIN_VELOCITY", 0.5),
 			MinSales:    envInt("SIG_MIN_SALES", 6),
 			MaxMADRatio: envFloat("SIG_MAX_MAD_RATIO", 0.35),
 			MinTrend:    envFloat("SIG_MIN_TREND", 0.90),
 			MinPrice:    envFloat("SIG_MIN_PRICE", 1),
 			MaxPrice:    envFloat("SIG_MAX_PRICE", 0),
+			MinNet:      envFloat("SIG_MIN_NET", 0.25),
+			MaxExitDays: envFloat("SIG_MAX_EXIT_DAYS", 4),
 		},
 		Auto: AutoGates{
-			MinEdge:        envFloat("AUTOBUY_MIN_EDGE", 0.03),
+			MinEdge:        envFloat("AUTOBUY_MIN_EDGE", 0.06),
 			MinVelocity:    envFloat("AUTOBUY_MIN_VELOCITY", 1.0),
 			MinSales:       envInt("AUTOBUY_MIN_SALES", 10),
 			MinTurnover:    envFloat("AUTOBUY_MIN_TURNOVER", 0.6),

@@ -30,17 +30,21 @@ func backWith(r Reply, target, data, label string) Reply {
 	return r.WithRow(Callback(label, target, data), Callback("🏠 Меню", cbMenu, ""))
 }
 
-// mainMenu returns the main dashboard with category buttons
+// mainMenu is the dashboard.
+//
+// The things done many times a day are on it directly. Auto-buy used to sit two
+// taps down, behind "Настройки", which is the wrong shape for the switch the
+// operator checks most often and the one most likely to be silently off.
 func mainMenu() Reply {
 	return Reply{
 		Text: "⚙️ <b>Floorline</b> — Tonnel трейдинг\n\n" +
 			"🎯 Давай торговать:",
 		Rows: [][]Button{
-			{Callback("📊 Рынок", cbMarket, "")},
-			{Callback("💼 Портфель", cbPortfolio, "")},
-			{Callback("⏰ Алерты", cbAlerts, "")},
-			{Callback("⚙️ Настройки", cbSettings, "")},
-			{Callback("📚 Справка", cbHelp, "")},
+			{Callback("⚔️ Сессия торговли", cbRefresh, "trade"), Callback("🔭 Скан", cbRefresh, "scan")},
+			{Callback("📍 Позиции", cbRefresh, "pos"), Callback("💰 P&L", cbRefresh, "pnl")},
+			{Callback("⚡️ Автобай", cbAuto, ""), Callback("📊 Рынок", cbMarket, "")},
+			{Callback("💼 Портфель", cbPortfolio, ""), Callback("⏰ Алерты", cbAlerts, "")},
+			{Callback("⚙️ Настройки", cbSettings, ""), Callback("📚 Справка", cbHelp, "")},
 		},
 	}
 }
@@ -122,7 +126,7 @@ func settingsMenu() Reply {
 		Text: "⚙️ <b>Настройки</b>\n\n" +
 			"Настрой под себя:",
 		Rows: [][]Button{
-			{Callback("⚡ Автобай и ресейл", cbAuto, "")},
+			{Callback("⚡️ Автобай и ресейл", cbAuto, "")},
 			{Callback("💰 Лимиты", cbRefresh, "limits")},
 			{Callback("🔐 Сессия", cbSettings, "auth")},
 			{Callback("🔙 Назад", cbMenu, "")},
@@ -153,20 +157,11 @@ func settingsActionMenu(action string) Reply {
 	}
 }
 
-// autoMenu returns auto-buy settings. Buying and selling are two switches, not
-// one, so the menu offers them separately.
-func autoMenu() Reply {
-	return Reply{
-		Text: "⚡ <b>Автобай</b>\n\n" +
-			"Покупка и продажа включаются отдельно:",
-		Rows: [][]Button{
-			{Callback("✅ Автобай вкл", cbRefresh, "arm"), Callback("❌ Автобай выкл", cbRefresh, "disarm")},
-			{Callback("✅ Ресейл вкл", cbRefresh, "resell_on"), Callback("❌ Ресейл выкл", cbRefresh, "resell_off")},
-			{Callback("📋 Лимиты", cbRefresh, "limits")},
-			{Callback("🔙 Назад", cbSettings, "")},
-		},
-	}
-}
+// The auto-buy screen is built by the backend rather than declared here: every
+// button on it is a toggle whose label depends on the current state, and the
+// checklist beside them has to be read from the database. A static keyboard is
+// what produced the bug it replaces — four fixed buttons, "Автобай вкл" next to
+// "Автобай выкл", with nothing indicating which was in effect.
 
 // marketActionMenu covers the one market view that needs a number typed in:
 // a gift id cannot be offered as a button because it is not in any list.
@@ -210,7 +205,12 @@ func helpMenuReply() Reply {
 			"<code>/watchlist</code> — подписки\n" +
 			"<code>/mute Коллекция [часы]</code> — тишина\n" +
 			"<code>/unmute Коллекция</code> — звук обратно\n\n" +
+			"<b>⚔️ Торговля:</b>\n" +
+			"<code>/trade</code> — сессия: отобрать ликвидные пары и торговать по ним\n" +
+			"<code>/trade off</code> — выйти из сессии\n" +
+			"<code>/scan</code> — разовый скан рынка\n\n" +
 			"<b>⚡ Автобай:</b>\n" +
+			"<code>/autobuy</code> — что включено и что мешает купить\n" +
 			"<code>/arm</code> — включить покупку\n" +
 			"<code>/disarm</code> — выключить покупку\n" +
 			"<code>/resell on|off</code> — продавать ли самому\n" +

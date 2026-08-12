@@ -232,6 +232,14 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 		note = "только вручную — " + dec.AutoFails[0]
 	}
 
+	// A session is a deliberate narrowing: the operator has said which pairs
+	// they are working, so everything else stops interrupting. The signal is
+	// still recorded — the backtest needs the whole tape, not the part that got
+	// a notification — and unattended buying above still runs, because that
+	// decision was never about where the operator is looking.
+	if s := a.loadSession(ctx); s.Active() && !s.Covers(v.Key) {
+		return nil
+	}
 	if dec.Suppressed {
 		return nil
 	}

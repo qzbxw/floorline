@@ -22,6 +22,26 @@ const KindBuy = "buy"
 // notification only — a lot that clears the auto-buy bar is still bought.
 const alertCooldown = 5 * time.Minute
 
+// collectionCooldown is the same idea one level up.
+//
+// On 12 Aug seven Lol Pop cards arrived between 22:21 and 22:31. Every one was
+// a different model, so no two shared a cooldown key, and every one was priced
+// at 3.3 — one seller emptying a collection, delivered as seven separate
+// opportunities.
+const collectionCooldown = 15 * time.Minute
+
+const (
+	// batchWindow and batchTolerance define "the same dump": other gifts of
+	// this collection signalled at essentially this price, recently.
+	batchWindow    = time.Hour
+	batchTolerance = 0.01
+	// maxBatchPeers is how many of them it takes before this stops being a
+	// misprice. Scarcity is the premise of the whole trade: if the desk has
+	// already been shown three lots at this number, then whatever we buy, our
+	// buyer can have the next one at the same price.
+	maxBatchPeers = 3
+)
+
 // Decision is the full verdict on one listing.
 type Decision struct {
 	Gift tonnel.Gift
@@ -34,6 +54,11 @@ type Decision struct {
 
 	SignalFails []string
 	AutoFails   []string
+
+	// BatchPeers is how many other gifts of the same collection were signalled
+	// at essentially this price in the last hour — the measure of how far this
+	// lot is from being scarce.
+	BatchPeers int
 
 	Age time.Duration // how long the listing has been visible to us
 }
@@ -48,8 +73,14 @@ type Detector struct {
 	// is not understated while the database is still filling up.
 	Coverage func() time.Duration
 	// Warm reports whether the history is deep enough to trust for auto-buying.
-	Warm             func() bool
+	Warm func() bool
+	// CalibrationReady and ShadowMode are supplied rather than read from config
+	// because both are switches the operator flips at runtime. Reading them
+	// from the immutable config meant the only way to change either was to edit
+	// .env and restart, while the bot reported the block in small print at the
+	// bottom of every card.
 	CalibrationReady func() bool
+	ShadowMode       func() bool
 	// CrossSupport supplies robust external ask depth before any gate runs.
 	// Leaving it nil simply disables that component.
 	CrossSupport func(context.Context, pricing.Valuation) pricing.CrossMarket
@@ -71,6 +102,7 @@ func New(st *store.Store, books *pricing.BookCache, cfg *config.Config) *Detecto
 		Coverage:         func() time.Duration { return time.Duration(cfg.LookbackDays) * 24 * time.Hour },
 		Warm:             func() bool { return true },
 		CalibrationReady: func() bool { return true },
+		ShadowMode:       func() bool { return cfg.ShadowMode },
 	}
 }
 
@@ -218,7 +250,19 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		return dec, nil
 	}
 
+	// How much of this collection is already on offer at this price decides
+	// whether the lot is scarce, so it is measured before the gates run.
+	peers, err := d.st.PeersAtPrice(ctx, key.Name, KindBuy, price, batchTolerance, now.Add(-batchWindow), g.GiftID.Int())
+	if err != nil {
+		return nil, fmt.Errorf("batch check: %w", err)
+	}
+	dec.BatchPeers = peers
+
 	dec.SignalFails = d.signalGates(val)
+	if peers >= maxBatchPeers {
+		dec.SignalFails = append(dec.SignalFails, fmt.Sprintf(
+			"%s этой коллекции уже прошли по той же цене за час — это распродажа одного продавца, а не мисприс", plural(peers, "лот", "лота", "лотов")))
+	}
 	dec.Signal = len(dec.SignalFails) == 0
 	dec.Score = Score(val)
 
@@ -231,13 +275,35 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		if err != nil {
 			return nil, fmt.Errorf("cooldown check: %w", err)
 		}
-		dec.Suppressed = muted || (!last.IsZero() && now.Sub(last) < alertCooldown)
+		lastCollection, err := d.st.LastSignalForCollection(ctx, key.Name, KindBuy)
+		if err != nil {
+			return nil, fmt.Errorf("collection cooldown check: %w", err)
+		}
+		dec.Suppressed = muted ||
+			(!last.IsZero() && now.Sub(last) < alertCooldown) ||
+			(!lastCollection.IsZero() && now.Sub(lastCollection) < collectionCooldown)
 
 		dec.AutoFails = d.autoGates(val, limits)
 		dec.Auto = len(dec.AutoFails) == 0
 	}
 
 	return dec, nil
+}
+
+// plural renders a Russian count with the right noun form. The card layer has
+// its own copy; a gate message that reads "1 лотов" undermines every other
+// number on the card.
+func plural(n int, one, few, many string) string {
+	word := many
+	if mod100 := n % 100; mod100 < 11 || mod100 > 14 {
+		switch n % 10 {
+		case 1:
+			word = one
+		case 2, 3, 4:
+			word = few
+		}
+	}
+	return fmt.Sprintf("%d %s", n, word)
 }
 
 func ownerID(fn func() int64) int64 {
@@ -307,6 +373,16 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	} else if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
 		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
 	}
+	// A percentage cannot tell a trade from a rounding error. Both bars have to
+	// be cleared: 5% of a 3-GRAM lot is seven hundredths of a GRAM, and a card
+	// for it costs more attention than the money is worth.
+	if g.MinNet > 0 && v.Net < g.MinNet {
+		fails = append(fails, fmt.Sprintf("чистыми всего %.2f GRAM, минимум %.2f — процент есть, денег нет", v.Net, g.MinNet))
+	}
+	if g.MaxExitDays > 0 && v.FastExpectedDays > g.MaxExitDays {
+		fails = append(fails, fmt.Sprintf("продавать %s — это склад, а не флип (лимит %.0fд)",
+			days(v.FastExpectedDays), g.MaxExitDays))
+	}
 	// No trait premium, cheaper offers already standing in front of us: this is
 	// an expensive listing, not a mispriced one.
 	if v.PricedAboveMarket {
@@ -338,10 +414,10 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	if d.Warm != nil && !d.Warm() {
 		fails = append(fails, "история сделок ещё прогревается")
 	}
-	if d.cfg.ShadowMode {
-		fails = append(fails, "включён shadow-режим")
+	if d.ShadowMode != nil && d.ShadowMode() {
+		fails = append(fails, "включён shadow-режим — только записываю, что купил бы (/autobuy)")
 	} else if d.CalibrationReady != nil && !d.CalibrationReady() {
-		fails = append(fails, "калибровка скоринга не набрала минимум выборки")
+		fails = append(fails, "калибровка скоринга не набрала выборку — можно снять в /autobuy")
 	}
 	if v.ScoreBreakdown.RiskAdjustedEdge < a.MinEdge {
 		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже порога автобая %.1f%%", v.ScoreBreakdown.RiskAdjustedEdge*100, a.MinEdge*100))

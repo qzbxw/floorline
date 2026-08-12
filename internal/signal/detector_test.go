@@ -416,6 +416,89 @@ func TestMuteSuppressesTheAlertNotTheEvaluation(t *testing.T) {
 	}
 }
 
+// seedSignal records a prior card for the same collection, as the batch and
+// cooldown checks read them back.
+func (h *harness) seedSignal(t *testing.T, giftID int64, model string, price float64, at time.Time) {
+	t.Helper()
+	_, err := h.st.InsertSignal(context.Background(), store.SignalRow{
+		TS: at, Kind: KindBuy, GiftID: giftID,
+		Key:   tonnel.ModelKey{Name: key.Name, Model: model},
+		Price: price, Exit: price * 1.1, Edge: .1,
+	})
+	if err != nil {
+		t.Fatalf("seed signal: %v", err)
+	}
+}
+
+// Production, 12 Aug, 22:21–22:31: seven Lol Pop cards in ten minutes. Every
+// one a different model — so no two shared the (collection, model) cooldown
+// key — and every one priced at exactly 3.3. That is one seller emptying a
+// collection, delivered as seven separate opportunities.
+//
+// It is not only noise. Several lots at one price is the absence of the
+// scarcity the whole trade rests on: whatever we buy, our buyer can have the
+// next one at the same number.
+func TestOneSellerDumpingACollectionIsNotSevenOpportunities(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 40, 40)
+	h.seedStat(t, 800, 12)
+	now := time.Now()
+
+	// The same collection, three other models, all at our price, minutes ago.
+	for i, model := range []string{"Lavender Ice", "Lychee Mint", "Wild Mango"} {
+		h.seedSignal(t, int64(500+i), model, 800, now.Add(-time.Duration(i+1)*time.Minute))
+	}
+
+	dec, err := h.det.Evaluate(ctx, gift(candidateID, 800), defaultLimits(), now)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if dec == nil {
+		t.Fatal("the listing was dropped instead of being judged")
+	}
+	if dec.BatchPeers != 3 {
+		t.Errorf("batch peers = %d, want the three lots already shown at this price", dec.BatchPeers)
+	}
+	if dec.Signal {
+		t.Error("a fourth lot from the same dump was still pushed as a signal")
+	}
+	if !containsSubstring(dec.SignalFails, "распродажа одного продавца") {
+		t.Errorf("the reason has to name the dump, got %v", dec.SignalFails)
+	}
+}
+
+// The collection cooldown is about the chat, not about the trade: a second
+// genuinely different model minutes after the first is still a real signal, it
+// just does not get its own notification.
+func TestASecondModelOfTheSameCollectionIsQuietButStillATrade(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 40, 40)
+	h.seedStat(t, 800, 12)
+	now := time.Now()
+
+	// One prior card, at a clearly different price so the batch rule stays out.
+	h.seedSignal(t, 501, "Lavender Ice", 400, now.Add(-2*time.Minute))
+
+	dec, err := h.det.Evaluate(ctx, gift(candidateID, 800), defaultLimits(), now)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if dec == nil || !dec.Signal {
+		t.Fatalf("a different model at a different price is a real signal: %+v", dec)
+	}
+	if dec.BatchPeers != 0 {
+		t.Errorf("batch peers = %d, want none — the prior card was at another price", dec.BatchPeers)
+	}
+	if !dec.Suppressed {
+		t.Error("a second card for the same collection within minutes must stay quiet")
+	}
+	if !dec.Auto {
+		t.Errorf("the cooldown is about noise, not trading; auto failures: %v", dec.AutoFails)
+	}
+}
+
 // Production, 12 Aug: a 53 GRAM Fine Pen was pushed as a signal while the
 // ticket cap was 5.5 and the wallet held 25.1. Nobody could act on it, in
 // either direction — that is not an opportunity, it is a 2am notification.

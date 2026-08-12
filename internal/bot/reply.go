@@ -3,6 +3,8 @@ package bot
 import (
 	"fmt"
 	"strconv"
+	"strings"
+	"unicode"
 )
 
 // Button is one inline keyboard button. A button either routes a callback
@@ -22,7 +24,14 @@ type Button struct {
 type Reply struct {
 	Text string
 	Rows [][]Button
+	// Preview lets Telegram unfurl the first link in the text. It is off by
+	// default because a preview under a data view is clutter, and on for signal
+	// cards because there the preview *is* the picture of the gift.
+	Preview bool
 }
+
+// WithPreview enables the link preview for this reply.
+func (r Reply) WithPreview() Reply { r.Preview = true; return r }
 
 // Text builds a plain reply. It takes the finished string rather than a format
 // so that vet does not mistake every caller for a printf wrapper.
@@ -56,6 +65,36 @@ func Link(label, url string) Button {
 // A manual trader wants to see the actual lot, not just our summary of it.
 func TonnelGiftURL(giftID int64) string {
 	return "https://t.me/tonnel_network_bot/gift?startapp=" + strconv.FormatInt(giftID, 10)
+}
+
+// NFTPreviewURL is the gift's canonical Telegram collectible link, which the
+// client unfurls into a picture of the actual item with its model, backdrop and
+// symbol.
+//
+// This is the only way to see the thing before buying it. The Tonnel deep link
+// cannot do it — a mini-app URL has nothing to unfurl — so a card built around
+// it asked the desk to judge a Black Mamba from a number, on a market where
+// half of what people pay for is how the gift looks.
+//
+// The slug is the collection name with everything but letters and digits
+// removed: "Vice Cream" #49968 becomes ViceCream-49968. Tonnel's API carries no
+// slug field, so this is derived rather than read. A collection whose real slug
+// differs simply produces a link that does not unfurl, which costs a picture
+// and nothing else.
+func NFTPreviewURL(collection string, giftNum int64) string {
+	if giftNum <= 0 {
+		return ""
+	}
+	var slug strings.Builder
+	for _, r := range collection {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			slug.WriteRune(r)
+		}
+	}
+	if slug.Len() == 0 {
+		return ""
+	}
+	return "https://t.me/nft/" + slug.String() + "-" + strconv.FormatInt(giftNum, 10)
 }
 
 func joinData(parts ...any) string {

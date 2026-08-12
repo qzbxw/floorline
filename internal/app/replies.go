@@ -249,9 +249,14 @@ func (a *App) ModelByRef(ctx context.Context, ref, view string) bot.Reply {
 }
 
 // Val prices one listing in full, including the gates it fails.
+//
+// The preview is on for the same reason it is on the card: this is usually
+// reached by pasting a share link, and the first thing worth knowing about a
+// gift is what it looks like.
 func (a *App) Val(ctx context.Context, giftID int64) bot.Reply {
 	return bot.Text(a.valText(ctx, giftID)).
-		WithRow(bot.Link("🔗 Открыть в Tonnel", bot.TonnelGiftURL(giftID)))
+		WithRow(bot.Link("🔗 Открыть в Tonnel", bot.TonnelGiftURL(giftID))).
+		WithPreview()
 }
 
 // ---- book ---------------------------------------------------------------
@@ -311,20 +316,120 @@ func (a *App) Relist(ctx context.Context, giftID int64) bot.Reply {
 
 // ---- auto-buy and settings ---------------------------------------------
 
-// Arm enables unattended buying.
-func (a *App) Arm(ctx context.Context) bot.Reply { return bot.Text(a.armText(ctx)) }
+// AutoPanel is the one screen that owns unattended trading: what is on, what is
+// blocking it, and a switch for each.
+//
+// Every button is a toggle labelled with the state it will produce, next to a
+// line saying what the state is now. The old menu offered four fixed buttons —
+// "Автобай вкл", "Автобай выкл", "Ресейл вкл", "Ресейл выкл" — none of which
+// showed which was in effect, so there was no way to tell a switch that had not
+// worked from one that had.
+func (a *App) AutoPanel(ctx context.Context) bot.Reply {
+	return a.autoPanel(ctx, a.autoPanelText(ctx))
+}
+
+func (a *App) autoPanel(ctx context.Context, text string) bot.Reply {
+	r := bot.Text(text)
+
+	if a.rm.Armed() {
+		r = r.WithRow(bot.Callback("⏹ Выключить покупку", cbRefresh, "disarm"))
+	} else {
+		r = r.WithRow(bot.Callback("▶️ Включить покупку", cbRefresh, "arm"))
+	}
+	if a.rm.ResellEnabled() {
+		r = r.WithRow(bot.Callback("⏹ Выключить ресейл", cbRefresh, "resell_off"))
+	} else {
+		r = r.WithRow(bot.Callback("▶️ Включить ресейл", cbRefresh, "resell_on"))
+	}
+	// The two that used to need a .env edit and a restart.
+	if a.rm.ShadowMode() {
+		r = r.WithRow(bot.Callback("🌗 Выйти из shadow — торговать вживую", cbRefresh, "shadow_off"))
+	} else {
+		r = r.WithRow(bot.Callback("🌑 Вернуть shadow — только записывать", cbRefresh, "shadow_on"))
+	}
+	if !a.calibrated(ctx) {
+		if a.rm.CalibrationWaived() {
+			r = r.WithRow(bot.Callback("🔒 Вернуть требование калибровки", cbRefresh, "calib_require"))
+		} else {
+			r = r.WithRow(bot.Callback("⚠️ Снять требование калибровки", cbRefresh, "calib_waive"))
+		}
+	}
+	return r.WithRow(
+		bot.Callback("📋 Лимиты", cbRefresh, "limits"),
+		bot.Callback("🔄 Обновить", cbRefresh, "autobuy"),
+	)
+}
+
+// Arm enables unattended buying. It answers with the whole panel, so the switch
+// and its effect are visible in one message instead of a claim of success
+// followed by silence.
+func (a *App) Arm(ctx context.Context) bot.Reply {
+	return a.autoPanel(ctx, a.armText(ctx))
+}
 
 // Disarm stops unattended buying.
-func (a *App) Disarm(ctx context.Context) bot.Reply { return bot.Text(a.disarmText(ctx)) }
+func (a *App) Disarm(ctx context.Context) bot.Reply {
+	return a.autoPanel(ctx, a.disarmText(ctx))
+}
+
+// SetShadow switches recording-only mode.
+func (a *App) SetShadow(ctx context.Context, on bool) bot.Reply {
+	return a.autoPanel(ctx, a.setShadowText(ctx, on))
+}
+
+// WaiveCalibration accepts, or reinstates, the scoring sample requirement.
+func (a *App) WaiveCalibration(ctx context.Context, on bool) bot.Reply {
+	return a.autoPanel(ctx, a.waiveCalibrationText(ctx, on))
+}
 
 // Scan sweeps the standing book for mispriced lots.
 func (a *App) Scan(ctx context.Context, collection string) bot.Reply {
 	return bot.Text(a.scanText(ctx, collection))
 }
 
+// Trade opens, refreshes or closes a trading session.
+//
+// The board is one message edited in place rather than a stream, which is the
+// whole point: sitting down to trade means watching a handful of pairs change,
+// not scrolling past the same pair five times.
+func (a *App) Trade(ctx context.Context, arg string) bot.Reply {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "off", "стоп", "выкл":
+		return bot.Text(a.closeTradeSession(ctx)).WithRow(bot.Callback("🏠 Меню", "m_menu", ""))
+	case "":
+		if a.loadSession(ctx).Active() {
+			return a.tradeBoard(ctx)
+		}
+		return a.tradeBoard(ctx, a.openTradeSession(ctx))
+	default:
+		return bot.Text("Формат: <code>/trade</code> — начать или обновить, <code>/trade off</code> — выйти.")
+	}
+}
+
+// tradeBoard attaches the session controls to a board rendered elsewhere.
+func (a *App) tradeBoard(ctx context.Context, text ...string) bot.Reply {
+	body := ""
+	if len(text) > 0 {
+		body = text[0]
+	} else {
+		body = a.sessionBoard(ctx)
+	}
+	return bot.Text(body).WithRow(
+		bot.Callback("🔄 Обновить", cbRefresh, "trade"),
+		bot.Callback("♻️ Пересобрать пары", cbRefresh, "trade_reset"),
+	).WithRow(
+		bot.Callback("⏹ Выйти из сессии", cbRefresh, "trade_off"),
+	)
+}
+
+// ResetSession picks the pairs again against the current market.
+func (a *App) ResetSession(ctx context.Context) bot.Reply {
+	return a.tradeBoard(ctx, a.openTradeSession(ctx))
+}
+
 // Resell shows or switches automatic selling.
 func (a *App) Resell(ctx context.Context, arg string) bot.Reply {
-	return bot.Text(a.resellText(ctx, arg))
+	return a.autoPanel(ctx, a.resellText(ctx, arg))
 }
 
 // LimitsText shows the limits and today's usage.

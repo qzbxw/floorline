@@ -29,6 +29,10 @@ type Backend interface {
 	// Scan sweeps the standing book rather than the arrival feed. An empty
 	// collection means the busiest slice of the whole market.
 	Scan(ctx context.Context, collection string) Reply
+	// Trade opens, refreshes or closes a trading session: a fixed shortlist of
+	// liquid pairs, with everything outside it silenced.
+	Trade(ctx context.Context, arg string) Reply
+	ResetSession(ctx context.Context) Reply
 
 	Positions(ctx context.Context) Reply
 	Portfolio(ctx context.Context) Reply
@@ -42,6 +46,11 @@ type Backend interface {
 
 	Arm(ctx context.Context) Reply
 	Disarm(ctx context.Context) Reply
+	// AutoPanel is the unattended-trading screen: every switch, plus the
+	// checklist of what is still blocking a purchase.
+	AutoPanel(ctx context.Context) Reply
+	SetShadow(ctx context.Context, on bool) Reply
+	WaiveCalibration(ctx context.Context, on bool) Reply
 	// Resell shows automatic selling with an empty argument, and switches it
 	// with "on" or "off".
 	Resell(ctx context.Context, arg string) Reply
@@ -153,7 +162,7 @@ func (b *Bot) Notify(text string) { b.send(Text(text)) }
 // The Buy button only opens a confirmation — a stray tap on a phone must not be
 // able to spend money on its own.
 func (b *Bot) NotifySignal(text string, signalID, giftID int64, price float64) {
-	b.send(Reply{Text: text}.
+	b.send(Reply{Text: text, Preview: true}.
 		WithRow(Callback(fmt.Sprintf("⚡️ Купить за %s", trimNum(price)), cbBuy, signalID)).
 		WithRow(
 			Link("🔗 Открыть в Tonnel", TonnelGiftURL(giftID)),
@@ -171,7 +180,7 @@ func (b *Bot) send(r Reply) {
 	}
 	chunks := splitMessage(r.Text)
 	for i, chunk := range chunks {
-		opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}
+		opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: !r.Preview}
 		// The keyboard belongs on the last chunk, next to where the eye ends up.
 		if i == len(chunks)-1 {
 			opts.ReplyMarkup = markup(r.Rows)
@@ -256,6 +265,10 @@ func (b *Bot) register() {
 		return b.back.Scan(ctx, strings.TrimSpace(c.Message().Payload))
 	}))
 
+	tb.Handle("/trade", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		return b.back.Trade(ctx, c.Message().Payload)
+	}))
+
 	tb.Handle("/pos", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Positions(ctx)
 	}))
@@ -322,6 +335,10 @@ func (b *Bot) register() {
 	}))
 	tb.Handle("/disarm", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Disarm(ctx)
+	}))
+	// The screen that answers "why has it not bought anything".
+	tb.Handle("/autobuy", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		return b.back.AutoPanel(ctx)
 	}))
 	tb.Handle("/resell", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Resell(ctx, c.Message().Payload)
@@ -499,20 +516,41 @@ func (b *Bot) registerCallbacks() {
 			r = back(b.back.BalanceText(ctx), cbPortfolio, "🔙 Портфель")
 		case "scan":
 			r = back(b.back.Scan(ctx, ""), cbMarket, "🔙 Рынок")
+		// The session board carries its own controls and is edited in place, so
+		// it gets no extra navigation row competing with them.
+		case "trade":
+			r = b.back.Trade(ctx, "")
+		case "trade_reset":
+			r = b.back.ResetSession(ctx)
+		case "trade_off":
+			r = back(b.back.Trade(ctx, "off"), cbMenu, "🏠 Меню")
 		case "gram":
 			r = back(b.back.Gram(ctx), cbMarket, "🔙 Рынок")
 		case "watchlist":
 			r = back(b.back.Watchlist(ctx), cbAlerts, "🔙 Алерты")
 		case "limits":
 			r = back(b.back.LimitsText(ctx), cbSettings, "🔙 Настройки")
+		// The auto-buy switches all answer with the whole panel, so the screen
+		// updates in place and the button that was just pressed comes back
+		// showing the state it produced.
+		case "autobuy":
+			r = back(b.back.AutoPanel(ctx), cbMenu, "🏠 Меню")
 		case "arm":
-			r = back(b.back.Arm(ctx), cbAuto, "🔙 Автобай")
+			r = back(b.back.Arm(ctx), cbMenu, "🏠 Меню")
 		case "disarm":
-			r = back(b.back.Disarm(ctx), cbAuto, "🔙 Автобай")
+			r = back(b.back.Disarm(ctx), cbMenu, "🏠 Меню")
 		case "resell_on":
-			r = back(b.back.Resell(ctx, "on"), cbAuto, "🔙 Автобай")
+			r = back(b.back.Resell(ctx, "on"), cbMenu, "🏠 Меню")
 		case "resell_off":
-			r = back(b.back.Resell(ctx, "off"), cbAuto, "🔙 Автобай")
+			r = back(b.back.Resell(ctx, "off"), cbMenu, "🏠 Меню")
+		case "shadow_on":
+			r = back(b.back.SetShadow(ctx, true), cbMenu, "🏠 Меню")
+		case "shadow_off":
+			r = back(b.back.SetShadow(ctx, false), cbMenu, "🏠 Меню")
+		case "calib_waive":
+			r = back(b.back.WaiveCalibration(ctx, true), cbMenu, "🏠 Меню")
+		case "calib_require":
+			r = back(b.back.WaiveCalibration(ctx, false), cbMenu, "🏠 Меню")
 		default:
 			return nil
 		}
@@ -575,7 +613,9 @@ func (b *Bot) registerCallbacks() {
 
 	tb.Handle(&tele.Btn{Unique: cbAuto}, func(c tele.Context) error {
 		_ = c.Respond(&tele.CallbackResponse{Text: "автобай"})
-		return b.editWith(c, autoMenu())
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return b.editWith(c, back(b.back.AutoPanel(ctx), cbMenu, "🏠 Меню"))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbHelp}, func(c tele.Context) error {
@@ -635,7 +675,7 @@ func (b *Bot) editWith(c tele.Context, r Reply) error {
 	if len(r.Text) > telegramMessageLimit {
 		return b.deliver(c, r)
 	}
-	opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}
+	opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: !r.Preview}
 	if m := markup(r.Rows); m != nil {
 		opts.ReplyMarkup = m
 	}
@@ -657,7 +697,7 @@ func (b *Bot) deliver(c tele.Context, r Reply) error {
 	}
 	chunks := splitMessage(r.Text)
 	for i, chunk := range chunks {
-		opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: true}
+		opts := &tele.SendOptions{ParseMode: tele.ModeHTML, DisableWebPagePreview: !r.Preview}
 		if i == len(chunks)-1 {
 			if m := markup(r.Rows); m != nil {
 				opts.ReplyMarkup = m

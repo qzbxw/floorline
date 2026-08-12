@@ -1117,6 +1117,40 @@ func (s *Store) LastSignalForModel(ctx context.Context, key tonnel.ModelKey, kin
 	return fromUnix(n), err
 }
 
+// LastSignalForCollection is the model cooldown one level up.
+//
+// Alert cooldown keyed on (collection, model) does not see a seller emptying a
+// whole collection: on 12 Aug seven Lol Pop cards arrived in ten minutes, every
+// one a different model and every one priced at 3.3, so no two shared a
+// cooldown key. From the chat's point of view that is one event.
+func (s *Store) LastSignalForCollection(ctx context.Context, name, kind string) (time.Time, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(ts),0) FROM signals WHERE name = ? AND kind = ?`,
+		name, kind).Scan(&n)
+	return fromUnix(n), err
+}
+
+// PeersAtPrice counts how many *other* gifts of the same collection were
+// signalled at essentially this price inside the window.
+//
+// Several lots of one collection appearing at one price is not several
+// opportunities. It is one seller, and it means the price has depth behind it:
+// whatever we buy, the next unit is available to our buyer at the same number.
+// Scarcity is the whole premise of the trade, and this is its absence.
+func (s *Store) PeersAtPrice(ctx context.Context, name, kind string, price, tolerance float64, since time.Time, excludeGiftID int64) (int, error) {
+	if price <= 0 {
+		return 0, nil
+	}
+	lo, hi := price*(1-tolerance), price*(1+tolerance)
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(DISTINCT gift_id) FROM signals
+WHERE name = ? AND kind = ? AND ts >= ? AND gift_id != ? AND price BETWEEN ? AND ?`,
+		name, kind, unix(since), excludeGiftID, lo, hi).Scan(&n)
+	return n, err
+}
+
 // SignalStats summarises detector output over a window, for /status.
 type SignalStats struct {
 	Total  int

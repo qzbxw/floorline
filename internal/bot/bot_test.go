@@ -182,7 +182,8 @@ func TestHelpDocumentsEveryTypedCommand(t *testing.T) {
 		"gram", "floor", "book", "hist", "val",
 		"pos", "portfolio", "advice", "history", "cost", "exit", "pnl", "balance", "relist",
 		"watch", "unwatch", "watchlist", "mute", "unmute",
-		"arm", "disarm", "limits", "status", "auth",
+		"arm", "disarm", "autobuy", "limits", "status", "auth",
+		"trade", "scan",
 	} {
 		if !strings.Contains(help, "/"+cmd) {
 			t.Errorf("command /%s has a handler but is not documented in /help", cmd)
@@ -198,9 +199,10 @@ func TestEveryMenuHasAWayBack(t *testing.T) {
 		"portfolio": portfolioMenu(),
 		"alerts":    alertsMenu(),
 		"settings":  settingsMenu(),
-		"auto":      autoMenu(),
-		"help":      helpMenuReply(),
-		"val":       marketActionMenu("val"),
+		// The auto-buy screen is built by the backend, not declared here, so it
+		// is covered by the backend's own navigation instead of this table.
+		"help": helpMenuReply(),
+		"val":  marketActionMenu("val"),
 	}
 	for name, m := range menus {
 		var found bool

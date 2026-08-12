@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -404,6 +405,11 @@ func (a *App) pnlText(ctx context.Context) string {
 
 	var realised, invested float64
 	var wins, losses, unknown int
+	// The dollar leg is reconstructed from the stored GRAM quotes rather than
+	// from a rate saved on each trade, so it covers every position already in
+	// the book instead of only the ones bought after this was written.
+	var realisedUSD, investedUSD float64
+	var fxKnown int
 	for _, p := range closed {
 		if p.BuyPrice <= 0 || p.SellPrice <= 0 {
 			unknown++
@@ -416,6 +422,13 @@ func (a *App) pnlText(ctx context.Context) string {
 			wins++
 		} else {
 			losses++
+		}
+		buyFX, okBuy, _ := a.st.GramQuoteAt(ctx, p.BoughtAt)
+		sellFX, okSell, _ := a.st.GramQuoteAt(ctx, p.SoldAt)
+		if okBuy && okSell && buyFX.USD > 0 && sellFX.USD > 0 {
+			realisedUSD += p.SellPrice*sellFX.USD - p.BuyPrice*buyFX.USD
+			investedUSD += p.BuyPrice * buyFX.USD
+			fxKnown++
 		}
 	}
 
@@ -457,6 +470,8 @@ func (a *App) pnlText(ctx context.Context) string {
 	}
 	fmt.Fprintf(&b, "\nИтого          <b>%s</b> GRAM\n", num(realised+unrealised))
 
+	b.WriteString(a.usdLeg(ctx, realised, realisedUSD, investedUSD, fxKnown, len(closed)-unknown))
+
 	if unknown > 0 || unmarked > 0 {
 		b.WriteString("\n<i>")
 		if unknown > 0 {
@@ -468,6 +483,44 @@ func (a *App) pnlText(ctx context.Context) string {
 		b.WriteString("Они выше не учтены.</i>\n")
 	}
 	fmt.Fprintf(&b, "\n<i>Открытые считаем по быстрому выходу из живого стакана; во входе уже сидит %.1f%% комиссии покупателя.</i>", a.cfg.TonnelFee*100)
+	return b.String()
+}
+
+// usdLeg reports the second profit-and-loss curve.
+//
+// Trading alpha and the money in your pocket are different numbers, and on this
+// market they routinely disagree: a hundred GRAM turned into a hundred and
+// fifteen is +15% of genuine edge, and if GRAM fell from $1.34 to $1.05 over
+// the same weeks it is $134 turned into $121. One curve says the bot works, the
+// other says the month lost money, and both are true. Reporting only the first
+// is how a losing quarter reads as a winning one.
+func (a *App) usdLeg(ctx context.Context, realised, realisedUSD, investedUSD float64, priced, total int) string {
+	if priced == 0 {
+		return "\n<i>Курс на моменты сделок неизвестен — долларовую кривую посчитать не из чего.</i>\n"
+	}
+	var b strings.Builder
+	b.WriteString("\n<b>В долларах</b> <i>(по курсу на моменты сделок)</i>\n")
+	fmt.Fprintf(&b, "Зафиксировано  <b>$%.2f</b>", realisedUSD)
+	if investedUSD > 0 {
+		fmt.Fprintf(&b, " · %+.1f%% на $%.2f вложенных", realisedUSD/investedUSD*100, investedUSD)
+	}
+	b.WriteString("\n")
+
+	// The gap between the two curves is the exchange rate's contribution, and
+	// it is the number worth reading: it says how much of the result was the
+	// bot and how much was the coin.
+	if cur, ok, _ := a.st.LatestGramQuote(ctx); ok && cur.USD > 0 {
+		if fx := realisedUSD - realised*cur.USD; math.Abs(fx) >= 0.01 {
+			verdict := "курс сработал в плюс"
+			if fx < 0 {
+				verdict = "курс съел часть прибыли"
+			}
+			fmt.Fprintf(&b, "Из них курс    <b>$%.2f</b> — %s\n", fx, verdict)
+		}
+	}
+	if priced < total {
+		fmt.Fprintf(&b, "<i>%d из %d сделок без котировки — в долларовую кривую не вошли.</i>\n", total-priced, total)
+	}
 	return b.String()
 }
 
@@ -522,24 +575,147 @@ func (a *App) relistText(ctx context.Context, giftID int64) string {
 		bot.Esc(p.Key.String()), num(price), num(p.BuyPrice), num(net), net/p.BuyPrice*100)
 }
 
+// blocker is one thing standing between the desk and an unattended purchase.
+type blocker struct {
+	// clear is true when this one is satisfied; warn marks a soft one that the
+	// operator may knowingly overrule.
+	clear, warn bool
+	name, state string
+}
+
+// autoBlockers is the honest answer to "why has this not bought anything".
+//
+// It exists because the answer used to be unobtainable. /arm reported success,
+// the bot then bought nothing, and the reason appeared as one line of small
+// print at the bottom of every card — "включён shadow-режим" — with nothing
+// saying what that was, why it was on, or how to change it. Two of the four
+// gates below were reachable only by editing .env and restarting.
+func (a *App) autoBlockers(ctx context.Context) []blocker {
+	l := a.rm.Limits()
+	out := make([]blocker, 0, 5)
+
+	switch {
+	case l.MaxTicket <= 0 || l.DailyBudget <= 0:
+		out = append(out, blocker{name: "лимиты", state: "не заданы — нужен max_ticket и daily_budget"})
+	default:
+		out = append(out, blocker{clear: true, name: "лимиты",
+			state: fmt.Sprintf("тикет %s · день %s", num(l.MaxTicket), num(l.DailyBudget))})
+	}
+
+	if a.rm.Armed() {
+		out = append(out, blocker{clear: true, name: "покупка", state: "включена"})
+	} else {
+		reason := "выключена"
+		if r := a.rm.LastReason(); r != "" {
+			reason += " — " + r
+		}
+		out = append(out, blocker{name: "покупка", state: reason})
+	}
+
+	if a.Warm() {
+		out = append(out, blocker{clear: true, name: "история", state: dur(a.Coverage()) + ", прогрета"})
+	} else {
+		out = append(out, blocker{name: "история", state: "ещё прогревается (" + dur(a.Coverage()) + ")"})
+	}
+
+	if a.rm.ShadowMode() {
+		out = append(out, blocker{name: "shadow-режим", state: "включён — только записываю, что купил бы"})
+	} else {
+		out = append(out, blocker{clear: true, name: "shadow-режим", state: "выключен"})
+	}
+
+	n, first, _ := a.st.CalibrationStats(ctx)
+	sample := fmt.Sprintf("%d/%d сигналов", n, a.cfg.CalibrationMinSignals)
+	if !first.IsZero() {
+		sample += fmt.Sprintf(" · %s из %dд", dur(time.Since(first)), a.cfg.CalibrationMinDays)
+	}
+	switch {
+	case a.calibrated(ctx):
+		out = append(out, blocker{clear: true, name: "калибровка", state: sample})
+	case a.rm.CalibrationWaived():
+		out = append(out, blocker{clear: true, warn: true, name: "калибровка",
+			state: sample + " — снята вручную, риск выше"})
+	default:
+		out = append(out, blocker{warn: true, name: "калибровка", state: sample})
+	}
+	return out
+}
+
+// autoPanelText renders the switches and the checklist together, because the
+// question "is it on" and the question "will it actually do anything" have had
+// different answers for two days.
+func (a *App) autoPanelText(ctx context.Context) string {
+	var b strings.Builder
+	b.WriteString("⚡️ <b>Автобай</b>\n\n")
+
+	blockers := a.autoBlockers(ctx)
+	blocking := 0
+	for _, bl := range blockers {
+		if !bl.clear {
+			blocking++
+		}
+	}
+	switch {
+	case blocking == 0:
+		b.WriteString("🟢 <b>Всё готово — покупает сам.</b>\n\n")
+	case a.rm.Armed():
+		fmt.Fprintf(&b, "🟡 <b>Включён, но не купит:</b> %s.\n\n",
+			plural(blocking, "барьер", "барьера", "барьеров"))
+	default:
+		b.WriteString("🔴 <b>Выключен.</b>\n\n")
+	}
+
+	for _, bl := range blockers {
+		mark := "🔴"
+		switch {
+		case bl.clear && bl.warn:
+			mark = "🟡"
+		case bl.clear:
+			mark = "✅"
+		case bl.warn:
+			mark = "🟡"
+		}
+		fmt.Fprintf(&b, "%s <b>%s</b> — %s\n", mark, bl.name, bot.Esc(bl.state))
+	}
+
+	resell := "🔴 ресейл выключен — покупает, но не выставляет"
+	if a.rm.ResellEnabled() {
+		resell = "🟢 ресейл включён — сам выставляет купленное"
+	}
+	b.WriteString("\n" + resell + "\n")
+	return b.String()
+}
+
 // Arm enables unattended buying.
 func (a *App) armText(ctx context.Context) string {
 	if err := a.rm.Arm(ctx); err != nil {
-		return "❌ " + bot.Esc(err.Error())
+		return "❌ " + bot.Esc(err.Error()) + "\n\n" + a.autoPanelText(ctx)
 	}
-	if !a.Warm() {
-		return "🟢 Автобай включён — но история сделок ещё прогревается, так что до готовности он ничего не купит.\n\n<pre>" +
-			bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>"
-	}
-	return "🟢 <b>Автобай включён.</b>\n\n<pre>" + bot.Esc(a.rm.Describe(ctx, time.Now())) + "</pre>"
+	return a.autoPanelText(ctx)
 }
 
 // Disarm stops unattended buying.
 func (a *App) disarmText(ctx context.Context) string {
 	if err := a.rm.Disarm(ctx, "выключен вручную"); err != nil {
+		return "❌ " + bot.Esc(err.Error()) + "\n\n" + a.autoPanelText(ctx)
+	}
+	return a.autoPanelText(ctx)
+}
+
+// setShadowText switches recording-only mode.
+func (a *App) setShadowText(ctx context.Context, on bool) string {
+	if err := a.rm.SetShadowMode(ctx, on); err != nil {
 		return "❌ " + bot.Esc(err.Error())
 	}
-	return "🔴 Автобай выключен."
+	return a.autoPanelText(ctx)
+}
+
+// waiveCalibrationText accepts, or reinstates, the scoring sample requirement.
+func (a *App) waiveCalibrationText(ctx context.Context, on bool) string {
+	if err := a.rm.SetCalibrationWaived(ctx, on); err != nil {
+		return "❌ " + bot.Esc(err.Error())
+	}
+	return a.autoPanelText(ctx)
 }
 
 // resellText shows or changes whether the bot may sell on its own.
@@ -553,20 +729,17 @@ func (a *App) resellText(ctx context.Context, arg string) string {
 		if err := a.rm.SetResell(ctx, true); err != nil {
 			return "❌ " + bot.Esc(err.Error())
 		}
-		return "🟢 <b>Ресейл включён.</b>\nПосле покупки бот сам выставляет лот и отвечает на андеркат."
 	case "off", "выкл", "0":
 		if err := a.rm.SetResell(ctx, false); err != nil {
 			return "❌ " + bot.Esc(err.Error())
 		}
-		return "🔴 <b>Ресейл выключен.</b>\nБот покупает, но не продаёт: после покупки подскажет цену, а выставишь сам через /relist."
 	case "":
-		if a.rm.ResellEnabled() {
-			return "🟢 <b>Ресейл включён</b> — бот сам выставляет купленное.\nВыключить: <code>/resell off</code>"
-		}
-		return "🔴 <b>Ресейл выключен</b> — бот покупает, но не продаёт.\nВключить: <code>/resell on</code>"
+		// Showing the panel is the answer: the switch and its current state
+		// belong in one place.
 	default:
 		return "Не понял. Ожидаю <code>/resell on</code> или <code>/resell off</code>."
 	}
+	return a.autoPanelText(ctx)
 }
 
 // LimitsText shows the limits and today's usage.

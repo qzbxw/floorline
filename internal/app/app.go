@@ -48,6 +48,9 @@ type App struct {
 	// nav holds short handles for keyboard buttons, because collection and
 	// model names do not fit in Telegram's 64-byte callback payload.
 	nav *navRefs
+	// trade is the active trading session, cached because the feed asks whether
+	// a listing is in scope for every row it sees.
+	trade sessionState
 
 	startedAt time.Time
 
@@ -131,13 +134,23 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		a.notify("🛑 <b>Автобай выключен</b>\n" + bot.Esc(reason))
 	}
 
+	// SHADOW_MODE is a first-run default, not a standing instruction: after the
+	// operator has switched it in the bot, the stored value is the answer.
+	if err := a.rm.SeedShadowMode(ctx, cfg.ShadowMode); err != nil {
+		st.Close()
+		return nil, err
+	}
+
 	a.det = signal.New(st, a.books, cfg)
 	a.det.OwnerID = a.api.UserID
 	a.det.Coverage = a.Coverage
 	a.det.Warm = a.Warm
+	a.det.ShadowMode = a.rm.ShadowMode
 	a.det.CalibrationReady = func() bool {
-		n, first, err := a.st.CalibrationStats(context.Background())
-		return err == nil && n >= cfg.CalibrationMinSignals && !first.IsZero() && time.Since(first) >= time.Duration(cfg.CalibrationMinDays)*24*time.Hour
+		if a.rm.CalibrationWaived() {
+			return true
+		}
+		return a.calibrated(context.Background())
 	}
 
 	a.ex = exec.New(a.api, st, a.books, a.rm, cfg)
@@ -323,6 +336,14 @@ func (a *App) Coverage() time.Duration {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.coverage
+}
+
+// calibrated reports whether enough signals have been recorded, over enough
+// days, to judge the scoring against outcomes.
+func (a *App) calibrated(ctx context.Context) bool {
+	n, first, err := a.st.CalibrationStats(ctx)
+	return err == nil && n >= a.cfg.CalibrationMinSignals && !first.IsZero() &&
+		time.Since(first) >= time.Duration(a.cfg.CalibrationMinDays)*24*time.Hour
 }
 
 // Warm reports whether there is enough history to trust for unattended buying.

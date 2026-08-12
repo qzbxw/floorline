@@ -25,6 +25,16 @@ const (
 	kvLimits = "risk.limits"
 	kvArmed  = "risk.armed"
 	kvResell = "risk.resell"
+	// Shadow mode and the calibration requirement are stored rather than read
+	// from the environment on every start. Both are decisions about whether the
+	// desk may spend money, which is what this package owns, and both were
+	// previously reachable only by editing .env and restarting — so an operator
+	// who had armed the bot still got "включён shadow-режим" in small print
+	// under every card, with nothing in the interface admitting why or offering
+	// to change it.
+	kvShadow       = "risk.shadow"
+	kvShadowSeeded = "risk.shadow_seeded"
+	kvCalibWaived  = "risk.calibration_waived"
 
 	// legacyMaxExitDays is the superseded default, kept so a stored copy of it
 	// can be told apart from a value the operator actually chose.
@@ -126,6 +136,8 @@ type Manager struct {
 	limits        Limits
 	armed         bool
 	resell        bool
+	shadow        bool
+	calibWaived   bool
 	disabledUntil time.Time
 	lastReason    string
 	failStreak    int
@@ -216,7 +228,82 @@ func New(ctx context.Context, st *store.Store) (*Manager, error) {
 		return nil, err
 	}
 	m.resell = resell == "1"
+
+	shadow, err := st.GetKV(ctx, kvShadow)
+	if err != nil {
+		return nil, err
+	}
+	m.shadow = shadow != "0"
+
+	waived, err := st.GetKV(ctx, kvCalibWaived)
+	if err != nil {
+		return nil, err
+	}
+	m.calibWaived = waived == "1"
 	return m, nil
+}
+
+// SeedShadowMode applies the configured default exactly once, on the first run
+// against a fresh database.
+//
+// After that the stored value wins. Without this the environment would silently
+// re-impose shadow mode on every restart, which is precisely the trap being
+// removed: the operator turns it off in the bot, the process restarts, and the
+// bot goes quiet again with no visible cause.
+func (m *Manager) SeedShadowMode(ctx context.Context, def bool) error {
+	seeded, err := m.st.GetKV(ctx, kvShadowSeeded)
+	if err != nil || seeded == "1" {
+		return err
+	}
+	if err := m.SetShadowMode(ctx, def); err != nil {
+		return err
+	}
+	return m.st.SetKV(ctx, kvShadowSeeded, "1")
+}
+
+// ShadowMode reports whether the desk records what it would have done instead
+// of doing it.
+func (m *Manager) ShadowMode() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.shadow
+}
+
+// SetShadowMode switches recording-only mode and persists the choice.
+func (m *Manager) SetShadowMode(ctx context.Context, on bool) error {
+	m.mu.Lock()
+	m.shadow = on
+	m.mu.Unlock()
+	return m.st.SetKV(ctx, kvShadow, boolKV(on))
+}
+
+// CalibrationWaived reports whether the operator has accepted trading before
+// the scoring sample is large enough.
+//
+// The requirement is a good default and a bad wall. It asks for two hundred
+// signals over a fortnight, which is a sensible amount of evidence — and while
+// it is unmet there is no way to tell a bot that is being careful from a bot
+// that is broken, because both do nothing. Making it waivable turns it into
+// what it should always have been: a warning the operator can read and overrule.
+func (m *Manager) CalibrationWaived() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.calibWaived
+}
+
+// SetCalibrationWaived records that decision.
+func (m *Manager) SetCalibrationWaived(ctx context.Context, on bool) error {
+	m.mu.Lock()
+	m.calibWaived = on
+	m.mu.Unlock()
+	return m.st.SetKV(ctx, kvCalibWaived, boolKV(on))
+}
+
+func boolKV(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
 }
 
 // ResellEnabled reports whether the bot may put gifts up for sale on its own.

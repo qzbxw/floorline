@@ -17,42 +17,167 @@ import (
 
 // renderCard builds the actionable signal message.
 //
-// Every section answers one question a trader would otherwise open three tabs
-// for: what am I paying, what do I realistically get out at, who is standing in
-// front of me, and what does the history say. The order matters — the verdict
-// and the money are at the top, the evidence below, the plumbing last — because
-// this arrives on a phone at 2am and gets three seconds of attention.
+// It is deliberately about half the length of what it replaces. The old card
+// printed every number the engine had — four exit rungs, two ask gaps, days of
+// supply, the four blend weights, an FX line — and the complaint about it was
+// not that any of it was wrong. It was that a card carrying thirty numbers
+// cannot be read, so the two that decide the trade get the same glance as the
+// twenty-eight that do not. Everything cut is still one tap away in /val, which
+// is the view for arguing with the engine rather than acting on it.
+//
+// The order is: what this is, what it pays, why that number, what could go
+// wrong, then the evidence. The first line is a link to the gift itself, which
+// Telegram unfurls into a picture — on this market the picture is half the
+// asset, and the desk was being asked to judge a Black Mamba from a price.
 func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string) string {
 	v := dec.Val
 	g := dec.Gift
 	var b strings.Builder
 
-	b.WriteString(titleBlock("⚡️", v, g))
-	b.WriteString("\n" + entryBlock(v))
-	b.WriteString("\n" + exitBlock(v))
-	b.WriteString("\n" + a.bookBlock(v))
-	if lines := a.crossMarketLines(ctx, v); len(lines) > 0 {
-		b.WriteString("\n🌐 <b>Другие площадки</b>\n")
-		for _, line := range lines {
-			b.WriteString(line + "\n")
+	if url := bot.NFTPreviewURL(v.Key.Name, g.GiftNum.Int()); url != "" {
+		fmt.Fprintf(&b, "<a href=\"%s\">🖼</a> ", url)
+	}
+	fmt.Fprintf(&b, "⚡️ <b>%s</b>\n<i>%s</i>\n\n",
+		bot.Esc(giftTitle(v.Key.Name, g.GiftNum.Int())), bot.Esc(v.Key.Model))
+
+	b.WriteString(headlineBlock(v))
+	b.WriteString("\n" + a.reasonBlock(ctx, v))
+	if risks := riskLines(v); len(risks) > 0 {
+		b.WriteString("\n")
+		for _, r := range risks {
+			b.WriteString("⚠️ " + r + "\n")
 		}
 	}
-	b.WriteString("\n" + a.historyBlock(v))
-	b.WriteString("\n" + traitBlock(v, g))
-	b.WriteString("\n" + mixLine(v))
-	if line := fxLine(v); line != "" {
-		b.WriteString(line)
+	b.WriteString("\n" + a.evidenceBlock(ctx, v, g))
+
+	if note != "" {
+		fmt.Fprintf(&b, "\n⛔️ <b>Только руками:</b> %s\n", bot.Esc(note))
+	}
+	fmt.Fprintf(&b, "\n<code>гифт %d</code>", g.GiftID.Int())
+	if dec.Age > 0 {
+		fmt.Fprintf(&b, " · <i>висит %s</i>", dur(dec.Age))
+	}
+	return b.String()
+}
+
+// giftTitle is the collection and number as one name.
+func giftTitle(collection string, giftNum int64) string {
+	if giftNum <= 0 {
+		return collection
+	}
+	return fmt.Sprintf("%s #%d", collection, giftNum)
+}
+
+// headlineBlock is the trade in two lines: the money, then how much the engine
+// believes itself.
+//
+// The old card gave equal billing to four exit rungs — liquidate, fast, fair,
+// patient. Only one of them is ever the decision, and printing the other three
+// beside it invited reading the most flattering as the plan. The fast exit is
+// the number this trade is judged on, so it is the only one here.
+func headlineBlock(v pricing.Valuation) string {
+	var b strings.Builder
+	arrow := "🟢"
+	switch {
+	case v.Edge <= 0:
+		arrow = "🔴"
+	case v.ScoreBreakdown.Total < 10:
+		arrow = "🟡"
+	}
+	fmt.Fprintf(&b, "%s <b>%s → %s</b> · <b>%s</b> · %s\n",
+		arrow, num(v.Cost), num(v.FastExit), pct(v.Edge), days(v.FastExpectedDays))
+	fmt.Fprintf(&b, "чистыми %s · скор %.0f/100 (%s) · данным веры %.0f%%\n",
+		num(v.Net), v.ScoreBreakdown.Total, scoreVerdict(v.ScoreBreakdown.Total), v.ScoreBreakdown.Quality*100)
+	return b.String()
+}
+
+// reasonBlock answers the one question the operator cannot check from a phone:
+// where did that exit price come from. A number without its reason is a number
+// nobody can disagree with, which is how a fast exit standing behind a queue
+// went unchallenged for weeks.
+func (a *App) reasonBlock(ctx context.Context, v pricing.Valuation) string {
+	why := v.ExitCapped
+	if why == "" {
+		why = fmt.Sprintf("стакан %.0f%% · история %.0f%% · площадки %.0f%%",
+			v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100)
+	}
+	return "📐 <b>Почему столько:</b> " + bot.Esc(why) + "\n"
+}
+
+// riskLines are the things that would make this trade go wrong, and nothing
+// else. A warning that fires on every card is not a warning.
+func riskLines(v pricing.Valuation) []string {
+	var out []string
+	if v.AppearanceUnpriced {
+		out = append(out, "считали по обычным экземплярам — по этим трейтам сравнить не с чем, реальная цена может быть выше")
+	}
+	if v.ExitInvented {
+		out = append(out, fmt.Sprintf("стакан и сделки разошлись на %.0f%% — цена выхода это середина между ними, а не факт", v.MarketDivergence*100))
+	} else if v.MarketDisagreement {
+		out = append(out, fmt.Sprintf("история и стакан разъехались на %.0f%%", v.MarketDivergence*100))
+	}
+	if v.DepthCapped || (v.HasCompetingAsk && v.LiveDepthCount < 2) {
+		out = append(out, fmt.Sprintf("дырявый стакан: %s → %s, живых цен подряд %d",
+			num(v.CompetingAsk), num(v.DepthPrice3), v.LiveDepthCount))
+	}
+	if v.AsksBelowEntry > 0 {
+		out = append(out, fmt.Sprintf("дешевле твоего входа стоит %s — рынок ниже нас",
+			plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков")))
+	} else if v.CompetitorsNear > 0 {
+		out = append(out, fmt.Sprintf("%s в 5%% над выходом — подрежут",
+			plural(v.CompetitorsNear, "продавец", "продавца", "продавцов")))
+	}
+	if v.Cross.Unreachable > 0 {
+		out = append(out, plural(v.Cross.Unreachable, "площадка не ответила", "площадки не ответили", "площадок не ответили")+" — сравнивать не с чем")
+	}
+	return out
+}
+
+// evidenceBlock is the market in four lines: the local queue, the other venues,
+// the tape, and the look. One line each, because the operator is deciding
+// whether to trust the headline, not recomputing it.
+func (a *App) evidenceBlock(ctx context.Context, v pricing.Valuation, g tonnel.Gift) string {
+	var b strings.Builder
+
+	if v.HasCompetingAsk {
+		fmt.Fprintf(&b, "📚 Tonnel: следующий %s · %s · саплай %d\n",
+			num(v.CompetingAsk), plural(v.ExternalAsks, "аск", "аска", "асков"), v.Supply)
+	} else {
+		fmt.Fprintf(&b, "📚 Tonnel: чужих асков нет · саплай %d\n", v.Supply)
 	}
 
-	b.WriteString("\n")
-	if note != "" {
-		fmt.Fprintf(&b, "⛔️ <b>Только руками:</b> %s\n", bot.Esc(note))
+	for _, line := range a.crossMarketLines(ctx, v) {
+		b.WriteString("🌐 " + line + "\n")
 	}
-	if dec.Age > 0 {
-		fmt.Fprintf(&b, "<i>лот висит %s</i> · ", dur(dec.Age))
+
+	// Trades and distinct gifts, both. One physical gift flipped repeatedly
+	// makes a tape look busy, and the gap between these two numbers is the only
+	// wash-trading signal the endpoint allows.
+	fmt.Fprintf(&b, "📊 %s · %s / %dд · медиана %s · %.2f в день · последняя %s\n",
+		plural(v.Liq.Prints, "сделка", "сделки", "сделок"),
+		plural(v.Liq.DistinctGifts, "гифт", "гифта", "гифтов"), a.cfg.LookbackDays,
+		num(v.Liq.Median), v.Liq.Velocity, ago(v.Liq.LastSale))
+
+	if bd := tonnel.BaseAttr(g.Backdrop); bd != "" {
+		fmt.Fprintf(&b, "🎨 %s · %s — %s\n",
+			bot.Esc(bd), bot.Esc(tonnel.BaseAttr(g.Symbol)), bot.Esc(premiumNote(v)))
 	}
-	fmt.Fprintf(&b, "<code>гифт %d</code>", g.GiftID.Int())
+	if len(v.Appearance.Reasons) > 0 {
+		fmt.Fprintf(&b, "✨ %s\n", bot.Esc(strings.Join(v.Appearance.Reasons, " · ")))
+	}
 	return b.String()
+}
+
+// premiumNote states what the trades say about these traits, in a few words.
+func premiumNote(v pricing.Valuation) string {
+	switch {
+	case v.Attribute.Valid && v.Attribute.ExactSamples >= pricing.MinAttributeSamples:
+		return fmt.Sprintf("премия %+.1f%% по %d сделкам", v.Attribute.Premium*100, v.Attribute.ExactSamples)
+	case v.Attribute.ExactSamples > 0:
+		return fmt.Sprintf("премии нет, всего %d точных сделок", v.Attribute.ExactSamples)
+	default:
+		return "премии нет, точных сделок не было"
+	}
 }
 
 // ---- shared card blocks -------------------------------------------------
@@ -61,11 +186,13 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 // drift into describing the same number two different ways.
 
 func titleBlock(icon string, v pricing.Valuation, g tonnel.Gift) string {
-	title := bot.Esc(v.Key.Name)
-	if n := g.GiftNum.Int(); n > 0 {
-		title += fmt.Sprintf(" #%d", n)
+	var b strings.Builder
+	if url := bot.NFTPreviewURL(v.Key.Name, g.GiftNum.Int()); url != "" {
+		fmt.Fprintf(&b, "<a href=\"%s\">🖼</a> ", url)
 	}
-	return fmt.Sprintf("%s <b>%s</b>\n<i>%s</i>\n", icon, title, bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
+	fmt.Fprintf(&b, "%s <b>%s</b>\n<i>%s</i>\n",
+		icon, bot.Esc(giftTitle(v.Key.Name, g.GiftNum.Int())), bot.Esc(attrWithRarity(v.Key.Model, v.Rarity)))
+	return b.String()
 }
 
 // entryBlock is the money going out. The listing price is not it — the referral

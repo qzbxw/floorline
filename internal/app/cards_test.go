@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"floorline/internal/bot"
 	"floorline/internal/config"
 	"floorline/internal/pricing"
 	"floorline/internal/signal"
@@ -21,7 +22,7 @@ func mambaCard(t *testing.T) (string, pricing.Valuation) {
 	book := &pricing.Book{Key: key, FetchedAt: time.Now(), Asks: []pricing.Ask{
 		{GiftID: 42, Price: 6}, {GiftID: 43, Price: 4.21}, {GiftID: 44, Price: 7.9}, {GiftID: 45, Price: 10.2},
 	}}
-	liq := pricing.Liquidity{Sales: 9, DistinctGifts: 9, Turnover: 1, Median: 3.846, Median7: 3.9,
+	liq := pricing.Liquidity{Prints: 9, Sales: 9, DistinctGifts: 9, Turnover: 1, Median: 3.846, Median7: 3.9,
 		Trend: 1.05, Velocity: .6, MADRatio: .15, LastSale: time.Now().Add(-2 * time.Hour)}
 	v := pricing.Evaluate(pricing.Input{
 		GiftID: 42, Key: key, Price: 6, Book: book, Liq: liq, Floor: 4.21, Supply: 13, Rarity: 1.4,
@@ -43,8 +44,8 @@ func mambaCard(t *testing.T) (string, pricing.Valuation) {
 func TestGappyBookCardWarnsInsteadOfTempting(t *testing.T) {
 	card, v := mambaCard(t)
 	for _, want := range []string{
-		"Дырявый стакан",
-		"Дешевле твоего входа стоит 6 чужих асков",
+		"дырявый стакан: 4.21 → 10.2",
+		"дешевле твоего входа стоит 6 чужих асков",
 	} {
 		if !strings.Contains(card, want) {
 			t.Errorf("card is missing %q:\n%s", want, card)
@@ -85,8 +86,8 @@ func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
 		t.Fatalf("fixture is wrong: three asks must sit below the %.3f entry, got %d",
 			v.Cost, v.AsksBelowEntry)
 	}
-	if strings.Contains(card, "Выходишь первым") {
-		t.Errorf("card calls us the best offer with %d asks under our entry:\n%s", v.AsksBelowEntry, card)
+	if strings.Contains(card, "подрежут") {
+		t.Errorf("card frames us as first in the queue with %d asks under our entry:\n%s", v.AsksBelowEntry, card)
 	}
 	if !strings.Contains(card, "рынок ниже нас") {
 		t.Errorf("card must say the market is cheaper than we paid:\n%s", card)
@@ -96,16 +97,57 @@ func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
 // Readability is a feature here: the operator reads these at 2am on a phone.
 func TestCardIsSectionedAndUsesRussianPlurals(t *testing.T) {
 	card, _ := mambaCard(t)
-	for _, want := range []string{"💵 <b>Вход", "🎯 <b>Выход</b>", "📚 <b>Стакан Tonnel</b>", "📊 <b>История 14д</b>", "⚖️ <b>Из чего цена</b>"} {
+	for _, want := range []string{"📐 <b>Почему столько:</b>", "📚 Tonnel:", "📊 ", "🎨 "} {
 		if !strings.Contains(card, want) {
 			t.Errorf("card has no %q section:\n%s", want, card)
 		}
 	}
-	if !strings.Contains(card, "всего 3 аска") {
+	if !strings.Contains(card, "3 аска") {
 		t.Errorf("wrong plural form for the ask count:\n%s", card)
 	}
 	if strings.Contains(card, "(-") || strings.Contains(card, " -1") {
 		t.Errorf("card mixes ASCII and typographic minus signs:\n%s", card)
+	}
+}
+
+// On this market half of what people pay for is how the gift looks, and the
+// only way to see it in Telegram is the collectible link, which the client
+// unfurls into a picture. The Tonnel deep link cannot do that.
+func TestCardLinksTheGiftSoTelegramShowsIt(t *testing.T) {
+	card, _ := mambaCard(t)
+	if !strings.Contains(card, `href="https://t.me/nft/PetSnake-150969"`) {
+		t.Errorf("card carries no collectible link to unfurl:\n%s", card)
+	}
+}
+
+// The complaint that started this: a card carrying thirty numbers cannot be
+// read, so the two that decide the trade get the same glance as the rest.
+//
+// The Mamba fixture is close to the worst case — two risk lines, an appearance
+// note and a manual-only footer all fire at once — so the bound is measured
+// there rather than on a clean card that would pass trivially.
+func TestCardStaysShortEnoughToRead(t *testing.T) {
+	card, _ := mambaCard(t)
+	if n := strings.Count(card, "\n"); n > 20 {
+		t.Errorf("card is %d lines; it replaced a 30-line one and has to stay readable:\n%s", n, card)
+	}
+}
+
+func TestNFTPreviewURLDerivesTheSlug(t *testing.T) {
+	for _, tc := range []struct {
+		collection string
+		num        int64
+		want       string
+	}{
+		{"Vice Cream", 49968, "https://t.me/nft/ViceCream-49968"},
+		{"Plush Pepe", 1, "https://t.me/nft/PlushPepe-1"},
+		{"Xmas Stocking", 224990, "https://t.me/nft/XmasStocking-224990"},
+		{"Pet Snake", 0, ""}, // no number, nothing to link to
+		{"", 42, ""},
+	} {
+		if got := bot.NFTPreviewURL(tc.collection, tc.num); got != tc.want {
+			t.Errorf("NFTPreviewURL(%q, %d) = %q, want %q", tc.collection, tc.num, got, tc.want)
+		}
 	}
 }
 

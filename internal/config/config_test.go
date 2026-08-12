@@ -64,10 +64,18 @@ func TestLoadDefaults(t *testing.T) {
 	if c.TonnelFee != 0.005 {
 		t.Errorf("TonnelFee = %v, want 0.005", c.TonnelFee)
 	}
-	if c.Sig.MinEdge != 0.01 || c.Sig.MinVelocity != .5 || c.Sig.MinSales != 6 {
-		t.Errorf("signal gates = %+v, want the micro-edge profile", c.Sig)
+	// The edge bars are deliberately well clear of break-even. They were set
+	// while the exit was overstated by roughly a factor of two, so 1% was
+	// admitting anything that was not an outright loss.
+	if c.Sig.MinEdge != 0.045 || c.Sig.MinVelocity != .5 || c.Sig.MinSales != 6 {
+		t.Errorf("signal gates = %+v, want the honest-edge profile", c.Sig)
 	}
-	if c.Auto.MinEdge != 0.03 || c.Auto.MinTurnover != 0.6 {
+	// A percentage alone cannot tell a trade from a rounding error, and a fast
+	// exit measured in weeks is a warehouse.
+	if c.Sig.MinNet != 0.25 || c.Sig.MaxExitDays != 4 {
+		t.Errorf("signal gates = %+v, want an absolute floor and a holding limit", c.Sig)
+	}
+	if c.Auto.MinEdge != 0.06 || c.Auto.MinTurnover != 0.6 {
 		t.Errorf("auto gates = %+v, want the strict profile", c.Auto)
 	}
 	if c.FeedInterval != 2*time.Second {
