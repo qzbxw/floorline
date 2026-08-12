@@ -20,6 +20,8 @@ import (
 // Backend is everything the bot can ask the application to do. Handlers render
 // nothing themselves — each method returns ready, HTML-safe output.
 type Backend interface {
+	// Home is the dashboard: live state above the main keyboard.
+	Home(ctx context.Context) Reply
 	Status(ctx context.Context) Reply
 	Gram(ctx context.Context) Reply
 	Floor(ctx context.Context, collection, model string) Reply
@@ -219,7 +221,7 @@ func markup(rows [][]Button) *tele.ReplyMarkup {
 func (b *Bot) register() {
 	tb := b.tb
 
-	tb.Handle("/start", b.reply(func(ctx context.Context, c tele.Context) Reply { return mainMenu() }))
+	tb.Handle("/start", b.reply(func(ctx context.Context, c tele.Context) Reply { return b.back.Home(ctx) }))
 	tb.Handle("/help", b.reply(func(ctx context.Context, c tele.Context) Reply { return helpMenuReply() }))
 
 	tb.Handle("/status", b.reply(func(ctx context.Context, c tele.Context) Reply {
@@ -505,15 +507,15 @@ func (b *Bot) registerCallbacks() {
 		var r Reply
 		switch strings.TrimSpace(c.Data()) {
 		case "pos":
-			r = back(b.back.Positions(ctx), cbPortfolio, "🔙 Портфель")
+			r = back(b.back.Positions(ctx), cbMenu, "")
 		case "status":
-			r = back(b.back.Status(ctx), cbPortfolio, "🔙 Портфель")
+			r = back(b.back.Status(ctx), cbMenu, "")
 		case "pnl":
-			r = back(b.back.PnL(ctx), cbPortfolio, "🔙 Портфель")
+			r = back(b.back.PnL(ctx), cbMenu, "")
 		case "portfolio":
-			r = back(b.back.Portfolio(ctx), cbPortfolio, "🔙 Портфель")
+			r = back(b.back.Portfolio(ctx), cbMenu, "")
 		case "balance":
-			r = back(b.back.BalanceText(ctx), cbPortfolio, "🔙 Портфель")
+			r = back(b.back.BalanceText(ctx), cbMenu, "")
 		case "scan":
 			r = back(b.back.Scan(ctx, ""), cbMarket, "🔙 Рынок")
 		// The session board carries its own controls and is edited in place, so
@@ -529,7 +531,7 @@ func (b *Bot) registerCallbacks() {
 		case "watchlist":
 			r = back(b.back.Watchlist(ctx), cbAlerts, "🔙 Алерты")
 		case "limits":
-			r = back(b.back.LimitsText(ctx), cbSettings, "🔙 Настройки")
+			r = back(b.back.LimitsText(ctx), cbMore, "🔙 Ещё")
 		// The auto-buy switches all answer with the whole panel, so the screen
 		// updates in place and the button that was just pressed comes back
 		// showing the state it produced.
@@ -569,46 +571,34 @@ func (b *Bot) registerCallbacks() {
 
 	// Menu navigation
 	tb.Handle(&tele.Btn{Unique: cbMenu}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "main menu"})
-		return b.editWith(c, mainMenu())
+		_ = c.Respond(&tele.CallbackResponse{Text: "домой"})
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return b.editWith(c, b.back.Home(ctx))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbMarket}, func(c tele.Context) error {
-		action := strings.TrimSpace(c.Data())
-		if action == "" {
-			_ = c.Respond(&tele.CallbackResponse{Text: "рынок"})
-			return b.editWith(c, marketMenu())
+		_ = c.Respond(&tele.CallbackResponse{Text: "рынок"})
+		if action := strings.TrimSpace(c.Data()); action != "" {
+			return b.editWith(c, howTo(action))
 		}
-		// Submenu for market actions (floor, book, hist, val)
-		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
-		return b.editWith(c, marketActionMenu(action))
-	})
-
-	tb.Handle(&tele.Btn{Unique: cbPortfolio}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "портфель"})
-		return b.editWith(c, portfolioMenu())
+		return b.editWith(c, marketMenu())
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbAlerts}, func(c tele.Context) error {
-		action := strings.TrimSpace(c.Data())
-		if action == "" {
-			_ = c.Respond(&tele.CallbackResponse{Text: "алерты"})
-			return b.editWith(c, alertsMenu())
-		}
-		// Submenu for alert actions (watch, mute)
-		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
-		return b.editWith(c, alertsActionMenu(action))
+		_ = c.Respond(&tele.CallbackResponse{Text: "алерты"})
+		return b.editWith(c, alertsMenu())
 	})
 
-	tb.Handle(&tele.Btn{Unique: cbSettings}, func(c tele.Context) error {
-		action := strings.TrimSpace(c.Data())
-		if action == "" {
-			_ = c.Respond(&tele.CallbackResponse{Text: "настройки"})
-			return b.editWith(c, settingsMenu())
-		}
-		// Submenu for settings actions (auth)
-		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
-		return b.editWith(c, settingsActionMenu(action))
+	tb.Handle(&tele.Btn{Unique: cbMore}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{Text: "ещё"})
+		return b.editWith(c, moreMenu())
+	})
+
+	// The screens that exist to show a command worth typing.
+	tb.Handle(&tele.Btn{Unique: cbHowTo}, func(c tele.Context) error {
+		_ = c.Respond(&tele.CallbackResponse{})
+		return b.editWith(c, howTo(strings.TrimSpace(c.Data())))
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbAuto}, func(c tele.Context) error {

@@ -64,6 +64,56 @@ func (n *navRefs) get(ref string) (tonnel.ModelKey, bool) {
 	return k, ok
 }
 
+// Home is the dashboard.
+//
+// It replaces a static greeting that said the same eight words every time. A
+// trading desk's home screen should answer the questions asked on opening it —
+// is it armed, is it really trading or only recording, how much can it spend,
+// what is open, is a session running — and none of those were reachable without
+// at least one more tap.
+func (a *App) Home(ctx context.Context) bot.Reply {
+	var b strings.Builder
+	b.WriteString("⚡️ <b>Floorline</b>\n\n")
+
+	// The switches, in the order they can bite: armed but shadowed is the state
+	// that looks like trading and is not.
+	switch {
+	case !a.rm.Armed():
+		b.WriteString("🔴 <b>автобай выключен</b>")
+	case a.rm.ShadowMode():
+		b.WriteString("🌑 <b>shadow</b> — считает, но не покупает")
+	default:
+		b.WriteString("🟢 <b>торгует сам</b>")
+	}
+	if a.rm.ResellEnabled() {
+		b.WriteString(" · ♻️ ресейл")
+	}
+	b.WriteString("\n")
+
+	if bal, ok := a.rm.Balance(); ok {
+		fmt.Fprintf(&b, "💰 %s GRAM", num(bal))
+	} else {
+		b.WriteString("💰 баланс неизвестен")
+	}
+	if n, err := a.st.CountOpenPositions(ctx); err == nil && n > 0 {
+		fmt.Fprintf(&b, " · 📍 %s", plural(n, "лот", "лота", "лотов"))
+	}
+	b.WriteString("\n")
+
+	if s := a.loadSession(ctx); s.Active() {
+		fmt.Fprintf(&b, "⚔️ сессия %s · %s\n", dur(time.Since(s.StartedAt)), plural(len(s.Pairs), "пара", "пары", "пар"))
+	}
+	if !a.Warm() {
+		fmt.Fprintf(&b, "⏳ история прогревается — %s из %dд\n", dur(a.Coverage()), a.cfg.LookbackDays)
+	}
+
+	r := bot.Text(b.String())
+	for _, row := range bot.HomeRows() {
+		r = r.WithRow(row...)
+	}
+	return r
+}
+
 // ---- market views -------------------------------------------------------
 
 // Status reports the health of every moving part.
@@ -261,7 +311,12 @@ func (a *App) Val(ctx context.Context, giftID int64) bot.Reply {
 
 // ---- book ---------------------------------------------------------------
 
-// Positions lists open inventory, each row carrying its own Relist button.
+// Positions lists open inventory with a reprice button for each.
+//
+// The buttons used to be one position per row plus a link button beside it,
+// which for eight positions is nine rows of keyboard under the text — more
+// screen than the positions themselves. The link now lives in the text, where
+// the model name can carry it, and the buttons pack two to a row.
 func (a *App) Positions(ctx context.Context) bot.Reply {
 	r := bot.Text(a.portfolioText(ctx))
 
@@ -269,17 +324,22 @@ func (a *App) Positions(ctx context.Context) bot.Reply {
 	if err != nil || len(positions) == 0 {
 		return r
 	}
+	var line []bot.Button
 	for i, p := range positions {
 		if i >= 8 {
 			break // a keyboard longer than this is unusable on a phone
 		}
-		label := fmt.Sprintf("♻️ Переставить %s", truncate(p.Key.Model, 14))
-		r = r.WithRow(
-			bot.Callback(label, cbRelist, p.GiftID),
-			bot.Link("🔗", bot.TonnelGiftURL(p.GiftID)),
-		)
+		line = append(line, bot.Callback("♻️ "+truncate(p.Key.Model, 12), cbRelist, p.GiftID))
+		if len(line) == 2 {
+			r = r.WithRow(line...)
+			line = nil
+		}
 	}
-	return r.WithRow(bot.Callback("🔄 Обновить", cbRefresh, "pos"))
+	r = r.WithRow(line...)
+	return r.WithRow(
+		bot.Callback("🔄 Обновить", cbRefresh, "pos"),
+		bot.Callback("📊 Обзор", cbRefresh, "portfolio"),
+	)
 }
 
 func (a *App) Portfolio(ctx context.Context) bot.Reply {
@@ -329,33 +389,33 @@ func (a *App) AutoPanel(ctx context.Context) bot.Reply {
 }
 
 func (a *App) autoPanel(ctx context.Context, text string) bot.Reply {
-	r := bot.Text(text)
-
+	// Each toggle is labelled with the state it will produce, and the checklist
+	// above says what the state is now. Two to a row: these are four switches,
+	// not four sections.
+	buy := bot.Callback("▶️ Покупка", cbRefresh, "arm")
 	if a.rm.Armed() {
-		r = r.WithRow(bot.Callback("⏹ Выключить покупку", cbRefresh, "disarm"))
-	} else {
-		r = r.WithRow(bot.Callback("▶️ Включить покупку", cbRefresh, "arm"))
+		buy = bot.Callback("⏹ Покупка", cbRefresh, "disarm")
 	}
+	resell := bot.Callback("▶️ Ресейл", cbRefresh, "resell_on")
 	if a.rm.ResellEnabled() {
-		r = r.WithRow(bot.Callback("⏹ Выключить ресейл", cbRefresh, "resell_off"))
-	} else {
-		r = r.WithRow(bot.Callback("▶️ Включить ресейл", cbRefresh, "resell_on"))
+		resell = bot.Callback("⏹ Ресейл", cbRefresh, "resell_off")
 	}
 	// The two that used to need a .env edit and a restart.
+	shadow := bot.Callback("🌑 Вкл shadow", cbRefresh, "shadow_on")
 	if a.rm.ShadowMode() {
-		r = r.WithRow(bot.Callback("🌗 Выйти из shadow — торговать вживую", cbRefresh, "shadow_off"))
-	} else {
-		r = r.WithRow(bot.Callback("🌑 Вернуть shadow — только записывать", cbRefresh, "shadow_on"))
+		shadow = bot.Callback("🌗 Выйти из shadow", cbRefresh, "shadow_off")
 	}
+
+	r := bot.Text(text).WithRow(buy, resell).WithRow(shadow)
 	if !a.calibrated(ctx) {
 		if a.rm.CalibrationWaived() {
-			r = r.WithRow(bot.Callback("🔒 Вернуть требование калибровки", cbRefresh, "calib_require"))
+			r = r.WithRow(bot.Callback("🔒 Вернуть калибровку", cbRefresh, "calib_require"))
 		} else {
-			r = r.WithRow(bot.Callback("⚠️ Снять требование калибровки", cbRefresh, "calib_waive"))
+			r = r.WithRow(bot.Callback("⚠️ Снять калибровку", cbRefresh, "calib_waive"))
 		}
 	}
 	return r.WithRow(
-		bot.Callback("📋 Лимиты", cbRefresh, "limits"),
+		bot.Callback("💰 Лимиты", cbRefresh, "limits"),
 		bot.Callback("🔄 Обновить", cbRefresh, "autobuy"),
 	)
 }

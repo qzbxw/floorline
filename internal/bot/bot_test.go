@@ -195,20 +195,22 @@ func TestHelpDocumentsEveryTypedCommand(t *testing.T) {
 // /start is the dead end this keyboard exists to avoid.
 func TestEveryMenuHasAWayBack(t *testing.T) {
 	menus := map[string]Reply{
-		"market":    marketMenu(),
-		"portfolio": portfolioMenu(),
-		"alerts":    alertsMenu(),
-		"settings":  settingsMenu(),
+		"market": marketMenu(),
+		"alerts": alertsMenu(),
+		"more":   moreMenu(),
+		"help":   helpMenuReply(),
 		// The auto-buy screen is built by the backend, not declared here, so it
 		// is covered by the backend's own navigation instead of this table.
-		"help": helpMenuReply(),
-		"val":  marketActionMenu("val"),
+		"howto/val":   howTo("val"),
+		"howto/watch": howTo("watch"),
+		"howto/auth":  howTo("auth"),
 	}
 	for name, m := range menus {
 		var found bool
 		for _, row := range m.Rows {
 			for _, btn := range row {
-				if btn.Unique == cbMenu || btn.Unique == cbMarket || btn.Unique == cbSettings || btn.Unique == cbAlerts {
+				switch btn.Unique {
+				case cbMenu, cbMarket, cbMore, cbAlerts:
 					found = true
 				}
 			}
@@ -219,11 +221,46 @@ func TestEveryMenuHasAWayBack(t *testing.T) {
 	}
 }
 
+// A column of one-button rows is a keyboard the operator has to scroll past to
+// reach the message it belongs to. Everything declared here packs into rows.
+func TestMenusAreGridsNotColumns(t *testing.T) {
+	menus := map[string]Reply{
+		"market": marketMenu(),
+		"alerts": alertsMenu(),
+		"more":   moreMenu(),
+	}
+	for name, m := range menus {
+		if len(m.Rows) > 3 {
+			t.Errorf("menu %q is %d rows tall", name, len(m.Rows))
+		}
+		for i, row := range m.Rows {
+			// The last row is the lone way home; every other one carries at
+			// least two buttons.
+			if len(row) < 2 && i != len(m.Rows)-1 {
+				t.Errorf("menu %q row %d has %d button(s) — pack the grid", name, i, len(row))
+			}
+			for _, btn := range row {
+				if n := len([]rune(btn.Label)); n > 12 {
+					t.Errorf("menu %q label %q is %d runes; three of these do not fit a phone", name, btn.Label, n)
+				}
+			}
+		}
+	}
+	if n := len(homeKeyboard()); n != 3 {
+		t.Errorf("home keyboard is %d rows, want a 3x3 grid", n)
+	}
+	for i, row := range homeKeyboard() {
+		if len(row) != 3 {
+			t.Errorf("home row %d has %d buttons, want 3", i, len(row))
+		}
+	}
+}
+
 // A backend view carries its own actions but no navigation, so back() is what
 // keeps it from becoming a dead end.
 func TestBackAddsNavigationWithoutLosingActions(t *testing.T) {
 	view := Text("positions").WithRow(Callback("♻️ Переставить", "fl_relist", int64(7)))
-	got := back(view, cbPortfolio, "🔙 Портфель")
+	got := back(view, cbMarket, "🔙 Рынок")
 
 	if len(got.Rows) != 2 {
 		t.Fatalf("rows = %d, want the action row plus a nav row", len(got.Rows))
@@ -231,9 +268,9 @@ func TestBackAddsNavigationWithoutLosingActions(t *testing.T) {
 	if got.Rows[0][0].Unique != "fl_relist" {
 		t.Error("the view's own action button must survive")
 	}
-	nav := got.Rows[1]
-	if nav[0].Unique != cbPortfolio || nav[1].Unique != cbMenu {
-		t.Errorf("nav row = %+v, want back-to-section then home", nav)
+	navRow := got.Rows[1]
+	if navRow[0].Unique != cbMarket || navRow[1].Unique != cbMenu {
+		t.Errorf("nav row = %+v, want back-to-section then home", navRow)
 	}
 }
 

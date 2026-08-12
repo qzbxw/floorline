@@ -1,227 +1,194 @@
 package bot
 
-// Menu callback identifiers
+// The keyboards.
+//
+// Two rules shape all of them.
+//
+// First, width. Telegram lays inline buttons out in rows, and a keyboard of
+// one-button rows becomes a column the operator has to scroll past to reach the
+// message above it — which on a phone is the message they are trying to read.
+// Three short buttons in a row occupy the same height as one long one, so
+// labels are kept to roughly ten characters and rows are filled.
+//
+// Second, depth. Every tap that only leads to more taps is a tap that did
+// nothing. The submenus that existed to hold two entries are gone; what is left
+// either shows data or switches something.
 const (
-	cbMenu      = "m_menu"      // main menu
-	cbMarket    = "m_market"    // market submenu
-	cbPortfolio = "m_portfolio" // portfolio submenu
-	cbAlerts    = "m_alerts"    // alerts/watch submenu
-	cbSettings  = "m_settings"  // settings submenu
-	cbAuto      = "m_auto"      // auto-buy settings
-	cbHelp      = "m_help"      // help menu
-	cbPick      = "m_pick"      // collection picker for a drill-down view
+	cbMenu   = "m_menu"   // home dashboard
+	cbMarket = "m_market" // market tools
+	cbAlerts = "m_alerts" // alerts and watchlist
+	cbMore   = "m_more"   // limits, session, status, help
+	cbAuto   = "m_auto"   // auto-buy panel (built by the backend)
+	cbHelp   = "m_help"   // command reference
+	cbPick   = "m_pick"   // collection picker for a drill-down view
+	cbHowTo  = "m_howto"  // the few screens that explain a typed command
 )
 
-// back appends a navigation row to a Reply built by the backend.
-//
-// Backend views carry their own action buttons but know nothing about the menu
-// they were opened from, so without this every data screen is a dead end that
-// can only be escaped by typing /start again.
-func back(r Reply, target, label string) Reply {
-	return backWith(r, target, "", label)
-}
-
-// backWith is back for targets that need a payload, such as the collection
-// picker, which must be told which view to return to.
-func backWith(r Reply, target, data, label string) Reply {
+// nav is the trailing row every data view gets: one step back and one step
+// home. It is a single row rather than two so a list of positions does not end
+// in more navigation than content.
+func nav(r Reply, target, data, label string) Reply {
 	if r.Empty() {
 		return r
 	}
-	return r.WithRow(Callback(label, target, data), Callback("🏠 Меню", cbMenu, ""))
+	if target == "" || target == cbMenu {
+		return r.WithRow(Callback("🏠 Домой", cbMenu, ""))
+	}
+	return r.WithRow(Callback(label, target, data), Callback("🏠 Домой", cbMenu, ""))
 }
 
-// mainMenu is the dashboard.
+// back is nav for targets that carry no payload.
+func back(r Reply, target, label string) Reply { return nav(r, target, "", label) }
+
+// backWith is nav for targets that need one, such as the collection picker.
+func backWith(r Reply, target, data, label string) Reply { return nav(r, target, data, label) }
+
+// HomeRows exposes the dashboard grid to the backend, which owns the text above
+// it. The keyboard stays in this package so every screen's navigation is
+// declared in one place.
+func HomeRows() [][]Button { return homeKeyboard() }
+
+// homeKeyboard is the dashboard's grid.
 //
-// The things done many times a day are on it directly. Auto-buy used to sit two
-// taps down, behind "Настройки", which is the wrong shape for the switch the
-// operator checks most often and the one most likely to be silently off.
-func mainMenu() Reply {
-	return Reply{
-		Text: "⚙️ <b>Floorline</b> — Tonnel трейдинг\n\n" +
-			"🎯 Давай торговать:",
-		Rows: [][]Button{
-			{Callback("⚔️ Сессия торговли", cbRefresh, "trade"), Callback("🔭 Скан", cbRefresh, "scan")},
-			{Callback("📍 Позиции", cbRefresh, "pos"), Callback("💰 P&L", cbRefresh, "pnl")},
-			{Callback("⚡️ Автобай", cbAuto, ""), Callback("📊 Рынок", cbMarket, "")},
-			{Callback("💼 Портфель", cbPortfolio, ""), Callback("⏰ Алерты", cbAlerts, "")},
-			{Callback("⚙️ Настройки", cbSettings, ""), Callback("📚 Справка", cbHelp, "")},
-		},
+// The order is by how often each is used, not by category: a session, a scan
+// and the open positions are the working day; limits and help are not. The text
+// above it is built from live state, because a home screen that says the same
+// thing every time is a splash screen.
+func homeKeyboard() [][]Button {
+	return [][]Button{
+		{Callback("⚔️ Сессия", cbRefresh, "trade"), Callback("🔭 Скан", cbRefresh, "scan"), Callback("📍 Лоты", cbRefresh, "pos")},
+		{Callback("⚡️ Автобай", cbAuto, ""), Callback("💰 PnL", cbRefresh, "pnl"), Callback("📊 Рынок", cbMarket, "")},
+		{Callback("⏰ Алерты", cbAlerts, ""), Callback("⚙️ Ещё", cbMore, ""), Callback("📚 Помощь", cbHelp, "")},
 	}
 }
 
-// marketMenu returns market analysis options
+// marketMenu is the four things that need a collection or a gift id chosen
+// before they can show anything.
 func marketMenu() Reply {
 	return Reply{
-		Text: "📊 <b>Анализ рынка</b>\n\n" +
-			"Что хочешь посмотреть?",
+		Text: "📊 <b>Рынок</b>",
 		Rows: [][]Button{
-			{Callback("🔭 Скан рынка", cbRefresh, "scan")},
-			{Callback("💹 GRAM/USDT", cbRefresh, "gram")},
-			{Callback("📈 Флор", cbPick, "floor"), Callback("📖 Стакан", cbPick, "book")},
-			{Callback("🕒 Сделки", cbPick, "hist"), Callback("💰 Оценка лота", cbMarket, "val")},
-			{Callback("🔙 Назад", cbMenu, "")},
+			{Callback("📈 Флор", cbPick, "floor"), Callback("📖 Стакан", cbPick, "book"), Callback("🕒 Сделки", cbPick, "hist")},
+			{Callback("💹 GRAM", cbRefresh, "gram"), Callback("🔭 Скан", cbRefresh, "scan"), Callback("💰 Оценка", cbMarket, "val")},
+			{Callback("🏠 Домой", cbMenu, "")},
 		},
 	}
 }
 
-// portfolioMenu returns portfolio options
-func portfolioMenu() Reply {
-	return Reply{
-		Text: "💼 <b>Портфель</b>\n\n" +
-			"Смотри свои позиции и прибыль:",
-		Rows: [][]Button{
-			{Callback("📍 Позиции", cbRefresh, "pos")},
-			{Callback("📊 Обзор", cbRefresh, "portfolio")},
-			{Callback("💰 P&L", cbRefresh, "pnl")},
-			{Callback("💵 Баланс", cbRefresh, "balance")},
-			{Callback("🔄 Статус", cbRefresh, "status")},
-			{Callback("🔙 Назад", cbMenu, "")},
-		},
-	}
-}
-
-// alertsMenu returns alert/watchlist options
+// alertsMenu is the watchlist and the mutes.
 func alertsMenu() Reply {
 	return Reply{
-		Text: "⏰ <b>Алерты</b>\n\n" +
-			"Следи за интересным:",
+		Text: "⏰ <b>Алерты</b>\n\nПодписки на модели и тишина по коллекциям.",
 		Rows: [][]Button{
-			{Callback("👁️ Мой список", cbRefresh, "watchlist")},
-			{Callback("📌 Подписаться", cbAlerts, "watch")},
-			{Callback("🔕 Отключить звук", cbAlerts, "mute")},
-			{Callback("🔙 Назад", cbMenu, "")},
+			{Callback("👁 Подписки", cbRefresh, "watchlist"), Callback("📌 Добавить", cbHowTo, "watch")},
+			{Callback("🔕 Заглушить", cbHowTo, "mute"), Callback("🏠 Домой", cbMenu, "")},
 		},
 	}
 }
 
-// alertsActionMenu returns instruction for alerts
-func alertsActionMenu(action string) Reply {
-	texts := map[string]string{
-		"watch": "📌 <b>Подписаться на коллекцию</b>\n\n" +
-			"Введи: <code>/watch Коллекция / Модель [цена]</code>\n\n" +
-			"Примеры:\n" +
+// moreMenu holds what is touched rarely: money limits, the session credential,
+// process health and the command reference.
+func moreMenu() Reply {
+	return Reply{
+		Text: "⚙️ <b>Ещё</b>",
+		Rows: [][]Button{
+			{Callback("💰 Лимиты", cbRefresh, "limits"), Callback("🔄 Статус", cbRefresh, "status"), Callback("💵 Баланс", cbRefresh, "balance")},
+			{Callback("📊 Обзор", cbRefresh, "portfolio"), Callback("🔐 Сессия", cbHowTo, "auth"), Callback("📚 Помощь", cbHelp, "")},
+			{Callback("🏠 Домой", cbMenu, "")},
+		},
+	}
+}
+
+// howTo covers the handful of actions that genuinely need something typed: a
+// collection name with a slash in it, a gift id, a credential. Each screen is
+// the shortest thing that gets the operator to a working command.
+func howTo(action string) Reply {
+	var text, backTo string
+	switch action {
+	case "watch":
+		backTo = cbAlerts
+		text = "📌 <b>Подписаться</b>\n\n" +
 			"<code>/watch Plush Pepe / Pink Diamond</code>\n" +
-			"<code>/watch Plush Pepe / Pink Diamond 50</code> — до цены 50 USDT",
-		"mute": "🔕 <b>Отключить звук</b>\n\n" +
-			"Введи: <code>/mute Коллекция [/ Модель] [часы]</code>\n\n" +
-			"Примеры:\n" +
-			"<code>/mute Plush</code> — 1 час\n" +
-			"<code>/mute Plush Pepe / Pink Diamond 4</code> — 4 часа",
-	}
-	text := texts[action]
-	if text == "" {
-		text = "Введи команду"
-	}
-	return Reply{
-		Text: text,
-		Rows: [][]Button{
-			{Callback("🔙 Назад", cbAlerts, "")},
-		},
-	}
-}
-
-// settingsMenu returns settings/configuration options
-func settingsMenu() Reply {
-	return Reply{
-		Text: "⚙️ <b>Настройки</b>\n\n" +
-			"Настрой под себя:",
-		Rows: [][]Button{
-			{Callback("⚡️ Автобай и ресейл", cbAuto, "")},
-			{Callback("💰 Лимиты", cbRefresh, "limits")},
-			{Callback("🔐 Сессия", cbSettings, "auth")},
-			{Callback("🔙 Назад", cbMenu, "")},
-		},
-	}
-}
-
-// settingsActionMenu returns instruction for settings
-func settingsActionMenu(action string) Reply {
-	texts := map[string]string{
-		"auth": "🔐 <b>Обновить сессию Tonnel</b>\n\n" +
-			"Сессия протухла? Берёшь новую initData из Tonnel мини-апп:\n\n" +
-			"DevTools → Console → выполни:\n" +
+			"<code>/watch Plush Pepe / Pink Diamond 50</code> — только дешевле 50\n\n" +
+			"<i>Слеш обязателен: и коллекция, и модель бывают из двух слов.</i>"
+	case "mute":
+		backTo = cbAlerts
+		text = "🔕 <b>Заглушить</b>\n\n" +
+			"<code>/mute Plush Pepe</code> — на час\n" +
+			"<code>/mute Plush Pepe 4</code> — на четыре\n" +
+			"<code>/mute Plush Pepe / Pink Diamond 4</code> — одну модель\n\n" +
+			"Вернуть звук: <code>/unmute Plush Pepe</code>"
+	case "val":
+		backTo = cbMarket
+		text = "💰 <b>Оценка лота</b>\n\n" +
+			"Проще всего — <b>Share</b> на гифте в мини-аппе Tonnel и кинуть ссылку сюда. " +
+			"Просто сообщением, подпись не мешает.\n\n" +
+			"Или руками: <code>/val 10368454</code>."
+	case "auth":
+		backTo = cbMore
+		text = "🔐 <b>Сессия Tonnel</b>\n\n" +
+			"Открой мини-апп с DevTools и в консоли выполни:\n" +
 			"<code>copy(Telegram.WebApp.initData)</code>\n\n" +
-			"Потом отправь:\n" +
-			"<code>/auth &lt;authData&gt;</code>\n\n" +
-			"<i>Сообщение удалится автоматом (в истории чата не останется).</i>",
+			"Потом пришли сюда <code>/auth &lt;строка&gt;</code>.\n\n" +
+			"<i>Сообщение удалю сразу — в истории чата оно не останется.</i>"
+	default:
+		return moreMenu()
 	}
-	text := texts[action]
-	if text == "" {
-		text = "Введи команду"
-	}
-	return Reply{
-		Text: text,
-		Rows: [][]Button{
-			{Callback("🔙 Назад", cbSettings, "")},
-		},
-	}
+	return Reply{Text: text, Rows: [][]Button{
+		{Callback("🔙 Назад", backTo, ""), Callback("🏠 Домой", cbMenu, "")},
+	}}
 }
 
-// The auto-buy screen is built by the backend rather than declared here: every
-// button on it is a toggle whose label depends on the current state, and the
-// checklist beside them has to be read from the database. A static keyboard is
-// what produced the bug it replaces — four fixed buttons, "Автобай вкл" next to
-// "Автобай выкл", with nothing indicating which was in effect.
-
-// marketActionMenu covers the one market view that needs a number typed in:
-// a gift id cannot be offered as a button because it is not in any list.
-func marketActionMenu(action string) Reply {
-	if action != "val" {
-		return marketMenu()
-	}
-	return Reply{
-		Text: "💰 <b>Оценка лота</b>\n\n" +
-			"Самый быстрый путь: в мини-аппе Tonnel жми <b>Share</b> на гифте и кидай ссылку сюда — просто сообщением, без команды. Подпись «Check out this gift!» не мешает.\n\n" +
-			"Можно и вручную: <code>/val 10368454</code> или просто ID числом.",
-		Rows: [][]Button{
-			{Callback("🔙 Назад", cbMarket, ""), Callback("🏠 Меню", cbMenu, "")},
-		},
-	}
-}
-
-// helpMenuReply returns help/reference information
+// helpMenuReply is the command reference.
+//
+// It is grouped by what the operator is trying to do rather than by which
+// package implements it, and every line is command-first so the eye can scan
+// the left edge instead of reading prose.
 func helpMenuReply() Reply {
 	return Reply{
-		Text: "📚 <b>Справка</b>\n\n" +
-			"<b>📊 Рынок:</b>\n" +
-			"<code>/gram</code> — курс GRAM и лаги\n" +
-			"<code>/floor Коллекция [/Модель]</code> — полы и предложения\n" +
-			"<code>/book Коллекция/Модель</code> — лесенка\n" +
-			"<code>/hist Коллекция/Модель</code> — сделки\n" +
-			"<code>/val ID</code> — оценка лота (или просто кинь ссылку из Tonnel)\n\n" +
-			"<b>💼 Портфель:</b>\n" +
-			"<code>/pos</code> — позиции\n" +
-			"<code>/portfolio</code> — советы\n" +
-			"<code>/advice ID</code> — как выходить\n" +
-			"<code>/history ID</code> — история\n" +
-			"<code>/cost ID цена</code> — цена покупки\n" +
-			"<code>/exit ID цена</code> — выход\n" +
-			"<code>/pnl</code> — профит/убыток\n" +
-			"<code>/balance</code> — баланс\n" +
-			"<code>/relist ID</code> — переоценить\n\n" +
-			"<b>⏰ Алерты:</b>\n" +
-			"<code>/watch Коллекция/Модель [цена]</code> — подписаться\n" +
-			"<code>/unwatch Коллекция/Модель</code> — отписаться\n" +
-			"<code>/watchlist</code> — подписки\n" +
-			"<code>/mute Коллекция [часы]</code> — тишина\n" +
-			"<code>/unmute Коллекция</code> — звук обратно\n\n" +
-			"<b>⚔️ Торговля:</b>\n" +
-			"<code>/trade</code> — сессия: отобрать ликвидные пары и торговать по ним\n" +
-			"<code>/trade off</code> — выйти из сессии\n" +
-			"<code>/scan</code> — разовый скан рынка\n\n" +
-			"<b>⚡ Автобай:</b>\n" +
-			"<code>/autobuy</code> — что включено и что мешает купить\n" +
-			"<code>/arm</code> — включить покупку\n" +
-			"<code>/disarm</code> — выключить покупку\n" +
-			"<code>/resell on|off</code> — продавать ли самому\n" +
-			"<code>/limits</code> — лимиты\n" +
-			"<code>/limits set ключ значение</code> — <code>/limits set max_ticket 50</code>\n\n" +
-			"<b>⚙️ Система:</b>\n" +
-			"<code>/status</code> — состояние\n" +
-			"<code>/auth authData</code> — сессия\n\n" +
-			"<i>Коллекция и модель разделены слешем: </i><code>/book Plush Pepe / Pink Diamond</code>",
+		Text: "📚 <b>Команды</b>\n\n" +
+
+			"<b>Торговать</b>\n" +
+			"<code>/trade</code> · сессия по ликвидным парам\n" +
+			"<code>/trade off</code> · выйти из сессии\n" +
+			"<code>/scan</code> · разовый скан рынка\n" +
+			"<code>/val ID</code> · оценка лота — или кинь ссылку из Tonnel\n\n" +
+
+			"<b>Смотреть рынок</b>\n" +
+			"<code>/floor Коллекция</code> · модели и полы\n" +
+			"<code>/book Коллекция / Модель</code> · лесенка асков\n" +
+			"<code>/hist Коллекция / Модель</code> · реальные сделки\n" +
+			"<code>/gram</code> · курс GRAM и отставание флоров\n\n" +
+
+			"<b>Свои лоты</b>\n" +
+			"<code>/pos</code> · позиции с переоценкой\n" +
+			"<code>/portfolio</code> · держать / переставить / сокращать\n" +
+			"<code>/pnl</code> · прибыль в GRAM и в долларах\n" +
+			"<code>/relist ID</code> · переставить по текущему стакану\n" +
+			"<code>/advice ID</code> · как выходить из одной позиции\n" +
+			"<code>/history ID</code> · вся жизнь позиции\n" +
+			"<code>/exit ID цена</code> · ручной выход\n" +
+			"<code>/cost ID цена</code> · задать себестоимость\n" +
+			"<code>/balance</code>\n\n" +
+
+			"<b>Автобай</b>\n" +
+			"<code>/autobuy</code> · что включено и что мешает купить\n" +
+			"<code>/arm</code> · <code>/disarm</code> · покупка\n" +
+			"<code>/resell on|off</code> · продавать ли самому\n" +
+			"<code>/limits</code> · <code>/limits set max_ticket 50</code>\n\n" +
+
+			"<b>Алерты</b>\n" +
+			"<code>/watch Коллекция / Модель [цена]</code>\n" +
+			"<code>/unwatch</code> · <code>/watchlist</code>\n" +
+			"<code>/mute Коллекция [часы]</code> · <code>/unmute</code>\n\n" +
+
+			"<b>Служебное</b>\n" +
+			"<code>/status</code> · поллеры, свежесть данных, прогрев\n" +
+			"<code>/auth строка</code> · заменить протухшую сессию\n\n" +
+
+			"<i>Коллекция и модель разделяются слешем — обе бывают из двух слов.</i>",
 		Rows: [][]Button{
-			{Callback("🔙 Назад", cbMenu, "")},
+			{Callback("🏠 Домой", cbMenu, "")},
 		},
 	}
 }

@@ -645,9 +645,6 @@ func (a *App) autoBlockers(ctx context.Context) []blocker {
 // question "is it on" and the question "will it actually do anything" have had
 // different answers for two days.
 func (a *App) autoPanelText(ctx context.Context) string {
-	var b strings.Builder
-	b.WriteString("⚡️ <b>Автобай</b>\n\n")
-
 	blockers := a.autoBlockers(ctx)
 	blocking := 0
 	for _, bl := range blockers {
@@ -655,14 +652,16 @@ func (a *App) autoPanelText(ctx context.Context) string {
 			blocking++
 		}
 	}
+
+	var b strings.Builder
 	switch {
 	case blocking == 0:
-		b.WriteString("🟢 <b>Всё готово — покупает сам.</b>\n\n")
+		b.WriteString("🟢 <b>Автобай готов</b> — покупает сам\n\n")
 	case a.rm.Armed():
-		fmt.Fprintf(&b, "🟡 <b>Включён, но не купит:</b> %s.\n\n",
+		fmt.Fprintf(&b, "🟡 <b>Включён, но не купит</b> — %s\n\n",
 			plural(blocking, "барьер", "барьера", "барьеров"))
 	default:
-		b.WriteString("🔴 <b>Выключен.</b>\n\n")
+		b.WriteString("🔴 <b>Автобай выключен</b>\n\n")
 	}
 
 	for _, bl := range blockers {
@@ -675,14 +674,14 @@ func (a *App) autoPanelText(ctx context.Context) string {
 		case bl.warn:
 			mark = "🟡"
 		}
-		fmt.Fprintf(&b, "%s <b>%s</b> — %s\n", mark, bl.name, bot.Esc(bl.state))
+		fmt.Fprintf(&b, "%s %s — <i>%s</i>\n", mark, bl.name, bot.Esc(bl.state))
 	}
 
-	resell := "🔴 ресейл выключен — покупает, но не выставляет"
 	if a.rm.ResellEnabled() {
-		resell = "🟢 ресейл включён — сам выставляет купленное"
+		b.WriteString("✅ ресейл — <i>сам выставляет купленное</i>\n")
+	} else {
+		b.WriteString("🔴 ресейл — <i>покупает, но не выставляет</i>\n")
 	}
-	b.WriteString("\n" + resell + "\n")
 	return b.String()
 }
 

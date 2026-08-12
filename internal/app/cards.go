@@ -86,7 +86,13 @@ func headlineBlock(v pricing.Valuation) string {
 	}
 	fmt.Fprintf(&b, "%s <b>%s → %s</b> · <b>%s</b> · %s\n",
 		arrow, num(v.Cost), num(v.FastExit), pct(v.Edge), days(v.FastExpectedDays))
-	fmt.Fprintf(&b, "чистыми %s · скор %.0f/100 (%s) · данным веры %.0f%%\n",
+	// Two numbers that are constantly confused for each other. One says how good
+	// the trade is, the other how much the data behind it can be believed, and
+	// they move independently: a well-measured mediocre trade scores low on the
+	// first and high on the second. Printing them as "скор 27 · доверие 76%"
+	// invited reading the pair as one hedged opinion, so the words now say which
+	// is which and the verdict attaches only to the trade.
+	fmt.Fprintf(&b, "чистыми %s · сделка <b>%.0f/100</b> — %s · данные %.0f%%\n",
 		num(v.Net), v.ScoreBreakdown.Total, scoreVerdict(v.ScoreBreakdown.Total), v.ScoreBreakdown.Quality*100)
 	return b.String()
 }
@@ -219,11 +225,22 @@ func exitBlock(v pricing.Valuation) string {
 		fmt.Fprintf(&b, "├ слить сейчас %s\n", num(v.Liquidation))
 	}
 	fmt.Fprintf(&b, "├ быстро <b>%s</b> за ~%s ← считаем по нему\n", num(v.FastExit), days(v.FastExpectedDays))
-	fmt.Fprintf(&b, "├ фэйр %s\n", num(v.FairValue))
+	fmt.Fprintf(&b, "├ фэйр %s", num(v.FairValue))
+	// Discovery below execution is not a contradiction — it means the queue is
+	// standing above what the tape has been paying — but printed bare, next to a
+	// higher "fast", it reads as a bug. Say which is which.
+	if v.FairValue < v.FastExit {
+		b.WriteString(" <i>(ниже быстрого: стакан выше реальных сделок)</i>")
+	}
+	b.WriteString("\n")
 	// A rung that collapsed onto the fast exit is not a second option, it is the
 	// same listing at the same price. Printing it twice was what produced
 	// "3.465 за 4д" directly above "3.465 за 16д".
-	if !pricing.SamePrice(v.PatientAsk, v.FastExit) {
+	//
+	// Neither is a rung worth a few hundredths at the same expected wait: that
+	// is not a slower, dearer option, it is the fast exit with rounding noise on
+	// it, and offering it as a choice invites taking the higher number for free.
+	if worthWaiting(v) {
 		fmt.Fprintf(&b, "└ терпеливо %s за ~%s\n", num(v.PatientAsk), days(v.PatientExpectedDays))
 	}
 	if v.BearCase > 0 {
@@ -247,6 +264,24 @@ func exitBlock(v pricing.Valuation) string {
 		fmt.Fprintf(&b, "⚠️ %s\n", bot.Esc(v.ExitCapped))
 	}
 	return b.String()
+}
+
+// patientPremium is the smallest gain over the fast exit that makes waiting a
+// real choice rather than a rounding difference.
+const patientPremium = 0.015
+
+// worthWaiting reports whether the patient rung is a genuinely different offer:
+// meaningfully dearer, and slower for a measurable reason. Equal prices, or
+// equal expected waits, mean there is one option here and printing two invites
+// reading the higher number as free money.
+func worthWaiting(v pricing.Valuation) bool {
+	if v.FastExit <= 0 || pricing.SamePrice(v.PatientAsk, v.FastExit) {
+		return false
+	}
+	if v.PatientAsk < v.FastExit*(1+patientPremium) {
+		return false
+	}
+	return v.PatientExpectedDays > v.FastExpectedDays
 }
 
 // bookBlock describes the queue we would have to sell through. Depth that had
@@ -744,13 +779,13 @@ func passReasons(v pricing.Valuation, fails []string) []string {
 func scoreVerdict(total float64) string {
 	switch {
 	case total >= 40:
-		return "редкий"
-	case total >= 20:
-		return "сильный"
-	case total >= 10:
-		return "рабочий"
+		return "<b>редкая</b>"
+	case total >= 25:
+		return "<b>сильная</b>"
+	case total >= 12:
+		return "рабочая"
 	case total > 0:
-		return "слабый"
+		return "слабая"
 	default:
 		return "мимо"
 	}

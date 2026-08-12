@@ -370,8 +370,9 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	// far under water the round trip actually is.
 	if v.Edge <= 0 {
 		fails = append(fails, fmt.Sprintf("реальный вход %.3f выше быстрого выхода %.3f — сделка уже %.1f%% в минусе до риск-буфера", v.Cost, v.FastExit, -v.Edge*100))
-	} else if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
-		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
+	} else if need := requiredEdge(g.MinEdge, v.Liq); v.ScoreBreakdown.RiskAdjustedEdge < need {
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%, %s)",
+			v.ScoreBreakdown.RiskAdjustedEdge*100, need*100, v.Edge*100, liquidityNote(v.Liq)))
 	}
 	// A percentage cannot tell a trade from a rounding error. Both bars have to
 	// be cleared: 5% of a 3-GRAM lot is seven hundredths of a GRAM, and a card
@@ -405,6 +406,51 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	return fails
 }
 
+// Liquidity bands for the edge bar. Velocity here is deduplicated sales per
+// day — one physical gift flipped repeatedly does not move it — so it is a
+// direct measure of how fast a mistake can be unwound.
+const (
+	liquidPerDay = 2.0
+	thinPerDay   = 1.0
+	// liquidRelief and thinPenalty move the required edge around the configured
+	// base. The point is not to trade more, it is to stop treating a model that
+	// sells twice a day and one that sells twice a week as the same risk.
+	liquidRelief = 0.005
+	thinPenalty  = 0.015
+)
+
+// requiredEdge scales the edge bar by how easily the position could be unwound.
+//
+// A flat threshold prices two very different trades identically. Three percent
+// on a model doing 2.5 distinct sales a day is a position you can be out of by
+// tomorrow; the same three percent on one selling twice a week is a fortnight of
+// capital tied up for the price of a rounding error, and that is the trade the
+// desk keeps getting stuck in. So the thin end pays for its illiquidity and the
+// liquid end gets a little back.
+func requiredEdge(base float64, l pricing.Liquidity) float64 {
+	switch {
+	case l.Velocity >= liquidPerDay:
+		return math.Max(base-liquidRelief, 0)
+	case l.Velocity >= thinPerDay:
+		return base
+	default:
+		return base + thinPenalty
+	}
+}
+
+// liquidityNote explains which band the model landed in, so the threshold in
+// the message does not look arbitrary.
+func liquidityNote(l pricing.Liquidity) string {
+	switch {
+	case l.Velocity >= liquidPerDay:
+		return fmt.Sprintf("модель ликвидная, %.1f/день — планка снижена", l.Velocity)
+	case l.Velocity >= thinPerDay:
+		return fmt.Sprintf("%.1f продажи в день", l.Velocity)
+	default:
+		return fmt.Sprintf("всего %.1f продажи в день — планка поднята, из такой модели тяжело выйти", l.Velocity)
+	}
+}
+
 // autoGates is layered strictly on top of signalGates. Everything here answers
 // one question: if we buy this, can we actually get out of it quickly?
 func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
@@ -419,8 +465,9 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	} else if d.CalibrationReady != nil && !d.CalibrationReady() {
 		fails = append(fails, "калибровка скоринга не набрала выборку — можно снять в /autobuy")
 	}
-	if v.ScoreBreakdown.RiskAdjustedEdge < a.MinEdge {
-		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже порога автобая %.1f%%", v.ScoreBreakdown.RiskAdjustedEdge*100, a.MinEdge*100))
+	if need := requiredEdge(a.MinEdge, v.Liq); v.ScoreBreakdown.RiskAdjustedEdge < need {
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже порога автобая %.1f%% (%s)",
+			v.ScoreBreakdown.RiskAdjustedEdge*100, need*100, liquidityNote(v.Liq)))
 	}
 	if v.Liq.Velocity < a.MinVelocity {
 		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже порога автобая %.2f", v.Liq.Velocity, a.MinVelocity))

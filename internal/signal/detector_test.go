@@ -2,6 +2,7 @@ package signal
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -587,4 +588,65 @@ func containsSubstring(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// A flat edge bar prices two very different trades identically.
+//
+// Three percent on a model doing 2.5 deduplicated sales a day is a position you
+// are out of by tomorrow. The same three percent on one selling twice a week is
+// a fortnight of capital tied up for the price of a rounding error — and that
+// is the trade the desk keeps getting stuck in. So the bar moves with how fast
+// a mistake can be unwound.
+func TestEdgeBarScalesWithHowFastYouCouldGetOut(t *testing.T) {
+	const base = 0.045
+	cases := []struct {
+		name     string
+		velocity float64
+		want     float64
+	}{
+		{"liquid model gets a little relief", 2.57, base - liquidRelief},
+		{"ordinary model pays the base", 1.4, base},
+		{"thin model pays for its illiquidity", 0.5, base + thinPenalty},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := requiredEdge(base, pricing.Liquidity{Velocity: c.velocity})
+			if math.Abs(got-c.want) > 1e-9 {
+				t.Errorf("requiredEdge at %.2f/day = %.4f, want %.4f", c.velocity, got, c.want)
+			}
+			// The reason travels with the number, or the threshold in the
+			// rejection message looks arbitrary.
+			if liquidityNote(pricing.Liquidity{Velocity: c.velocity}) == "" {
+				t.Error("the band has no explanation")
+			}
+		})
+	}
+	// The ordering is the property that matters: illiquidity is never cheaper.
+	thin := requiredEdge(base, pricing.Liquidity{Velocity: .3})
+	liquid := requiredEdge(base, pricing.Liquidity{Velocity: 3})
+	if thin <= liquid {
+		t.Errorf("a model selling twice a week (%.3f) must not be easier to clear than one selling three times a day (%.3f)", thin, liquid)
+	}
+}
+
+// Production, 13 Aug: Liberty Figure / Peridot at 4.02 with a 4.158 exit —
+// +3.4% raw, 2.5% after the risk buffer, with three sellers within 5% of the
+// exit. The model is genuinely liquid, and it still is not worth 0.14 GRAM of
+// NFT risk.
+func TestThinEdgeOnALiquidModelIsStillRejected(t *testing.T) {
+	h := newHarness(t, 800, 830, 840)
+	h.seedSales(t, 800, 60, 40)
+	h.seedStat(t, 830, 46)
+
+	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if dec == nil {
+		t.Fatal("the listing was dropped instead of being judged")
+	}
+	if dec.Signal {
+		t.Errorf("a ~3%% edge was pushed as a signal: edge %.1f%% fails %v",
+			dec.Val.Edge*100, dec.SignalFails)
+	}
 }

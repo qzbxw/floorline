@@ -696,18 +696,25 @@ func (m *Manager) Describe(ctx context.Context, now time.Time) string {
 	spend, _ := m.st.SpendToday(ctx, day)
 	open, _ := m.st.CountOpenPositions(ctx)
 
+	// Two narrow columns, meaning first. The old form printed the raw key list
+	// and made the reader translate every line before they could use it — and
+	// two of those keys were wrong, so copying what was on screen into
+	// /limits set produced "unknown limit". The keys now come from LimitKeys,
+	// which is what the setter accepts, and live under the table where they do
+	// not have to fit beside a value on a phone.
 	var b strings.Builder
-	fmt.Fprintf(&b, "max_ticket          %s\n", money(l.MaxTicket))
-	fmt.Fprintf(&b, "daily_budget        %s  (spent today %.2f in %d buys)\n", money(l.DailyBudget), spend.Spent, spend.Buys)
-	fmt.Fprintf(&b, "max_positions       %d  (open %d)\n", l.MaxOpenPositions, open)
-	fmt.Fprintf(&b, "max_buys_per_hour   %d\n", l.MaxBuysPerHour)
-	fmt.Fprintf(&b, "model_cooldown_min  %.0f\n", l.ModelCooldown.Minutes())
-	fmt.Fprintf(&b, "min_balance_reserve %s\n", money(l.MinBalanceReserve))
-	fmt.Fprintf(&b, "min_markup          %.1f%%\n", l.MinMarkup*100)
-	fmt.Fprintf(&b, "max_exit_days       %.1f\n", l.MaxExitDays)
-	fmt.Fprintf(&b, "max_model_exposure  %.0f%%\n", l.MaxModelExposurePct*100)
-	fmt.Fprintf(&b, "max_collection_exp  %.0f%%\n", l.MaxCollectionExposurePct*100)
-	fmt.Fprintf(&b, "max_pos_per_model   %d\n", l.MaxPositionsPerModel)
+	row := func(what, value string) { fmt.Fprintf(&b, "%-21s %s\n", what, value) }
+	row("Тикет, максимум", money(l.MaxTicket))
+	row("Бюджет на день", fmt.Sprintf("%s · сегодня %.2f", money(l.DailyBudget), spend.Spent))
+	row("Открытых лотов", fmt.Sprintf("%d · сейчас %d", l.MaxOpenPositions, open))
+	row("Покупок в час", fmt.Sprintf("%d", l.MaxBuysPerHour))
+	row("Кулдаун модели", fmt.Sprintf("%.0f мин", l.ModelCooldown.Minutes()))
+	row("Неснижаемый остаток", money(l.MinBalanceReserve))
+	row("Наценка, минимум", fmt.Sprintf("%.1f%%", l.MinMarkup*100))
+	row("Продать за, дней", fmt.Sprintf("%.1f", l.MaxExitDays))
+	row("Доля одной модели", fmt.Sprintf("%.0f%%", l.MaxModelExposurePct*100))
+	row("Доля коллекции", fmt.Sprintf("%.0f%%", l.MaxCollectionExposurePct*100))
+	row("Лотов одной модели", fmt.Sprintf("%d", l.MaxPositionsPerModel))
 	return b.String()
 }
 
