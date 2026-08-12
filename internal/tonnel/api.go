@@ -338,6 +338,15 @@ func (c *Client) GiftData(ctx context.Context, giftID int64) (*Gift, error) {
 	if err != nil {
 		return nil, err
 	}
+	// This endpoint answers without a gift_id field: the id is in the URL, so
+	// the response is about that gift by construction. Callers cannot know that,
+	// and a zero id silently broke them — the book stopped excluding the very
+	// listing being valued, and the executor rejected every purchase because the
+	// id "did not match". Stamp it here so a Gift is always fully identified,
+	// whichever endpoint produced it.
+	if g.GiftID.Int() == 0 {
+		g.GiftID = FlexInt(giftID)
+	}
 	return &g, nil
 }
 

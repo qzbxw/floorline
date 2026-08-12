@@ -209,9 +209,14 @@ func WithCrossMarket(v Valuation, support float64) Valuation {
 // WithCrossDepth is the full form: the reference and the queue behind it.
 func WithCrossDepth(v Valuation, cm CrossMarket) Valuation {
 	if cm.Support <= 0 {
-		// Even with no usable price, the fact that a venue could not be reached
-		// has to survive: it is what stops the desk from trading blind.
+		// No usable price, but "a venue could not be reached" is itself an input:
+		// it blocks unattended buying and costs the trade rank, so it has to be
+		// recorded *and* fed back through the score.
+		if cm.Unreachable == v.Cross.Unreachable {
+			return v
+		}
 		v.Cross.Unreachable = cm.Unreachable
+		recompute(&v)
 		return v
 	}
 	v.Cross = cm

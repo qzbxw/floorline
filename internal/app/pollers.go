@@ -228,6 +228,11 @@ func (a *App) revalidateAuto(ctx context.Context, old *signal.Decision) (*signal
 	if g == nil {
 		return nil, "перепроверка вернула пустой лот"
 	}
+	// /api/giftData reports no seller. Carry the one the feed gave us, or the
+	// own-lot guard downstream has nothing to compare against.
+	if g.Seller.Int() == 0 {
+		g.Seller = old.Gift.Seller
+	}
 	a.books.Invalidate(old.Val.Key)
 	fresh, err := a.det.EvaluateFresh(ctx, *g, a.rm.Limits(), time.Now())
 	if err != nil {

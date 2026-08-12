@@ -725,6 +725,116 @@ func TestBookExcludesBundlesAndPremarket(t *testing.T) {
 	}
 }
 
+// Production, 12 Aug: the highest score the desk ever printed was 136.5, on a
+// book reading 8 → 14.4 with a single live ask under the hole. The gap was
+// scored as room to sell into. A gap above one price is the hole itself.
+func TestGapAboveASingleAskIsNotRewardedAsDepth(t *testing.T) {
+	liq := liqOf(6.327, 16)
+	liq.DistinctGifts, liq.Velocity = 12, .86
+
+	// One real ask at 8, then a jump to 14.4 — the Blåhaj shape.
+	gappy := evalPrice(t, 6.16, bookOf(42, 6.16, 8, 14.4, 15), liq, 8, 6)
+	// The same edge, but with a genuine run of prices behind the first ask.
+	solid := evalPrice(t, 6.16, bookOf(42, 6.16, 8, 8.3, 8.6), liq, 8, 6)
+
+	if gappy.LiveDepthCount != 1 || !gappy.DepthCapped {
+		t.Fatalf("fixture is wrong: depth count %d capped %v", gappy.LiveDepthCount, gappy.DepthCapped)
+	}
+	if gappy.ScoreBreakdown.DepthFactor >= 1 {
+		t.Errorf("a hole scored a depth bonus of %.2f", gappy.ScoreBreakdown.DepthFactor)
+	}
+	if gappy.ScoreBreakdown.Total >= solid.ScoreBreakdown.Total {
+		t.Errorf("gappy book scored %.1f against %.1f for a real queue",
+			gappy.ScoreBreakdown.Total, solid.ScoreBreakdown.Total)
+	}
+}
+
+// The score has to be readable at a glance and comparable between cards. The
+// old one was an unbounded product that ranged from 9 to 136.
+func TestScoreStaysOnAHundredPointScale(t *testing.T) {
+	// A deliberately extreme case: huge edge, sells in hours, dense history.
+	liq := liqOf(10, 60)
+	liq.DistinctGifts, liq.Velocity, liq.MADRatio = 60, 12, .01
+	v := evalPrice(t, 3, bookOf(42, 3, 9, 9.1, 9.2), liq, 9, 60)
+	v = WithCrossDepth(v, CrossMarket{Support: 9, Venues: 2, Asks: []float64{9, 9.1, 9.2}})
+
+	s := v.ScoreBreakdown
+	if s.Total <= 0 || s.Total > 100 {
+		t.Errorf("score %.1f is outside 0..100 on an excellent trade", s.Total)
+	}
+	if s.Quality <= 0 || s.Quality > 1 {
+		t.Errorf("quality %.2f is outside 0..1", s.Quality)
+	}
+	// The top of the scale has to be reachable, or the wording on the card
+	// ("отличный") is decoration for a band nothing ever lands in.
+	if s.Total < 80 {
+		t.Errorf("a near-perfect trade scored only %.1f; the scale is unusable", s.Total)
+	}
+
+	// And a dead model must sit at the bottom of the same scale: four prints
+	// across two gifts, a fortnight to sell.
+	dead := liqOf(4.25, 4)
+	dead.DistinctGifts, dead.Velocity, dead.Turnover = 2, .14, .5
+	slow := evalPrice(t, 4.6, bookOf(42, 4.6, 5, 5.2, 5.5), dead, 4.55, 16)
+	if slow.ScoreBreakdown.Total > 10 {
+		t.Errorf("a model trading twice a fortnight scored %.1f", slow.ScoreBreakdown.Total)
+	}
+}
+
+// Evidence, not just price, has to move the ranking: the same trade priced
+// without any cross-market corroboration must rank below one the other venues
+// confirm, and far below neither is a venue that failed to answer.
+func TestScoreRewardsCorroborationAndPunishesBlindness(t *testing.T) {
+	liq := liqOf(3.1, 20)
+	liq.DistinctGifts, liq.Velocity = 20, 1.5
+
+	base := evalPrice(t, 3, bookOf(42, 3, 3.5, 3.55, 3.6), liq, 3.5, 20)
+	confirmed := WithCrossDepth(base, CrossMarket{Support: 3.5, Venues: 2, Asks: []float64{3.5, 3.52, 3.55}})
+	blind := WithCrossDepth(base, CrossMarket{Unreachable: 1})
+
+	if confirmed.ScoreBreakdown.Total <= base.ScoreBreakdown.Total {
+		t.Errorf("two agreeing venues scored %.1f, no better than pricing alone at %.1f",
+			confirmed.ScoreBreakdown.Total, base.ScoreBreakdown.Total)
+	}
+	if blind.ScoreBreakdown.Total >= base.ScoreBreakdown.Total {
+		t.Errorf("a venue that never answered scored %.1f, no worse than a clean read at %.1f",
+			blind.ScoreBreakdown.Total, base.ScoreBreakdown.Total)
+	}
+}
+
+// Eight tidy prints used to read as 81% confident. Sample size now scales the
+// whole judgement rather than topping up a generous floor.
+func TestConfidenceNeedsSamplesNotJustTidiness(t *testing.T) {
+	thin := liqOf(3.02, 8)
+	thin.DistinctGifts, thin.MADRatio, thin.Velocity = 8, .02, .57
+	deep := liqOf(3.02, 40)
+	deep.DistinctGifts, deep.MADRatio, deep.Velocity = 40, .02, 2.5
+
+	thinConf := confidence(thin, AttributeValue{})
+	deepConf := confidence(deep, AttributeValue{})
+
+	if thinConf > .6 {
+		t.Errorf("eight prints gave %.0f%% confidence", thinConf*100)
+	}
+	if deepConf <= thinConf {
+		t.Errorf("forty prints (%.2f) must beat eight (%.2f)", deepConf, thinConf)
+	}
+}
+
+// A model that barely trades must not outrank a liquid one on the strength of a
+// flattering day estimate derived from a single competitor.
+func TestIlliquidModelRanksBelowALiquidOneAtTheSameEdge(t *testing.T) {
+	slow := liqOf(3.1, 8)
+	slow.DistinctGifts, slow.Velocity = 8, .2
+	fast := liqOf(3.1, 8)
+	fast.DistinctGifts, fast.Velocity = 8, 3
+
+	book := bookOf(42, 3, 3.5, 3.55, 3.6)
+	if s, f := evalPrice(t, 3, book, slow, 3.5, 10), evalPrice(t, 3, book, fast, 3.5, 10); s.ScoreBreakdown.Total >= f.ScoreBreakdown.Total {
+		t.Errorf("0.2 sales/day scored %.1f against %.1f for 3/day", s.ScoreBreakdown.Total, f.ScoreBreakdown.Total)
+	}
+}
+
 func TestScoreRanksFastMicroEdgeAboveSlowLargeEdge(t *testing.T) {
 	fast := Valuation{Valid: true, Edge: .03, Net: 3, ExpectedDays: .5, Confidence: .8, Liq: Liquidity{Sales: 20, MADRatio: .02}}
 	slow := Valuation{Valid: true, Edge: .10, Net: 10, ExpectedDays: 8, Confidence: .8, Liq: Liquidity{Sales: 20, MADRatio: .02}}

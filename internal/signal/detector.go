@@ -372,7 +372,7 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 		fails = append(fails, fmt.Sprintf("тренд %.2f ниже минимума автобая %.2f", v.Liq.Trend, a.MinTrend))
 	}
 	if limits.MaxExitDays > 0 && v.ExpectedDays > limits.MaxExitDays {
-		fails = append(fails, fmt.Sprintf("ожидаемая продажа %s дольше лимита %.1fд",
+		fails = append(fails, fmt.Sprintf("ожидаемая продажа %s дольше лимита %.1fд — поднять: /limits set max_exit_days 7",
 			days(v.ExpectedDays), limits.MaxExitDays))
 	}
 	if a.MaxDataAge > 0 && v.DataAge > a.MaxDataAge {

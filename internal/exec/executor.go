@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"floorline/internal/config"
@@ -23,6 +24,10 @@ type Trader interface {
 	Balance(ctx context.Context) (*tonnel.Balance, error)
 	BuyGift(ctx context.Context, giftID int64, price float64) (*tonnel.Result, error)
 	ListForSale(ctx context.Context, giftID int64, price float64) (*tonnel.Result, error)
+	// CancelSale withdraws one of our own listings. Tonnel has no "change the
+	// price" call: listForSale only finds gifts that are not currently on sale,
+	// so repricing means withdrawing first.
+	CancelSale(ctx context.Context, giftID int64) (*tonnel.Result, error)
 	MyGifts(ctx context.Context, listed bool, page, limit int) ([]tonnel.Gift, error)
 }
 
@@ -107,7 +112,9 @@ func (e *Executor) Buy(ctx context.Context, val pricing.Valuation, gift tonnel.G
 	if err != nil {
 		return out, fmt.Errorf("re-read gift immediately before buy: %w", err)
 	}
-	if why := validateFreshListing(fresh, giftID, val.Key, quotePrice, e.api.UserID()); why != "" {
+	// The seller comes from the listing we were handed, not from the re-read:
+	// /api/giftData does not report one. See validateFreshListing.
+	if why := validateFreshListing(fresh, giftID, val.Key, quotePrice, gift.Seller.Int(), e.api.UserID()); why != "" {
 		return out, errors.New(why)
 	}
 
@@ -245,8 +252,26 @@ func (e *Executor) Buy(ctx context.Context, val pricing.Valuation, gift tonnel.G
 	return out, nil
 }
 
-func validateFreshListing(g *tonnel.Gift, giftID int64, key tonnel.ModelKey, price float64, ownerID int64) string {
-	if g == nil || g.GiftID.Int() != giftID {
+// validateFreshListing is the last check before money moves: the gift is re-read
+// straight from the marketplace and anything unexpected aborts the purchase.
+//
+// What it can check is bounded by what /api/giftData actually returns, and that
+// is less than it looks. The response carries no `gift_id` — the id is in the
+// URL, so the answer is about that gift by construction — and its `seller` is
+// always 0. Two earlier checks compared exactly those two fields, so both were
+// unsatisfiable and every purchase, manual and unattended alike, was rejected
+// before it was attempted. The desk had never once been able to buy.
+//
+// So identity comes from the URL, the seller comes from the listing that
+// produced the candidate (pageGifts does report one), and everything the
+// endpoint genuinely answers — model, price, status, settlement — is still
+// checked strictly.
+func validateFreshListing(g *tonnel.Gift, giftID int64, key tonnel.ModelKey, price float64, sellerID, ownerID int64) string {
+	if g == nil {
+		return "перед покупкой Tonnel не ответил про этот гифт"
+	}
+	// Only meaningful when the payload carries an id at all; today it does not.
+	if id := g.GiftID.Int(); id != 0 && id != giftID {
 		return "перед покупкой Tonnel вернул уже другой гифт"
 	}
 	if g.Key() != key {
@@ -255,11 +280,9 @@ func validateFreshListing(g *tonnel.Gift, giftID int64, key tonnel.ModelKey, pri
 	if g.Price.Float() != price {
 		return fmt.Sprintf("перед покупкой цена уехала с %.2f на %.2f", price, g.Price.Float())
 	}
-	if ownerID != 0 && g.Seller.Int() == ownerID {
+	// The own-lot guard uses whichever source actually knows the seller.
+	if ownerID != 0 && (g.Seller.Int() == ownerID || sellerID == ownerID) {
 		return "это наш собственный лот — покупать его не буду"
-	}
-	if g.Seller.Int() == 0 {
-		return "перед покупкой пропал ID продавца"
 	}
 	if g.IsBundle() || g.Premarket.Bool() || g.TelegramMarketplace.Bool() || g.Refunded.Bool() || g.Buyer != nil {
 		return "лот уже нельзя нормально купить и получить"
@@ -365,7 +388,31 @@ func (e *Executor) ListAt(ctx context.Context, giftID int64, key tonnel.ModelKey
 	if target < floorPrice {
 		return 0, fmt.Sprintf("не выставил: цель %.2f ниже входа с наценкой %.2f", target, floorPrice), nil
 	}
+
 	res, err := e.api.ListForSale(ctx, giftID, target)
+	// Tonnel has no reprice call. listForSale searches the gifts that are *not*
+	// currently on sale, so repricing an active listing answers "Gift not found"
+	// — which is what every /relist on a listed position used to return. Withdraw
+	// the old ask and place the new one.
+	if isNotListable(res, err) {
+		if why := e.withdraw(ctx, giftID); why != "" {
+			return 0, "", fmt.Errorf("не переставил по %.2f: %s", target, why)
+		}
+		res, err = e.api.ListForSale(ctx, giftID, target)
+		if err != nil || (res != nil && !res.OK()) {
+			// The old ask is already gone, so the gift is now sitting unlisted.
+			// Say so plainly: silence here reads as "nothing happened".
+			detail := "неизвестная причина"
+			if err != nil {
+				detail = err.Error()
+			} else if res != nil && res.Message != "" {
+				detail = res.Message
+			}
+			return 0, "", fmt.Errorf(
+				"КРИТИЧНО: снял старый аск, но новый по %.2f не встал (%s) — гифт %d сейчас без листинга, поставь руками",
+				target, detail, giftID)
+		}
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("не выставил по %.2f: %w", target, err)
 	}
@@ -378,6 +425,34 @@ func (e *Executor) ListAt(ctx context.Context, giftID int64, key tonnel.ModelKey
 	}
 	e.books.Invalidate(key)
 	return target, "", nil
+}
+
+// isNotListable reports the specific rejection that means "this gift is already
+// on sale", as opposed to a transport failure or a different refusal.
+//
+// Tonnel answers it with HTTP 200 and a body message rather than a status code,
+// so it has to be matched on text. Anything else is left alone: withdrawing a
+// listing in response to an error we did not understand would be a way to end
+// up with nothing on the market.
+func isNotListable(res *tonnel.Result, err error) bool {
+	if err != nil {
+		return strings.Contains(strings.ToLower(err.Error()), "gift not found")
+	}
+	return res != nil && !res.OK() && strings.Contains(strings.ToLower(res.Message), "not found")
+}
+
+// withdraw removes our current ask so a new one can be placed. It returns an
+// explanation when the listing could not be withdrawn, and an empty string on
+// success.
+func (e *Executor) withdraw(ctx context.Context, giftID int64) string {
+	res, err := e.api.CancelSale(ctx, giftID)
+	if err != nil {
+		return "не снял старый аск: " + err.Error()
+	}
+	if res != nil && !res.OK() {
+		return "Tonnel не дал снять старый аск: " + res.Message
+	}
+	return ""
 }
 
 // owns reports whether the account currently holds the gift, checking both the

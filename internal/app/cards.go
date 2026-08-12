@@ -108,8 +108,13 @@ func exitBlock(v pricing.Valuation) string {
 	case v.Edge < 0:
 		verdict = "🔴"
 	}
-	fmt.Fprintf(&b, "%s Итог <b>%s</b> (<b>%s</b>) · эдж с риском %.1f%% · скор %.1f · конфа %.0f%%\n",
-		verdict, num(v.Net), pct(v.Edge), v.ScoreBreakdown.RiskAdjustedEdge*100, v.ScoreBreakdown.Total, v.Confidence*100)
+	fmt.Fprintf(&b, "%s Итог <b>%s</b> (<b>%s</b>) · эдж с риском %.1f%%\n",
+		verdict, num(v.Net), pct(v.Edge), v.ScoreBreakdown.RiskAdjustedEdge*100)
+	// The score is worth nothing without the evidence behind it, so the two are
+	// printed together: a 60 on solid data and a 60 on three prints and one live
+	// ask are not the same signal.
+	fmt.Fprintf(&b, "Скор <b>%.0f</b>/100 (%s) · доверие данным %.0f%%\n",
+		v.ScoreBreakdown.Total, scoreVerdict(v.ScoreBreakdown.Total), v.ScoreBreakdown.Quality*100)
 	if v.ExitCapped != "" {
 		fmt.Fprintf(&b, "⚠️ %s\n", bot.Esc(v.ExitCapped))
 	}
@@ -566,6 +571,23 @@ func passReasons(v pricing.Valuation, fails []string) []string {
 		parts = append(parts, "Tonnel и другие площадки спорят")
 	}
 	return parts
+}
+
+// scoreVerdict puts a word to the number, so the score is readable without
+// remembering what counts as good on this scale.
+func scoreVerdict(total float64) string {
+	switch {
+	case total >= 50:
+		return "отличный"
+	case total >= 30:
+		return "хороший"
+	case total >= 15:
+		return "средний"
+	case total > 0:
+		return "слабый"
+	default:
+		return "мимо"
+	}
 }
 
 // mentions reports whether any gate failure already makes a point, so the PASS

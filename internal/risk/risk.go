@@ -25,6 +25,10 @@ const (
 	kvLimits = "risk.limits"
 	kvArmed  = "risk.armed"
 	kvResell = "risk.resell"
+
+	// legacyMaxExitDays is the superseded default, kept so a stored copy of it
+	// can be told apart from a value the operator actually chose.
+	legacyMaxExitDays = 3
 )
 
 // Limits are the hard money constraints.
@@ -47,14 +51,17 @@ type Limits struct {
 // the bot to spend.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxTicket:                0,
-		DailyBudget:              0,
-		MaxOpenPositions:         8,
-		MaxBuysPerHour:           3,
-		ModelCooldown:            15 * time.Minute,
-		MinBalanceReserve:        0,
-		MinMarkup:                0.03,
-		MaxExitDays:              3,
+		MaxTicket:         0,
+		DailyBudget:       0,
+		MaxOpenPositions:  8,
+		MaxBuysPerHour:    3,
+		ModelCooldown:     15 * time.Minute,
+		MinBalanceReserve: 0,
+		MinMarkup:         0.03,
+		// Three days rejected most of a market whose liquid models sell in four
+		// to five. The cap exists to stop capital being parked for a week, not
+		// to demand same-week flips of everything.
+		MaxExitDays:              5,
 		MaxModelExposurePct:      .15,
 		MaxCollectionExposurePct: .30,
 		MaxPositionsPerModel:     2,
@@ -183,6 +190,14 @@ func New(ctx context.Context, st *store.Store) (*Manager, error) {
 			}
 			if m.limits.MaxPositionsPerModel <= 0 {
 				m.limits.MaxPositionsPerModel = 2
+			}
+			// The old three-day cap was rejecting most of a market whose liquid
+			// models sell in four to five, so the default moved to five. Raise a
+			// stored value only when it is still exactly the old default — an
+			// operator who deliberately chose three keeps three, and anyone can
+			// override either way with /limits set max_exit_days.
+			if m.limits.MaxExitDays == legacyMaxExitDays {
+				m.limits.MaxExitDays = DefaultLimits().MaxExitDays
 			}
 		}
 	}

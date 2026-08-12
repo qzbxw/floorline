@@ -87,7 +87,19 @@ func (a *App) Dump(ctx context.Context, w io.Writer, what string) error {
 		return a.probeTypes(ctx, w)
 
 	default:
-		return fmt.Errorf("unknown dump target %q (feed, sales, bids, fresh, types, balance, mygifts)", what)
+		// "gift 123" prints one listing exactly as the marketplace returns it.
+		// The purchase path re-reads a gift immediately before spending money
+		// and refuses on anything unexpected, so when a buy is rejected this is
+		// the only way to see which field it tripped over.
+		if id, ok := strings.CutPrefix(what, "gift "); ok {
+			err := a.api.Raw(ctx, tonnel.HostRead, "/api/giftData/"+strings.TrimSpace(id),
+				map[string]any{"authData": a.api.Auth()}, &raw)
+			if err != nil {
+				return err
+			}
+			break
+		}
+		return fmt.Errorf("unknown dump target %q (feed, sales, bids, fresh, types, balance, mygifts, gift <id>)", what)
 	}
 
 	out, err := json.MarshalIndent(raw, "", "  ")

@@ -31,6 +31,13 @@ type fakeAPI struct {
 	buyFee     float64
 	balanceErr error
 
+	// listedNow mirrors the real marketplace: listForSale searches the gifts
+	// that are *not* currently on sale, so an active listing answers "Gift not
+	// found" until it is withdrawn.
+	listedNow   map[int64]bool
+	cancelCalls []int64
+	cancelErr   error
+
 	buyCalls  []buyCall
 	listCalls []listCall
 
@@ -93,10 +100,30 @@ func (f *fakeAPI) ListForSale(ctx context.Context, giftID int64, price float64) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listCalls = append(f.listCalls, listCall{giftID, price})
+	if f.listedNow[giftID] {
+		return &tonnel.Result{Status: "error", Message: "Gift not found"}, nil
+	}
 	if f.listResult == nil && f.listErr == nil {
 		return &tonnel.Result{Status: "success"}, nil
 	}
 	return f.listResult, f.listErr
+}
+
+func (f *fakeAPI) CancelSale(ctx context.Context, giftID int64) (*tonnel.Result, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelCalls = append(f.cancelCalls, giftID)
+	if f.cancelErr != nil {
+		return nil, f.cancelErr
+	}
+	delete(f.listedNow, giftID)
+	return &tonnel.Result{Status: "success"}, nil
+}
+
+func (f *fakeAPI) cancels() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.cancelCalls...)
 }
 
 func (f *fakeAPI) MyGifts(ctx context.Context, listed bool, page, limit int) ([]tonnel.Gift, error) {
@@ -175,6 +202,7 @@ func newHarness(t *testing.T, bookPrices ...float64) *harness {
 		bookPrices: bookPrices,
 		balance:    10000,
 		buyFee:     cfg.TonnelFee,
+		listedNow:  map[int64]bool{},
 		quote: tonnel.Gift{GiftID: 1, Name: key.Name, Model: key.Model + " (0.4%)",
 			Price: tonnel.Flex64(bookPrices[0]), Asset: tonnel.AssetGRAM, Seller: 999},
 	}
@@ -241,6 +269,114 @@ func TestResellOffBuysButDoesNotList(t *testing.T) {
 	}
 	if pos.BuyPrice != 804 {
 		t.Errorf("buy price = %v, want the actual 804 debit", pos.BuyPrice)
+	}
+}
+
+// Production: every /relist on a listed position answered
+// "tonnel /api/listForSale: http 200: Gift not found" while the gift was plainly
+// there. Tonnel has no reprice call — listForSale only sees gifts that are not
+// currently on sale — so the old ask has to be withdrawn first.
+func TestRepricingAListedGiftWithdrawsTheOldAskFirst(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.api.listedNow[1] = true // the gift is already on the market
+
+	price, note, err := h.ex.ListAt(ctx, 1, key, 1207.65, 800, time.Now())
+	if err != nil {
+		t.Fatalf("relist: %v (note %q)", err, note)
+	}
+	if price != 1207.65 {
+		t.Errorf("listed at %v, want 1207.65", price)
+	}
+	if got := h.api.cancels(); len(got) != 1 || got[0] != 1 {
+		t.Errorf("cancel calls = %v, want exactly one for gift 1", got)
+	}
+	// First attempt, withdrawal, second attempt.
+	if got := h.api.lists(); len(got) != 2 {
+		t.Errorf("list calls = %+v, want two: the rejected one and the retry", got)
+	}
+}
+
+// Withdrawing succeeds and re-listing then fails: the gift is now on nobody's
+// market. That must be shouted, not returned as a quiet zero.
+func TestFailedRepriceAfterWithdrawalIsReportedLoudly(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.api.listedNow[1] = true
+	h.api.listErr = errors.New("upstream exploded")
+
+	_, _, err := h.ex.ListAt(ctx, 1, key, 1207.65, 800, time.Now())
+	if err == nil {
+		t.Fatal("a gift left unlisted must surface as an error")
+	}
+	if !strings.Contains(err.Error(), "без листинга") {
+		t.Errorf("error %q must say the gift is now unlisted", err)
+	}
+}
+
+// An error we do not recognise must never trigger a withdrawal: reacting to a
+// misunderstood failure by cancelling is how a position ends up off the market
+// for no reason.
+func TestUnrecognisedListFailureDoesNotWithdraw(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.api.listResult = &tonnel.Result{Status: "error", Message: "insufficient balance"}
+
+	if _, _, err := h.ex.ListAt(ctx, 1, key, 1207.65, 800, time.Now()); err == nil {
+		t.Fatal("the rejection must still be an error")
+	}
+	if got := h.api.cancels(); len(got) != 0 {
+		t.Errorf("withdrew the listing on an unrelated failure: %v", got)
+	}
+}
+
+// /api/giftData returns neither gift_id nor a seller. Two checks compared
+// exactly those fields, so both were unsatisfiable and every purchase was
+// refused before it was attempted — the desk could never buy anything.
+func TestPurchaseSurvivesAGiftDataResponseWithoutIdOrSeller(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 30)
+	// Exactly what the live endpoint returns: a price and a status, no id,
+	// seller zero.
+	h.api.quote = tonnel.Gift{
+		Name: key.Name, Model: key.Model + " (0.4%)",
+		Price: tonnel.Flex64(800), Asset: tonnel.AssetGRAM, Status: "forsale",
+	}
+
+	out, err := h.ex.Buy(ctx, valuation(800), candidate(800), "manual", time.Now())
+	if err != nil {
+		t.Fatalf("buy refused on a normal response: %v", err)
+	}
+	if !out.Bought {
+		t.Fatalf("purchase did not happen: %+v", out)
+	}
+}
+
+// The own-lot guard has to keep working even though the re-read cannot supply a
+// seller: it comes from the listing that produced the candidate.
+func TestBuyStillRefusesOurOwnListing(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 30)
+	h.api.apiOwner = 555
+	h.api.quote = tonnel.Gift{
+		Name: key.Name, Model: key.Model + " (0.4%)",
+		Price: tonnel.Flex64(800), Asset: tonnel.AssetGRAM, Status: "forsale",
+	}
+
+	mine := candidate(800)
+	mine.Seller = tonnel.FlexInt(555)
+
+	_, err := h.ex.Buy(ctx, valuation(800), mine, "manual", time.Now())
+	if err == nil {
+		t.Fatal("bought our own listing")
+	}
+	if !strings.Contains(err.Error(), "собственный лот") {
+		t.Errorf("error = %q, want the own-lot refusal", err)
+	}
+	if len(h.api.buys()) != 0 {
+		t.Error("a purchase request went out for our own lot")
 	}
 }
 

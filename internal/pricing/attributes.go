@@ -103,51 +103,156 @@ type ScoreBreakdown struct {
 	FillProbability  float64 `json:"fill_probability"`
 	FXFactor         float64 `json:"fx_factor"`
 	DepthFactor      float64 `json:"depth_factor"`
+	// CrossFactor is how much the other venues corroborate this trade, and
+	// LiquidityFactor how much the model actually trades. Both used to be absent
+	// from the score entirely.
+	CrossFactor     float64 `json:"cross_factor"`
+	LiquidityFactor float64 `json:"liquidity_factor"`
+	// Quality is every trust multiplier collapsed into one number in [0,1], so
+	// the card can say "how good is the evidence" separately from "how good is
+	// the price".
+	Quality float64 `json:"quality"`
 }
 
+// scoreHalfPoint is the daily risk-adjusted return that scores 50 out of 100
+// on perfect evidence. 3%/day is a very good flip on this market, so the scale
+// saturates where reality does.
+const scoreHalfPoint = 0.03
+
+// BuildScore turns a valuation into a single number in 0..100.
+//
+// The old score was an unbounded product that ran from 9 to 136 with no
+// interpretable meaning, and it was dominated by 1/ExpectedDays — so a thin,
+// badly-evidenced lot with an optimistic day count outranked a solid one. Worse,
+// it *rewarded* the exact pathology the pricing engine exists to catch: a wide
+// gap above the cheapest ask scored a 1.18 bonus as "room to sell into" even
+// when that gap was a hole with a single real price under it. The highest score
+// the desk ever produced, 136.5, was a book reading 8 → 14.4 with one live ask.
+//
+// The shape now is deliberately two-part: how good the price is, multiplied by
+// how much the evidence deserves to be believed.
 func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 	portfolioFit = clamp(portfolioFit, 0, 1)
-	b := ScoreBreakdown{NetProfit: v.Net, ExpectedDays: v.ExpectedDays, Confidence: v.Confidence, PortfolioFit: portfolioFit, FXFactor: 1, DepthFactor: 1}
+	b := ScoreBreakdown{
+		NetProfit: v.Net, ExpectedDays: v.ExpectedDays, Confidence: v.Confidence,
+		PortfolioFit: portfolioFit, FXFactor: 1, DepthFactor: 1, CrossFactor: 1, LiquidityFactor: 1,
+	}
 	b.SafetyBuffer = .005 + math.Min(.03, v.Liq.MADRatio*.15/math.Sqrt(math.Max(float64(v.Liq.Sales), 1))) + math.Min(.01, float64(v.CompetitorsNear)*.001)
 	b.FillProbability = 1 / (1 + math.Max(v.ExpectedDays, 0)/3)
+
 	if v.FX.Valid {
 		b.FXFactor = clamp(1-math.Max(v.FX.FloorLag, 0)*1.5+math.Max(-v.FX.FloorLag, 0)*.35, .5, 1.15)
 		if math.Abs(v.FX.Move15m) > .02 {
 			b.FXFactor *= .85
 		}
 	}
-	// The queue in front of the exit. A wide gap above us is room to sell into;
-	// a tight one — or a competing ask already at or below our price, which the
-	// clamp at AskGap1 reports as a flat zero — means we are one of a crowd and
-	// the modelled exit needs a wider margin of error.
-	switch {
-	case v.AskGap1 >= .05 || v.AskGap3 >= .08:
-		b.DepthFactor = 1.18
-	case v.AskGap1 < .02 && v.AskGap3 < .04:
-		b.DepthFactor = .72
-		b.SafetyBuffer += .01
-	}
-	if v.MarketDisagreement {
-		b.DepthFactor *= .45
-	}
-	// Every penalty above must land before this line: the risk-adjusted edge is
-	// what the gates read, so a buffer added after it would only ever decorate
-	// the recorded breakdown.
+
+	b.DepthFactor = depthFactor(v, &b)
+	b.CrossFactor = crossFactor(v)
+	b.LiquidityFactor = liquidityFactor(v.Liq)
+
+	// Every penalty must land before this line: the risk-adjusted edge is what
+	// the gates read, so a buffer added afterwards would only decorate the
+	// recorded breakdown.
 	b.RiskAdjustedEdge = math.Max(v.Edge-b.SafetyBuffer, 0)
+
+	b.Quality = clamp(v.Confidence*b.DepthFactor*b.CrossFactor*b.LiquidityFactor*b.FXFactor*portfolioFit, 0, 1)
+
 	if v.Valid && b.RiskAdjustedEdge > 0 && !math.IsInf(v.ExpectedDays, 1) {
 		b.ProfitPerDay = v.Net / math.Max(v.ExpectedDays, .25)
-		b.DailyROI = b.RiskAdjustedEdge / math.Max(v.ExpectedDays, .25)
-		b.Total = b.DailyROI * 10000 * v.Confidence * portfolioFit * b.FillProbability * b.FXFactor * b.DepthFactor
+		b.DailyROI = b.RiskAdjustedEdge / math.Max(v.ExpectedDays, .5)
+		// Saturating so that an implausible day estimate cannot run away with
+		// the ranking: doubling an already-excellent daily return is worth a few
+		// points, not a multiple.
+		price := b.DailyROI / (b.DailyROI + scoreHalfPoint)
+		b.Total = clamp(100*price*b.Quality, 0, 100)
 	}
 	return b
 }
 
+// depthFactor judges the queue we would have to sell through.
+//
+// The order of these cases is the fix: a gap only counts as room to sell into
+// when there is a real run of prices under it. Above a single ask the same gap
+// is the hole itself.
+func depthFactor(v Valuation, b *ScoreBreakdown) float64 {
+	f := 1.0
+	switch {
+	case v.DepthCapped || (v.HasCompetingAsk && v.LiveDepthCount < 2):
+		// One live price and then a jump. The exit is a guess about a market
+		// nobody is currently making.
+		f = .45
+		b.SafetyBuffer += .01
+	case v.AskGap1 >= .05 || v.AskGap3 >= .08:
+		f = 1.18
+	case v.AskGap1 < .02 && v.AskGap3 < .04:
+		f = .72
+		b.SafetyBuffer += .01
+	}
+	if !v.HasCompetingAsk {
+		f = math.Min(f, .5) // nothing to price against but history
+	}
+	if v.MarketDisagreement {
+		f *= .45
+	}
+	return f
+}
+
+// crossFactor is how much the rest of the market corroborates the trade.
+//
+// Cross-market depth is what bounds the exit, so its absence is not neutral. A
+// venue that could not be read at all is worse than a venue with nothing
+// listed: we are guessing where we could have been checking.
+func crossFactor(v Valuation) float64 {
+	if v.Cross.Unreachable > 0 {
+		return .5
+	}
+	if v.CrossMarketSupport <= 0 {
+		return .8 // priced on Tonnel alone
+	}
+	f := 1.0
+	if v.Cross.Venues >= 2 {
+		f = 1.05 // two independent venues agreeing is real corroboration
+	}
+	// Disagreement is already a manual-only gate; here it also costs rank, in
+	// proportion to how far apart the venues are.
+	if v.CrossDivergence > 0 {
+		f *= clamp(1-v.CrossDivergence, .4, 1)
+	}
+	return f
+}
+
+// liquidityFactor is the model's actual trade rate.
+//
+// Expected days already divides by velocity, but that only says how long one
+// sale should take — not how much to trust the estimate. A model printing twice
+// a week can produce a flattering day count off a single competitor, and the
+// ranking used to take it at face value.
+func liquidityFactor(l Liquidity) float64 {
+	if l.Velocity <= 0 {
+		return .3
+	}
+	return clamp(l.Velocity/(l.Velocity+.6), .3, 1)
+}
+
+// confidence is how much the trade history deserves to be believed.
+//
+// It used to start at 0.2 and collect another 0.2 for turnover regardless of
+// sample size, so eight prints could read as 81% confident. Sample size now
+// scales the whole thing: with nothing traded there is nothing to be confident
+// about, however tidy the few prints look.
 func confidence(l Liquidity, a AttributeValue) float64 {
-	samples := math.Min(float64(l.Sales)/20, 1)
+	n := float64(l.DistinctGifts)
+	if n <= 0 {
+		return 0
+	}
+	// Half weight at 8 distinct gifts, 0.71 at 20, 0.83 at 40.
+	sample := n / (n + 8)
 	turnover := clamp(l.Turnover, 0, 1)
 	stability := clamp(1-l.MADRatio, 0, 1)
 	trend := clamp(l.Trend, 0, 1)
-	base := .2 + .3*samples + .2*turnover + .2*stability + .1*trend
+
+	base := sample * (.45 + .2*turnover + .25*stability + .1*trend)
 	if a.Valid {
 		base = .8*base + .2*a.Confidence
 	}
