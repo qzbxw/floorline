@@ -87,10 +87,17 @@ func entryBlock(v pricing.Valuation) string {
 func exitBlock(v pricing.Valuation) string {
 	var b strings.Builder
 	b.WriteString("🎯 <b>Выход</b>\n")
-	fmt.Fprintf(&b, "├ слить сейчас %s\n", num(v.Liquidation))
+	if !pricing.SamePrice(v.Liquidation, v.FastExit) {
+		fmt.Fprintf(&b, "├ слить сейчас %s\n", num(v.Liquidation))
+	}
 	fmt.Fprintf(&b, "├ быстро <b>%s</b> за ~%s ← считаем по нему\n", num(v.FastExit), days(v.FastExpectedDays))
 	fmt.Fprintf(&b, "├ фэйр %s\n", num(v.FairValue))
-	fmt.Fprintf(&b, "└ терпеливо %s за ~%s\n", num(v.PatientAsk), days(v.PatientExpectedDays))
+	// A rung that collapsed onto the fast exit is not a second option, it is the
+	// same listing at the same price. Printing it twice was what produced
+	// "3.465 за 4д" directly above "3.465 за 16д".
+	if !pricing.SamePrice(v.PatientAsk, v.FastExit) {
+		fmt.Fprintf(&b, "└ терпеливо %s за ~%s\n", num(v.PatientAsk), days(v.PatientExpectedDays))
+	}
 	if v.BearCase > 0 {
 		fmt.Fprintf(&b, "Если рынок поплывёт: %s\n", num(v.BearCase))
 	}
@@ -148,7 +155,7 @@ func (a *App) historyBlock(v pricing.Valuation) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "📊 <b>История %dд</b>\n", a.cfg.LookbackDays)
 	fmt.Fprintf(&b, "%d сделок · %d гифтов · %.2f в день · последняя %s\n",
-		v.Liq.Sales, v.Liq.DistinctGifts, v.Liq.Velocity, ago(v.Liq.LastSale))
+		v.Liq.Prints, v.Liq.DistinctGifts, v.Liq.Velocity, ago(v.Liq.LastSale))
 	fmt.Fprintf(&b, "Медиана %s · разброс %.0f%% · тренд %+.0f%%\n",
 		num(v.Liq.Median), v.Liq.MADRatio*100, (v.Liq.Trend-1)*100)
 	if v.MarketDisagreement {
@@ -176,7 +183,15 @@ func traitBlock(v pricing.Valuation, g tonnel.Gift) string {
 	return b.String()
 }
 
+// mixLine explains how the exit price was made.
+//
+// When a clamp overwrote the blend wholesale, the weights are no longer how the
+// price was made and printing them is a lie the operator has no way to catch.
+// In that case the clamp is the answer to "where did this number come from".
 func mixLine(v pricing.Valuation) string {
+	if v.ExitCapped != "" {
+		return fmt.Sprintf("⚖️ <b>Из чего цена</b>: не из блендинга — %s\n", bot.Esc(v.ExitCapped))
+	}
 	return fmt.Sprintf("⚖️ <b>Из чего цена</b>: стакан %.0f%% · история %.0f%% · площадки %.0f%% · трейты %.0f%%\n",
 		v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
 }
@@ -419,12 +434,20 @@ func (a *App) crossMarketLines(ctx context.Context, v pricing.Valuation) []strin
 	if !a.cross.Enabled() {
 		return nil
 	}
-	// Bound the wait: a slow venue must not hold up a time-sensitive card.
-	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	// Bound the wait: a slow venue must not hold up a time-sensitive card. The
+	// budget has to cover a venue's own pacing, though — two rate-limited calls
+	// per venue — or the comparison drops out exactly when several cards are
+	// rendered together.
+	qctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
-	quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
-	lines := make([]string, 0, 2*len(quotes))
+	quotes, unreachable := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
+	lines := make([]string, 0, 2*len(quotes)+1)
+	if unreachable > 0 {
+		lines = append(lines, fmt.Sprintf("⚠️ %s не ответил%s — сравнить не с чем",
+			plural(unreachable, "площадка", "площадки", "площадок"),
+			map[bool]string{true: "а", false: "и"}[unreachable == 1]))
+	}
 	for _, q := range quotes {
 		lines = append(lines, fmt.Sprintf("<b>%s</b> %s%s", bot.Esc(q.Venue), askPreview(q.Asks, q.Floor), scopeNote(q.Scope)))
 
@@ -507,12 +530,28 @@ func passLine(v pricing.Valuation, fails []string) string {
 	return "PASS: " + strings.Join(passReasons(v, fails), "; ") + "."
 }
 
-// passReasons states the actual economic reasons to skip a listing, most
-// decisive first. The detailed gates stay below them for debugging, but the
-// operator should not have to infer "entry is above exit" from a clamped
-// risk-adjusted zero.
+// passReasons states why a listing was skipped, most decisive first.
+//
+// Every line here has to correspond to something that actually rejected the
+// trade. An earlier version invented two of its own — "no gap after the first
+// ask" and "the other venues give no edge" — which are checked by no gate at
+// all, and then only fell back to the real failure when none of the inventions
+// fired. So the block could name three reasons while hiding the one that
+// actually mattered.
 func passReasons(v pricing.Valuation, fails []string) []string {
 	parts := make([]string, 0, 5)
+	// The economics first, restated plainly: the operator should not have to
+	// infer "entry is above exit" from a risk-adjusted edge clamped to zero.
+	// The gate says this better when it fires, so only stand in for it.
+	if v.FastExit > 0 && v.Cost >= v.FastExit && !mentions(fails, "выше быстрого выхода") {
+		parts = append(parts, fmt.Sprintf("реальный вход %s выше быстрого выхода %s", num(v.Cost), num(v.FastExit)))
+	}
+	// Then whatever actually rejected the listing, verbatim and before any
+	// commentary. The block is trimmed to three lines, so a gate pushed below
+	// the context lines is a gate the operator never reads.
+	parts = append(parts, fails...)
+
+	// Supporting context last: true, useful, but not why we said no.
 	if v.PricedAboveMarket {
 		parts = append(parts, fmt.Sprintf("дешевле входа %s стоит %s на всех площадках, премии за трейты нет",
 			num(v.Cost), plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков")))
@@ -520,24 +559,24 @@ func passReasons(v pricing.Valuation, fails []string) []string {
 	if v.DepthCapped {
 		parts = append(parts, fmt.Sprintf("стакан дырявый (%s → %s), глубине верить нельзя", num(v.CompetingAsk), num(v.DepthPrice3)))
 	}
-	if v.Cost >= v.FastExit && v.FastExit > 0 {
-		parts = append(parts, fmt.Sprintf("реальный вход %s выше быстрого выхода %s", num(v.Cost), num(v.FastExit)))
-	}
-	if !v.HasCompetingAsk || v.AskGap1 < .05 {
-		parts = append(parts, "после первого аска нормального гэпа нет")
-	}
-	if v.CrossMarketSupport > 0 && v.CrossMarketSupport <= v.Cost {
-		parts = append(parts, "другие площадки эджа не дают")
-	} else if v.CrossDivergence > .15 {
-		parts = append(parts, "Tonnel и другие площадки спорят")
-	}
 	if v.MarketDisagreement {
 		parts = append(parts, "история и живой стакан разъехались")
 	}
-	if len(parts) == 0 && len(fails) > 0 {
-		parts = append(parts, fails[0])
+	if v.CrossDivergence > pricing.CrossDivergenceLimit {
+		parts = append(parts, "Tonnel и другие площадки спорят")
 	}
 	return parts
+}
+
+// mentions reports whether any gate failure already makes a point, so the PASS
+// block does not say the same thing twice in two different wordings.
+func mentions(fails []string, substr string) bool {
+	for _, f := range fails {
+		if strings.Contains(f, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func attrWithRarity(name string, rarity float64) string {

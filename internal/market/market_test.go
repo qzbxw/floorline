@@ -82,9 +82,12 @@ func TestComparisonSkipsVenuesWithNothingToSay(t *testing.T) {
 
 func TestComparisonUsesActualAskDepthAndRobustReference(t *testing.T) {
 	d := &fakeDepthSource{fakeSource: fakeSource{name: "Depth", enabled: true, floor: 1, fee: .02}, asks: []float64{10, 20, 21, 40}}
-	quotes := NewComparison(d).QuotesForGift(context.Background(), "c", "m", "b", "s")
+	quotes, unreachable := NewComparison(d).QuotesForGift(context.Background(), "c", "m", "b", "s")
 	if len(quotes) != 1 || len(quotes[0].Asks) != 4 {
 		t.Fatalf("quotes = %+v", quotes)
+	}
+	if unreachable != 0 {
+		t.Errorf("unreachable = %d, want 0 for a venue that answered", unreachable)
 	}
 	if quotes[0].Floor != 10 || quotes[0].Reference() != 20 {
 		t.Fatalf("floor/reference = %.2f/%.2f, want 10/20", quotes[0].Floor, quotes[0].Reference())
@@ -94,6 +97,31 @@ func TestComparisonUsesActualAskDepthAndRobustReference(t *testing.T) {
 	}
 	if quotes[0].NetReference() != 20*.98 {
 		t.Fatalf("net reference = %v", quotes[0].NetReference())
+	}
+}
+
+// A venue that could not be reached is not a venue with nothing listed.
+//
+// Production, 12 Aug: three gifts priced back to back starved the per-venue rate
+// limiter, Portals timed out, and the card quietly printed "площадки 0%" — with
+// the cross-market cap and the undercut veto silently switched off. Those are
+// the guards that stop a hole in the Tonnel book from reading as an edge, so
+// losing them has to be loud.
+func TestUnreachableVenueIsReportedNotSwallowed(t *testing.T) {
+	broken := &fakeSource{name: "Broken", enabled: true, err: errors.New("timeout")}
+	empty := &fakeSource{name: "Empty", enabled: true, floor: 0}
+	live := &fakeSource{name: "Live", enabled: true, floor: 5}
+
+	quotes, unreachable := NewComparison(broken, empty, live).
+		QuotesForGift(context.Background(), "c", "m", "", "")
+
+	if unreachable != 1 {
+		t.Errorf("unreachable = %d, want 1 — only the venue that errored", unreachable)
+	}
+	// The venue with nothing listed is not a failure, and must not be counted
+	// as one: an empty book is real information about the market.
+	if len(quotes) != 1 || quotes[0].Venue != "Live" {
+		t.Errorf("quotes = %+v, want only the venue that answered with a price", quotes)
 	}
 }
 

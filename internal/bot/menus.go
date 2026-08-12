@@ -121,7 +121,7 @@ func settingsMenu() Reply {
 		Text: "⚙️ <b>Настройки</b>\n\n" +
 			"Настрой под себя:",
 		Rows: [][]Button{
-			{Callback("⚡ Автокупля", cbAuto, "")},
+			{Callback("⚡ Автобай и ресейл", cbAuto, "")},
 			{Callback("💰 Лимиты", cbRefresh, "limits")},
 			{Callback("🔐 Сессия", cbSettings, "auth")},
 			{Callback("🔙 Назад", cbMenu, "")},
@@ -152,14 +152,15 @@ func settingsActionMenu(action string) Reply {
 	}
 }
 
-// autoMenu returns auto-buy settings
+// autoMenu returns auto-buy settings. Buying and selling are two switches, not
+// one, so the menu offers them separately.
 func autoMenu() Reply {
 	return Reply{
-		Text: "⚡ <b>Автокупля</b>\n\n" +
-			"Включи режим автопилота:",
+		Text: "⚡ <b>Автобай</b>\n\n" +
+			"Покупка и продажа включаются отдельно:",
 		Rows: [][]Button{
-			{Callback("✅ Включить", cbRefresh, "arm")},
-			{Callback("❌ Выключить", cbRefresh, "disarm")},
+			{Callback("✅ Автобай вкл", cbRefresh, "arm"), Callback("❌ Автобай выкл", cbRefresh, "disarm")},
+			{Callback("✅ Ресейл вкл", cbRefresh, "resell_on"), Callback("❌ Ресейл выкл", cbRefresh, "resell_off")},
 			{Callback("📋 Лимиты", cbRefresh, "limits")},
 			{Callback("🔙 Назад", cbSettings, "")},
 		},
@@ -208,9 +209,10 @@ func helpMenuReply() Reply {
 			"<code>/watchlist</code> — подписки\n" +
 			"<code>/mute Коллекция [часы]</code> — тишина\n" +
 			"<code>/unmute Коллекция</code> — звук обратно\n\n" +
-			"<b>⚡ Автокупля:</b>\n" +
-			"<code>/arm</code> — включить\n" +
-			"<code>/disarm</code> — выключить\n" +
+			"<b>⚡ Автобай:</b>\n" +
+			"<code>/arm</code> — включить покупку\n" +
+			"<code>/disarm</code> — выключить покупку\n" +
+			"<code>/resell on|off</code> — продавать ли самому\n" +
 			"<code>/limits</code> — лимиты\n" +
 			"<code>/limits set ключ значение</code> — <code>/limits set max_ticket 50</code>\n\n" +
 			"<b>⚙️ Система:</b>\n" +

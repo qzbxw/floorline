@@ -74,6 +74,40 @@ func TestRepeatedSalesOfOnePhysicalGiftCountOnce(t *testing.T) {
 	}
 }
 
+// Turnover is the only wash-trading signal available: the endpoint carries no
+// counterparty identities. It has to be measured against the raw tape, because
+// comparing distinct gifts against the already-deduplicated count makes it
+// identically 1 and the AUTOBUY_MIN_TURNOVER gate unreachable.
+func TestTurnoverMeasuresTheRawTapeNotTheDeduplicatedOne(t *testing.T) {
+	now := time.Now()
+	window := 14 * 24 * time.Hour
+
+	// Four prints, but only two physical gifts changing hands.
+	washed := ComputeLiquidity(salesAt(now,
+		entry{1, 100, 7}, entry{2, 100, 7},
+		entry{3, 120, 8}, entry{4, 120, 8},
+	), now, window, window)
+
+	if washed.Prints != 4 {
+		t.Errorf("prints = %d, want the four raw trades", washed.Prints)
+	}
+	if washed.DistinctGifts != 2 {
+		t.Errorf("distinct gifts = %d, want 2", washed.DistinctGifts)
+	}
+	if math.Abs(washed.Turnover-0.5) > 1e-9 {
+		t.Errorf("turnover = %.3f, want 0.5 — two gifts behind four prints", washed.Turnover)
+	}
+
+	// A genuine market: every print is a different gift.
+	clean := ComputeLiquidity(salesAt(now,
+		entry{1, 100, 1}, entry{2, 100, 2}, entry{3, 120, 3}, entry{4, 120, 4},
+	), now, window, window)
+
+	if clean.Turnover != 1 {
+		t.Errorf("turnover = %.3f, want 1 when every print is a different gift", clean.Turnover)
+	}
+}
+
 func TestComputeLiquidityIgnoresTradesOutsideTheWindow(t *testing.T) {
 	now := time.Now()
 	window := 14 * 24 * time.Hour

@@ -38,24 +38,56 @@ func mambaCard(t *testing.T) (string, pricing.Valuation) {
 	return a.renderCard(context.Background(), dec, "включён shadow-режим"), v
 }
 
-// The card claimed "nobody within 5% of your exit → you are the best ask" two
-// lines under a 4.21 competing ask it had printed itself.
-func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
+// The 12 Aug card read as an opportunity. It has to read as a warning: the book
+// is gappy, and six offers across the venues are already under our entry.
+func TestGappyBookCardWarnsInsteadOfTempting(t *testing.T) {
 	card, v := mambaCard(t)
-	if v.CheaperAsks == 0 {
-		t.Fatal("fixture is wrong: the 4.21 ask must undercut the exit")
-	}
-	if strings.Contains(card, "Дешевле тебя никого") {
-		t.Errorf("card calls us the best ask with %d cheaper asks in the book:\n%s", v.CheaperAsks, card)
-	}
 	for _, want := range []string{
-		"Перед тобой в очереди",
 		"Дырявый стакан",
 		"Дешевле твоего входа по всем площадкам",
 	} {
 		if !strings.Contains(card, want) {
 			t.Errorf("card is missing %q:\n%s", want, card)
 		}
+	}
+	// The exit now undercuts the single real ask instead of clearing the hole
+	// above it, so we genuinely would be the cheapest offer at that price.
+	if v.CheaperAsks != 0 {
+		t.Errorf("exit %.3f should sit under the 4.21 ask, leaving nobody cheaper; got %d",
+			v.FastExit, v.CheaperAsks)
+	}
+}
+
+// The card claimed "nobody within 5% of your exit → you are the best ask" two
+// lines under a competing ask it had printed itself. Whenever real asks sit
+// below the exit, the queue line has to say so.
+func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
+	key := tonnel.ModelKey{Name: "Pet Snake", Model: "Black Mamba"}
+	// Our own 4.90 listing behind three cheaper sellers: the exit lands above
+	// them, so we are demonstrably not first in the queue.
+	book := &pricing.Book{Key: key, FetchedAt: time.Now(), Asks: []pricing.Ask{
+		{GiftID: 43, Price: 4.0}, {GiftID: 44, Price: 4.1}, {GiftID: 45, Price: 4.2},
+		{GiftID: 42, Price: 4.9}, {GiftID: 46, Price: 5.0},
+	}}
+	liq := pricing.Liquidity{Sales: 20, Prints: 20, DistinctGifts: 20, Turnover: 1,
+		Median: 4.6, Median7: 4.6, Trend: 1, Velocity: 1.4, MADRatio: .05, LastSale: time.Now()}
+	v := pricing.Evaluate(pricing.Input{
+		GiftID: 42, Key: key, Price: 4.9, Book: book, Liq: liq, Floor: 4.0, Supply: 20,
+		Now: time.Now(), Params: pricing.Params{Fee: .005, Undercut: .01},
+	})
+
+	a := &App{cfg: &config.Config{LookbackDays: 14, Undercut: .01}}
+	card := a.renderCard(context.Background(),
+		&signal.Decision{Gift: tonnel.Gift{GiftID: 10380168, GiftNum: 150969}, Val: v}, "")
+
+	if v.CheaperAsks == 0 {
+		t.Fatalf("fixture is wrong: three asks must undercut the %.3f exit", v.FastExit)
+	}
+	if strings.Contains(card, "Дешевле тебя никого") {
+		t.Errorf("card calls us the best ask with %d cheaper asks in the book:\n%s", v.CheaperAsks, card)
+	}
+	if !strings.Contains(card, "Перед тобой в очереди") {
+		t.Errorf("card must say we are behind a queue:\n%s", card)
 	}
 }
 

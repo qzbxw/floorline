@@ -39,6 +39,9 @@ type Backend interface {
 
 	Arm(ctx context.Context) Reply
 	Disarm(ctx context.Context) Reply
+	// Resell shows automatic selling with an empty argument, and switches it
+	// with "on" or "off".
+	Resell(ctx context.Context, arg string) Reply
 	LimitsText(ctx context.Context) Reply
 	SetLimit(ctx context.Context, key, value string) Reply
 
@@ -313,6 +316,9 @@ func (b *Bot) register() {
 	tb.Handle("/disarm", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		return b.back.Disarm(ctx)
 	}))
+	tb.Handle("/resell", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		return b.back.Resell(ctx, c.Message().Payload)
+	}))
 
 	tb.Handle("/limits", b.reply(func(ctx context.Context, c tele.Context) Reply {
 		f := strings.Fields(c.Message().Payload)
@@ -494,6 +500,10 @@ func (b *Bot) registerCallbacks() {
 			r = back(b.back.Arm(ctx), cbAuto, "🔙 Автобай")
 		case "disarm":
 			r = back(b.back.Disarm(ctx), cbAuto, "🔙 Автобай")
+		case "resell_on":
+			r = back(b.back.Resell(ctx, "on"), cbAuto, "🔙 Автобай")
+		case "resell_off":
+			r = back(b.back.Resell(ctx, "off"), cbAuto, "🔙 Автобай")
 		default:
 			return nil
 		}
@@ -555,7 +565,7 @@ func (b *Bot) registerCallbacks() {
 	})
 
 	tb.Handle(&tele.Btn{Unique: cbAuto}, func(c tele.Context) error {
-		_ = c.Respond(&tele.CallbackResponse{Text: "автокупля"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "автобай"})
 		return b.editWith(c, autoMenu())
 	})
 

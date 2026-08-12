@@ -68,7 +68,7 @@ func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64
 		Backdrop: tonnel.BaseAttr(g.Backdrop), Symbol: tonnel.BaseAttr(g.Symbol),
 		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
 		SnapshotAt: snapshotAt, Now: now, FX: fxContext,
-		Params: pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut, Window: a.window()},
+		Params: pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut},
 	})
 	if cm := a.crossMarketDepth(ctx, v); cm.Support > 0 {
 		v = pricing.WithCrossDepth(v, cm)
@@ -93,6 +93,13 @@ func (a *App) statusText(ctx context.Context) string {
 		fmt.Fprintf(&b, " — %s", bot.Esc(reason))
 	}
 	b.WriteString("\n")
+
+	resell := "🔴 выключен — покупает, но не продаёт"
+	if a.rm.ResellEnabled() {
+		resell = "🟢 включён — сам выставляет купленное"
+	}
+	fmt.Fprintf(&b, "Ресейл %s\n", resell)
+
 	n, first, _ := a.st.CalibrationStats(ctx)
 	mode := "боевой"
 	if a.cfg.ShadowMode {
@@ -526,6 +533,33 @@ func (a *App) disarmText(ctx context.Context) string {
 		return "❌ " + bot.Esc(err.Error())
 	}
 	return "🔴 Автобай выключен."
+}
+
+// resellText shows or changes whether the bot may sell on its own.
+//
+// Buying and selling are separate switches: catching a mispriced lot and
+// deciding what to ask for it are different decisions, and the second one is
+// the one worth keeping by hand while the exit model is still being trusted.
+func (a *App) resellText(ctx context.Context, arg string) string {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "on", "вкл", "1":
+		if err := a.rm.SetResell(ctx, true); err != nil {
+			return "❌ " + bot.Esc(err.Error())
+		}
+		return "🟢 <b>Ресейл включён.</b>\nПосле покупки бот сам выставляет лот и отвечает на андеркат."
+	case "off", "выкл", "0":
+		if err := a.rm.SetResell(ctx, false); err != nil {
+			return "❌ " + bot.Esc(err.Error())
+		}
+		return "🔴 <b>Ресейл выключен.</b>\nБот покупает, но не продаёт: после покупки подскажет цену, а выставишь сам через /relist."
+	case "":
+		if a.rm.ResellEnabled() {
+			return "🟢 <b>Ресейл включён</b> — бот сам выставляет купленное.\nВыключить: <code>/resell off</code>"
+		}
+		return "🔴 <b>Ресейл выключен</b> — бот покупает, но не продаёт.\nВключить: <code>/resell on</code>"
+	default:
+		return "Не понял. Ожидаю <code>/resell on</code> или <code>/resell off</code>."
+	}
 }
 
 // LimitsText shows the limits and today's usage.

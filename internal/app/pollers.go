@@ -114,13 +114,18 @@ func (a *App) spendable() (float64, bool) {
 // cheaper to go, which is the difference between a misprice and an overprice.
 func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing.CrossMarket {
 	if !a.cross.Enabled() {
-		return pricing.CrossMarket{}
+		return pricing.CrossMarket{} // no venue configured is a choice, not a failure
 	}
-	qctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	// The budget has to fit a venue's own pacing. Each one may need two calls —
+	// exact attributes, then a model-wide fallback — and they are rate-limited
+	// to roughly one per second, so a four-second deadline silently starved the
+	// comparison whenever several cards were priced in a row. Losing it is not
+	// cosmetic: it is the cap that holds an optimistic exit down.
+	qctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
-	quotes := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
+	quotes, unreachable := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
 
-	cm := pricing.CrossMarket{}
+	cm := pricing.CrossMarket{Unreachable: unreachable}
 	var refs []float64
 	for _, q := range quotes {
 		ref := q.Reference()
@@ -136,7 +141,7 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 		}
 	}
 	if len(refs) == 0 {
-		return pricing.CrossMarket{}
+		return pricing.CrossMarket{Unreachable: unreachable}
 	}
 	sort.Float64s(refs)
 	sort.Float64s(cm.Asks)
@@ -672,27 +677,42 @@ func relativeChange(old, new float64) float64 {
 }
 
 // checkUndercut warns when our ask is no longer the cheapest.
+//
+// The comparison has to come from the live book, not the market snapshot. The
+// snapshot is refreshed once a minute and its floor is a plain minimum over
+// every listing — including the lot we have just bought out of the book and the
+// one we have just relisted ourselves. Reading it produced the alert that fired
+// seconds after a purchase, telling the operator they had been undercut at
+// exactly the price they had paid.
 func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time) {
 	if p.Status != store.StatusListed || p.ListPrice <= 0 {
 		return
 	}
-	stat, err := a.st.ModelStat(ctx, p.Key)
-	if err != nil || stat == nil || stat.Floor <= 0 {
+	book, err := a.books.Get(ctx, p.Key)
+	if err != nil || book == nil {
 		return
 	}
-	if stat.Floor >= p.ListPrice {
+	// A book fetched before we listed cannot say anything about our listing.
+	if !p.ListedAt.IsZero() && book.FetchedAt.Before(p.ListedAt) {
 		return
 	}
-	if !a.throttle(fmt.Sprintf("undercut:%d:%.2f", p.GiftID, stat.Floor), 6*time.Hour) {
+	// BestExcluding drops our own gift and everything else we are selling, so
+	// what is left is a genuine competitor.
+	best, ok := book.BestExcluding(p.GiftID, a.api.UserID())
+	if !ok || best <= 0 || best >= p.ListPrice {
+		return
+	}
+	if !a.throttle(fmt.Sprintf("undercut:%d:%.2f", p.GiftID, best), 6*time.Hour) {
 		return
 	}
 	// Safe automatic repricing: never below cost+markup, never a large jump,
-	// and never more than once per six hours. Loss-taking remains manual.
-	if !a.cfg.ShadowMode && a.rm.Armed() && p.BuyPrice > 0 {
+	// and never more than once per six hours. Loss-taking remains manual, and
+	// the whole branch is off unless selling has been switched on.
+	if a.rm.ResellEnabled() && !a.cfg.ShadowMode && a.rm.Armed() && p.BuyPrice > 0 {
 		last, _ := a.st.LastReprice(ctx, p.GiftID)
 		if last.IsZero() || now.Sub(last) >= 6*time.Hour {
 			ad := a.advisePosition(ctx, p, now)
-			if preview := ad.Val; preview.Valid && ad.Action == actRelist && !preview.MarketDisagreement && ad.CrossDivergence <= .15 {
+			if preview := ad.Val; preview.Valid && ad.Action == actRelist && !preview.MarketDisagreement && ad.CrossDivergence <= pricing.CrossDivergenceLimit {
 				target := math.Floor(preview.Exit*100) / 100
 				change := math.Abs(target/p.ListPrice - 1)
 				if target >= p.BuyPrice*(1+a.rm.Limits().MinMarkup) && change >= .02 && change <= .15 {
@@ -707,9 +727,9 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 		}
 	}
 	a.notify(fmt.Sprintf(
-		"🥊 <b>Тебя андеркатнули</b> — %s\nТвой аск %s · флор сейчас %s (−%.1f%%)\nВход %s · <code>/relist %d</code>",
-		bot.Esc(p.Key.String()), num(p.ListPrice), num(stat.Floor),
-		(p.ListPrice-stat.Floor)/p.ListPrice*100, num(p.BuyPrice), p.GiftID))
+		"🥊 <b>Тебя андеркатнули</b> — %s\nТвой аск %s · чужой аск %s (−%.1f%%)\nВход %s · <code>/relist %d</code>",
+		bot.Esc(p.Key.String()), num(p.ListPrice), num(best),
+		(p.ListPrice-best)/p.ListPrice*100, num(p.BuyPrice), p.GiftID))
 }
 
 // checkStale warns when a position has been sitting far longer than the model's

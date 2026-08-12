@@ -1,10 +1,18 @@
 // Package market reads active sell queues from other gift marketplaces.
 //
-// This is a price *reference* only. Floorline never trades on these venues:
-// moving a gift out of Tonnel's off-chain engine to sell it elsewhere takes
-// minutes to hours plus gas, by which time any spread has gone. What the
-// comparison is good for is sanity — if Tonnel's executable exit is far from
-// the first few asks elsewhere, the trade deserves a second look.
+// Floorline does not yet trade on these venues: moving a gift out of Tonnel's
+// off-chain engine to sell it elsewhere takes minutes to hours plus gas, by
+// which time any spread has gone.
+//
+// It does, however, price against them, and that is not a footnote. Our buyer
+// can shop anywhere, so the cheapest ask across every venue — not the next ask
+// on Tonnel — is what bounds our exit. A hole in the Tonnel book above a dense
+// queue elsewhere is a hole, not liquidity, and reading it as room to sell into
+// is what used to manufacture double-digit edges out of nothing.
+//
+// Because these quotes are load-bearing, a venue that cannot be reached is
+// reported rather than skipped: "nobody answered" must never be mistaken for
+// "nobody objected".
 package market
 
 import (
@@ -118,17 +126,25 @@ func (c *Comparison) Venues() []string {
 // have nothing to say. A slow or broken venue delays the card by at most the
 // context deadline and never blocks the others.
 func (c *Comparison) Quotes(ctx context.Context, collection, model string) []Quote {
-	return c.QuotesForGift(ctx, collection, model, "", "")
+	q, _ := c.QuotesForGift(ctx, collection, model, "", "")
+	return q
 }
 
 // QuotesForGift asks venues with attribute-aware APIs for a tighter comparable
 // and gracefully falls back to their model floor otherwise.
-func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backdrop, symbol string) []Quote {
+//
+// The second return is how many venues could not be reached at all. That is not
+// the same as a venue having nothing listed, and the difference decides whether
+// the desk is allowed to trade unattended: cross-market depth is what caps an
+// over-optimistic exit, so losing it to a timeout must not read as the market
+// having no objection.
+func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backdrop, symbol string) ([]Quote, int) {
 	if !c.Enabled() {
-		return nil
+		return nil, 0
 	}
 
 	results := make([]Quote, len(c.sources))
+	failed := make([]bool, len(c.sources))
 	var wg sync.WaitGroup
 	for i, s := range c.sources {
 		wg.Add(1)
@@ -156,7 +172,11 @@ func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backd
 			} else {
 				floor, err = s.ModelFloor(ctx, collection, model)
 			}
-			if err == nil && floor > 0 {
+			if err != nil {
+				failed[i] = true
+				return
+			}
+			if floor > 0 {
 				results[i] = Quote{Venue: s.Venue(), Floor: floor, Asks: asks, Scope: scope, Fee: s.Fee()}
 			}
 		}(i, s)
@@ -170,7 +190,13 @@ func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backd
 			out = append(out, q)
 		}
 	}
-	return out
+	n := 0
+	for _, f := range failed {
+		if f {
+			n++
+		}
+	}
+	return out, n
 }
 
 // Probing is the diagnostic form of Quotes: it keeps the per-venue error so

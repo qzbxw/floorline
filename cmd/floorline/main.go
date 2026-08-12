@@ -10,9 +10,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,7 +61,7 @@ func main() {
 
 func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	switch cmd {
-	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history":
+	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history", "val":
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -76,6 +78,27 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	defer a.Close()
 
 	switch cmd {
+	case "val":
+		// The same valuation the /val card shows, without needing Telegram. This
+		// is how a pricing change gets checked against real listings before it
+		// is trusted with money.
+		if flag.NArg() < 2 {
+			return fmt.Errorf("val requires at least one gift id")
+		}
+		if err := a.SyncGram(ctx); err != nil {
+			log.Warn().Err(err).Msg("GRAM quote unavailable; FX lines will be blank")
+		}
+		for _, arg := range flag.Args()[1:] {
+			id, err := strconv.ParseInt(arg, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid gift id %q: %w", arg, err)
+			}
+			fmt.Printf("═══ gift %d ═══\n", id)
+			fmt.Println(stripHTML(a.Val(ctx, id).Text))
+			fmt.Println()
+		}
+		return nil
+
 	case "history":
 		if flag.NArg() < 2 {
 			return fmt.Errorf("history requires a gift id")
@@ -147,6 +170,17 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	}
 }
 
+// stripHTML renders the bot's Telegram markup as plain terminal text. The
+// backend returns one HTML string for every surface, so the CLI unwraps rather
+// than the views branching on where they are going.
+func stripHTML(s string) string {
+	r := strings.NewReplacer(
+		"<b>", "", "</b>", "", "<i>", "", "</i>", "",
+		"<pre>", "", "</pre>", "", "<code>", "", "</code>", "",
+	)
+	return html.UnescapeString(r.Replace(s))
+}
+
 // truncateName keeps the progress line from wrapping in a narrow terminal.
 func truncateName(s string) string {
 	if len(s) <= 28 {
@@ -168,6 +202,7 @@ Commands:
   portfolio  sync all inventory pages and print recommendations
   gram       refresh and print GRAM/USDT plus tracked floor lag
   history ID sync inventory and print the full position lifecycle
+  val ID...  price one or more listings and print why they pass or fail
   dump <x>   print one endpoint's raw JSON (feed, sales, sales-all, balance, mygifts)
 
 Flags:

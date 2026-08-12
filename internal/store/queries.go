@@ -1063,10 +1063,21 @@ func (s *Store) PutSignalOutcome(ctx context.Context, signalID int64, horizon in
 	return err
 }
 
+// CalibrationStats reports how much *scored* evidence the desk has: buy signals
+// whose forward outcome has actually been measured, and how far back they go.
+//
+// Counting raw signal rows instead — which is what this used to do — makes it a
+// volume gate wearing the name of a calibration gate. Two hundred signals that
+// nobody ever checked the result of say nothing about whether the scoring works,
+// and that is the one question standing between shadow mode and real money.
 func (s *Store) CalibrationStats(ctx context.Context) (int, time.Time, error) {
 	var n int
 	var ts int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MIN(ts),0) FROM signals WHERE kind='buy'`).Scan(&n, &ts)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT s.id), COALESCE(MIN(s.ts),0)
+		FROM signals s
+		JOIN signal_outcomes o ON o.signal_id = s.id
+		WHERE s.kind='buy'`).Scan(&n, &ts)
 	return n, fromUnix(ts), err
 }
 

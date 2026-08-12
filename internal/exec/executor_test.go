@@ -164,6 +164,11 @@ func newHarness(t *testing.T, bookPrices ...float64) *harness {
 	if err := rm.SetLimit(ctx, "min_markup", "0.03"); err != nil {
 		t.Fatalf("set markup: %v", err)
 	}
+	// Automatic selling ships off. Most cases here are about the relist path, so
+	// the harness turns it on and the off behaviour gets its own test.
+	if err := rm.SetResell(ctx, true); err != nil {
+		t.Fatalf("enable resell: %v", err)
+	}
 
 	cfg := &config.Config{TonnelFee: 0.005, Undercut: 0.01, LookbackDays: 14, BookCacheTTL: time.Nanosecond}
 	api := &fakeAPI{
@@ -200,6 +205,43 @@ func valuation(price float64) pricing.Valuation {
 
 func candidate(price float64) tonnel.Gift {
 	return tonnel.Gift{GiftID: 1, Name: key.Name, Model: key.Model + " (0.4%)", Price: tonnel.Flex64(price)}
+}
+
+// Buying and selling are separate switches. With selling off the purchase must
+// still go through untouched — the gift just stays in inventory, unlisted, with
+// the price the engine would have used handed to the operator.
+func TestResellOffBuysButDoesNotList(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 30)
+	if err := h.rm.SetResell(ctx, false); err != nil {
+		t.Fatalf("disable resell: %v", err)
+	}
+
+	out, err := h.ex.Buy(ctx, valuation(800), candidate(800), "auto", time.Now())
+	if err != nil {
+		t.Fatalf("buy: %v", err)
+	}
+	if !out.Bought {
+		t.Fatalf("selling being off must not block the purchase: %+v", out)
+	}
+	if out.Listed || len(h.api.lists()) != 0 {
+		t.Errorf("gift was listed with resell off: %+v", h.api.lists())
+	}
+	if !strings.Contains(out.Note, "1207.65") {
+		t.Errorf("note must carry the price we would have asked: %q", out.Note)
+	}
+
+	pos, err := h.st.GetPosition(ctx, 1)
+	if err != nil || pos == nil {
+		t.Fatalf("position not recorded: %v", err)
+	}
+	if pos.Status != store.StatusOpen || pos.ListPrice != 0 {
+		t.Errorf("position = %+v, want an open, unlisted position", pos)
+	}
+	if pos.BuyPrice != 804 {
+		t.Errorf("buy price = %v, want the actual 804 debit", pos.BuyPrice)
+	}
 }
 
 func TestBuyThenRelistAtTheUndercutPrice(t *testing.T) {

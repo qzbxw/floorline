@@ -221,6 +221,15 @@ func (e *Executor) Buy(ctx context.Context, val pricing.Valuation, gift tonnel.G
 	// We just removed the cheapest ask; anything cached is now wrong.
 	e.books.Invalidate(val.Key)
 
+	// Buying and selling are separate decisions. With automatic selling off the
+	// gift stays in inventory, unlisted, and the operator gets the price the
+	// engine would have used — so turning the switch off costs information but
+	// never costs the trade.
+	if !e.rm.ResellEnabled() {
+		out.Note = joinNotes(out.Note, e.suggestListing(ctx, giftID, val.Key, actualCost, now, val))
+		return out, nil
+	}
+
 	listPrice, note, err := e.relist(ctx, giftID, val.Key, actualCost, now, val)
 	out.Note = joinNotes(out.Note, note)
 	if listPrice > 0 {
@@ -274,6 +283,32 @@ func (e *Executor) Relist(ctx context.Context, giftID int64, key tonnel.ModelKey
 }
 
 func (e *Executor) relist(ctx context.Context, giftID int64, key tonnel.ModelKey, entry float64, now time.Time, prior pricing.Valuation) (float64, string, error) {
+	target, note, err := e.listingTarget(ctx, giftID, key, entry, now, prior)
+	if err != nil || target <= 0 {
+		return 0, note, err
+	}
+	return e.ListAt(ctx, giftID, key, target, entry, now)
+}
+
+// suggestListing is the read-only half of a relist: it prices the gift and says
+// what it would have asked, without touching the market. This is what the
+// operator gets when automatic selling is switched off.
+func (e *Executor) suggestListing(ctx context.Context, giftID int64, key tonnel.ModelKey, entry float64, now time.Time, prior pricing.Valuation) string {
+	target, note, err := e.listingTarget(ctx, giftID, key, entry, now, prior)
+	switch {
+	case err != nil:
+		return "ресейл выключен, и цену подсказать не смог: " + err.Error()
+	case target <= 0:
+		return "ресейл выключен. " + note
+	default:
+		return fmt.Sprintf("ресейл выключен — не выставляю. По текущему стакану поставил бы %.2f: /relist %d", target, giftID)
+	}
+}
+
+// listingTarget prices an owned gift against the current book and returns the
+// ask it would place. A zero price with a nil error means listing right now
+// would lock in a loss; the note says why.
+func (e *Executor) listingTarget(ctx context.Context, giftID int64, key tonnel.ModelKey, entry float64, now time.Time, prior pricing.Valuation) (float64, string, error) {
 	limits := e.rm.Limits()
 	floorPrice := entry * (1 + limits.MinMarkup)
 
@@ -319,8 +354,7 @@ func (e *Executor) relist(ctx context.Context, giftID int64, key tonnel.ModelKey
 			"не выставил: рынок уехал — быстрый выход %.2f ниже твоего минимума %.2f (вход %.2f + %.0f%%)",
 			target, floorPrice, entry, limits.MinMarkup*100), nil
 	}
-
-	return e.ListAt(ctx, giftID, key, target, entry, now)
+	return target, "", nil
 }
 
 // ListAt applies the same no-loss invariant to an externally computed target

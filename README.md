@@ -11,6 +11,7 @@ cp .env.example .env && chmod 600 .env    # заполни три обязате
 ./floorline smoke                          # проверка, что API отвечает
 ./floorline gram                           # GRAM/USDT и лаг отслеживаемых флоров
 ./floorline history 10368454               # полный lifecycle конкретной позиции
+./floorline val 10368454 10382082          # оценка лотов без Telegram: цена и гейты
 ./floorline backfill                       # 60 дней: ликвидность + премии атрибутов
 ./floorline run                            # поллеры + бот
 ```
@@ -141,8 +142,9 @@ Web → DevTools → Network → POST на `api.tgmrkt.io/api/v1/auth` → по�
   /mute Plush Pepe 4        заглушить коллекцию на 4 часа
   /unmute Plush Pepe
 
-Автопокупка
-  /arm, /disarm
+Автобай
+  /arm, /disarm       покупка без участия человека
+  /resell on|off      продавать ли купленное самому (по умолчанию off)
   /limits
   /limits set max_ticket 50
 

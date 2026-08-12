@@ -95,7 +95,7 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		ad.Action = actHold
 		ad.Reason = "аск в пределах 2% от рекомендованного выхода"
 	}
-	if ad.CrossDivergence > .15 && !ad.FloorGuarded {
+	if ad.CrossDivergence > pricing.CrossDivergenceLimit && !ad.FloorGuarded {
 		ad.Reason += fmt.Sprintf("; расхождение с внешними стаканами %.0f%% — проверь руками", ad.CrossDivergence*100)
 		if ad.Action == actHold || ad.Action == actRelist {
 			ad.Action = actReview
@@ -136,7 +136,12 @@ func (a *App) adviceText(ctx context.Context, giftID int64) string {
 	if ad.Val.Valid {
 		v := ad.Val
 		fmt.Fprintf(&b, "Слить сейчас %s · быстрый выход %s за ~%s\n", num(v.Liquidation), num(v.FastExit), days(v.FastExpectedDays))
-		fmt.Fprintf(&b, "Фэйр %s · терпеливый аск %s за ~%s\n", num(v.FairValue), num(v.PatientAsk), days(v.PatientExpectedDays))
+		// Only a genuinely higher ask is a second option worth naming.
+		if pricing.SamePrice(v.PatientAsk, v.FastExit) {
+			fmt.Fprintf(&b, "Фэйр %s · ждать смысла нет, терпеливый аск тот же\n", num(v.FairValue))
+		} else {
+			fmt.Fprintf(&b, "Фэйр %s · терпеливый аск %s за ~%s\n", num(v.FairValue), num(v.PatientAsk), days(v.PatientExpectedDays))
+		}
 		if v.BearCase > 0 {
 			fmt.Fprintf(&b, "Если рынок поплывёт: %s\n", num(v.BearCase))
 		}

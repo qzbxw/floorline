@@ -24,6 +24,7 @@ import (
 const (
 	kvLimits = "risk.limits"
 	kvArmed  = "risk.armed"
+	kvResell = "risk.resell"
 )
 
 // Limits are the hard money constraints.
@@ -117,6 +118,7 @@ type Manager struct {
 	mu            sync.RWMutex
 	limits        Limits
 	armed         bool
+	resell        bool
 	disabledUntil time.Time
 	lastReason    string
 	failStreak    int
@@ -189,7 +191,39 @@ func New(ctx context.Context, st *store.Store) (*Manager, error) {
 		return nil, err
 	}
 	m.armed = armed == "1"
+
+	// Selling is off until it is switched on, and it is a separate switch from
+	// arming on purpose: buying and selling are different decisions with
+	// different risks, and the operator who wants the bot to catch lots while
+	// they price the exits themselves had no way to say so.
+	resell, err := st.GetKV(ctx, kvResell)
+	if err != nil {
+		return nil, err
+	}
+	m.resell = resell == "1"
 	return m, nil
+}
+
+// ResellEnabled reports whether the bot may put gifts up for sale on its own.
+//
+// It gates exactly two things: the listing that follows a purchase, and the
+// automatic response to being undercut. Deliberate operator actions — /relist,
+// /exit — are never gated by it.
+func (m *Manager) ResellEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.resell
+}
+
+// SetResell turns automatic selling on or off and persists the choice.
+func (m *Manager) SetResell(ctx context.Context, on bool) error {
+	m.mu.Lock()
+	m.resell = on
+	m.mu.Unlock()
+	if on {
+		return m.st.SetKV(ctx, kvResell, "1")
+	}
+	return m.st.SetKV(ctx, kvResell, "0")
 }
 
 // Limits returns a copy of the current limits.

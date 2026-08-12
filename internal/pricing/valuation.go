@@ -2,11 +2,16 @@ package pricing
 
 import (
 	"math"
-	"sort"
 	"time"
 
 	"floorline/internal/tonnel"
 )
+
+// CrossDivergenceLimit is how far Tonnel and the other venues may disagree
+// before a trade stops being something a machine should do on its own. It lives
+// here because the detector, the portfolio adviser, the card renderer and the
+// auto-reprice path all have to mean the same thing by "they disagree".
+const CrossDivergenceLimit = 0.15
 
 const (
 	marketDisagreementLimit = 0.10
@@ -34,7 +39,6 @@ type Params struct {
 	// Tonnel does not take the same fee from our sale a second time.
 	Fee      float64
 	Undercut float64
-	Window   time.Duration
 }
 
 type Input struct {
@@ -114,6 +118,15 @@ type Valuation struct {
 	// AsksBelowEntry counts independent offers — ours excluded, every venue
 	// included — that are already cheaper than what this listing costs us.
 	AsksBelowEntry int
+	// UndercutsEntry is the subset of those that sit *meaningfully* cheaper
+	// (crossUndercutMargin below entry), i.e. too far away to be explained by
+	// rounding or a fee difference between venues.
+	UndercutsEntry int
+	// Walkaway is the cheapest offer on any venue that a buyer could take
+	// instead of ours. It is what actually bounds the exit, and it is the reason
+	// a hole in one venue's book can no longer read as room to sell into.
+	Walkaway      float64
+	WalkawayVenue string
 	// PricedAboveMarket is the hard verdict: no measured trait premium, several
 	// cheaper offers in front of us, and a model that still wanted to price the
 	// exit above our own entry. The exit was clamped and the trade is manual.
@@ -151,10 +164,6 @@ func Evaluate(in Input) Valuation {
 		Backdrop: in.Backdrop, Symbol: in.Symbol, Attribute: in.Attribute,
 		Liq: in.Liq, FX: in.FX, input: in,
 	}
-	if in.Price <= 0 {
-		v.Reason = "у листинга нет цены"
-		return v
-	}
 	if in.Floor > 0 {
 		v.DiscountToFloor = (in.Floor - in.Price) / in.Floor
 	}
@@ -184,6 +193,11 @@ type CrossMarket struct {
 	Support float64
 	Asks    []float64 // merged across venues, ascending
 	Venues  int
+	// Unreachable counts venues that could not be read at all — a timeout or a
+	// rejected session, as opposed to a venue with nothing listed. Losing this
+	// data silently removes the cap that holds an optimistic exit down, so the
+	// count travels with the quote and blocks unattended buying.
+	Unreachable int
 }
 
 // WithCrossMarket promotes external depth from a footnote to a pricing input.
@@ -195,6 +209,9 @@ func WithCrossMarket(v Valuation, support float64) Valuation {
 // WithCrossDepth is the full form: the reference and the queue behind it.
 func WithCrossDepth(v Valuation, cm CrossMarket) Valuation {
 	if cm.Support <= 0 {
+		// Even with no usable price, the fact that a venue could not be reached
+		// has to survive: it is what stops the desk from trading blind.
+		v.Cross.Unreachable = cm.Unreachable
 		return v
 	}
 	v.Cross = cm
@@ -203,178 +220,65 @@ func WithCrossDepth(v Valuation, cm CrossMarket) Valuation {
 	return v
 }
 
+// recompute is the exit-pricing pipeline. Every stage lives in exit.go and owns
+// one question; this function is the order in which they are asked.
 func recompute(v *Valuation) {
 	in := v.input
-	cost := v.Cost
 	undercut := in.Params.Undercut
 	if undercut < 0 || undercut >= 1 {
 		undercut = 0
 	}
+	resetDerived(v)
 
+	// These have to be checked on every pass, not once in Evaluate.
+	// WithCrossDepth re-runs this whole pipeline on a Valuation that Evaluate
+	// may already have rejected, and a delisted gift arrives here with a price
+	// of zero — which turned Edge into Net/0 = +Inf and rendered a card reading
+	// "BUY, +Inf%". The feed path never saw it because tradable() screens zero
+	// prices first, but /val did.
+	if in.Price <= 0 {
+		v.Reason = "у листинга нет цены — скорее всего его уже сняли с продажи"
+		return
+	}
+	if v.Cost <= 0 {
+		v.Reason = "непонятна цена входа"
+		return
+	}
+
+	external := readLocalBook(v, in)
+	readWalkaway(v, external, v.Cost)
+	setLiquidation(v, in, undercut)
+
+	if !blendWeights(v, in) {
+		return
+	}
+	if !priceExits(v, in, undercut) {
+		return
+	}
+	clampOverpriced(v, v.Cost)
+	buildLadder(v, in, undercut)
+
+	settle(v, in)
+}
+
+// resetDerived clears everything recompute is about to rebuild. WithCrossDepth
+// re-runs the whole pipeline on an already-populated Valuation, so a stale field
+// left behind here would silently survive into the second pass.
+func resetDerived(v *Valuation) {
 	v.Valid, v.Reason = false, ""
 	v.CompetingAsk, v.HasCompetingAsk = 0, false
 	v.LiveDepth, v.DepthPrice3, v.AskGap1, v.AskGap3, v.LiveDepthCount = 0, 0, 0, 0, 0
 	v.ExternalAsks, v.DepthCapped = 0, false
-	v.AsksBelowEntry, v.CheaperAsks, v.PricedAboveMarket, v.ExitCapped = 0, 0, false, ""
-	var external []Ask
-	if in.Book != nil {
-		external = in.Book.ExternalAsks(in.GiftID, in.OwnerID)
-	}
-	if len(external) > 0 {
-		v.ExternalAsks = len(external)
-		v.CompetingAsk, v.HasCompetingAsk = external[0].Price, true
-		v.LiveDepthCount = contiguousDepth(external, depthWindow)
-		if len(external) >= 2 {
-			depth := medianFirst(external, depthWindow)
-			// A hole in the book is not liquidity. Whatever the median of the
-			// first three says, nothing proves the market clears more than
-			// depthGapLimit above the cheapest genuinely competing ask, so that
-			// is where the reference stops.
-			if lid := external[0].Price * (1 + depthGapLimit); depth > lid {
-				depth, v.DepthCapped = lid, true
-			}
-			v.LiveDepth = depth
-		}
-		v.DepthPrice3 = external[minInt(2, len(external)-1)].Price
-		if v.Price > 0 {
-			v.AskGap1 = math.Max(0, external[0].Price/v.Price-1)
-			v.AskGap3 = math.Max(0, v.DepthPrice3/v.Price-1)
-		}
-		for _, a := range external {
-			if a.Price > 0 && a.Price < cost {
-				v.AsksBelowEntry++
-			}
-		}
-	}
-	for _, p := range v.Cross.Asks {
-		if p > 0 && p < cost {
-			v.AsksBelowEntry++
-		}
-	}
+	v.AsksBelowEntry, v.UndercutsEntry, v.CheaperAsks = 0, 0, 0
+	v.PricedAboveMarket, v.ExitCapped = false, ""
+	v.Walkaway, v.WalkawayVenue = 0, ""
+	v.Liquidation, v.LiquidationBasis = 0, ""
+	v.MarketDivergence, v.MarketDisagreement, v.CrossDivergence = 0, false, 0
+	v.BearCase = 0
+}
 
-	// The snapshot floor may still be the candidate we are about to remove.
-	// Liquidation therefore follows the next external ask; floor is only a
-	// fallback when no book depth is available.
-	liveFloor := v.CompetingAsk
-	if liveFloor <= 0 {
-		liveFloor = in.Floor
-	}
-	if liveFloor > 0 {
-		v.Liquidation = liveFloor * (1 - undercut)
-		v.LiquidationBasis = "живой стакан"
-		if v.LiveDepthCount < 2 && in.Liq.Median > 0 && in.Liq.Median < v.Liquidation {
-			v.Liquidation = in.Liq.Median
-			v.LiquidationBasis = "история при тонком стакане"
-		}
-	}
-
-	hw := historyWeight(in.Liq.DistinctGifts)
-	if in.Liq.Median <= 0 {
-		hw = 0
-	}
-	tw := 0.0
-	if in.Attribute.Valid && in.Attribute.ExactSamples >= MinAttributeSamples && in.Attribute.Fair > 0 {
-		tw = .05
-	}
-	cw := 0.0
-	if v.CrossMarketSupport > 0 {
-		cw = .20
-	}
-	lw := 0.0
-	if v.LiveDepth > 0 {
-		lw = math.Max(0, 1-hw-cw-tw)
-	}
-	if lw == 0 && hw+cw+tw == 0 {
-		v.Reason = "нет нормальной опоры для выхода"
-		return
-	}
-
-	// Sparse history is first pulled towards the live market and only then
-	// allowed into the blend. Seven trades over three gifts cannot drag a live
-	// 3.70 book down to a stale 3.26 median.
-	v.HistoryReference = in.Liq.Median
-	if in.Liq.Median > 0 && v.LiveDepth > 0 {
-		trust := hw / .40
-		v.HistoryReference = v.LiveDepth + (in.Liq.Median-v.LiveDepth)*trust
-		v.MarketDivergence = math.Abs(in.Liq.Median/v.LiveDepth - 1)
-		v.MarketDisagreement = v.MarketDivergence > marketDisagreementLimit
-	}
-	if v.CrossMarketSupport > 0 && v.LiveDepth > 0 {
-		v.CrossDivergence = math.Abs(v.CrossMarketSupport/v.LiveDepth - 1)
-	}
-
-	// If the live source is missing, redistribute its weight rather than
-	// silently losing part of the estimate.
-	total := lw + hw + cw + tw
-	if total <= 0 {
-		v.Reason = "не из чего собрать цену выхода"
-		return
-	}
-	lw, hw, cw, tw = lw/total, hw/total, cw/total, tw/total
-	v.LiveWeight, v.HistoryWeight, v.CrossWeight, v.TraitWeight = lw, hw, cw, tw
-
-	liveFast := v.LiveDepth
-	if liveFast > 0 {
-		liveFast *= 1 - undercut
-	}
-	v.FastExit = weighted(
-		component{liveFast, lw}, component{v.HistoryReference, hw},
-		component{v.CrossMarketSupport, cw}, component{in.Attribute.Fair, tw},
-	)
-	// History can pull a live price down, but cannot lift a fast exit through
-	// the visible queue. External depth may raise that ceiling only when an
-	// independent venue confirms it — and it works in both directions: a venue
-	// with a real stack *below* the Tonnel book caps us instead of confirming
-	// us, because that is where our buyer will go.
-	ceiling := liveFast
-	if v.CrossMarketSupport > 0 {
-		crossFast := v.CrossMarketSupport * (1 - undercut)
-		if len(v.Cross.Asks) >= 2 && crossFast < ceiling {
-			ceiling = math.Max(math.Min(ceiling, crossFast), v.Liquidation)
-		} else {
-			ceiling = math.Max(ceiling, crossFast)
-		}
-	}
-	if ceiling > 0 && v.FastExit > ceiling {
-		v.FastExit = ceiling
-	}
-	v.FairValue = weighted(
-		component{v.LiveDepth, lw}, component{v.HistoryReference, hw},
-		component{v.CrossMarketSupport, cw}, component{in.Attribute.Fair, tw},
-	)
-	if v.FastExit <= 0 {
-		v.Reason = "быстрый выход не посчитался"
-		return
-	}
-	if v.Liquidation > 0 && v.FastExit < v.Liquidation {
-		v.FastExit = v.Liquidation
-	}
-
-	// The overpriced-listing guard. Claiming we can get out above what we just
-	// paid needs a reason, and "the model averaged its way there" is not one:
-	// with no measured trait premium and several independent offers already
-	// cheaper than our entry, we are the expensive ask, not the misprice. The
-	// exit is pulled back to entry (never below the live liquidation price) and
-	// the listing is flagged manual.
-	if tw == 0 && v.AsksBelowEntry >= minAsksBelowEntry && cost > 0 && v.FastExit > cost {
-		if capped := math.Max(v.Liquidation, cost); capped < v.FastExit {
-			v.FastExit = capped
-			v.PricedAboveMarket = true
-			v.ExitCapped = "выход прижат ко входу: рынок дешевле нас"
-		}
-	}
-
-	v.PatientAsk = math.Max(v.FastExit, v.FairValue*(1+patientWaitPremium))
-	if in.Attribute.Valid && in.Attribute.ExactSamples >= MinAttributeSamples && in.Book != nil {
-		if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.OwnerID, in.Backdrop, in.Symbol); ok {
-			v.PatientAsk = math.Max(math.Max(v.FastExit, v.FairValue), math.Min(v.PatientAsk, ask*(1-undercut)))
-		}
-	}
-	v.PatientExit = v.PatientAsk
-	if in.Liq.Trend > 0 && in.Liq.Trend < .98 {
-		v.BearCase = math.Min(v.FastExit, v.FairValue*in.Liq.Trend)
-	}
-
+// settle turns the priced ladder into the numbers a decision is made on.
+func settle(v *Valuation, in Input) {
 	v.Support = v.LiveDepth
 	v.SupportGuarded = in.Liq.Median > 0 && v.LiveDepth > in.Liq.Median*(1+marketDisagreementLimit) && v.FastExit > in.Liq.Median
 	v.Exit, v.ExitBasis, v.ChosenExit = v.FastExit, "быстрый выход", "быстрый"
@@ -386,22 +290,8 @@ func recompute(v *Valuation) {
 		v.CompetitorsNear = in.Book.CountBetween(v.FastExit, v.FastExit*1.05, in.GiftID, in.OwnerID)
 		v.CheaperAsks = in.Book.CountBelow(v.FastExit, in.GiftID, in.OwnerID)
 	}
-	if in.Liq.Velocity > 0 {
-		v.DaysOfSupply = float64(in.Supply) / in.Liq.Velocity
-		v.FastExpectedDays = float64(1+v.CompetitorsNear) / in.Liq.Velocity
-		v.ExpectedDays = v.FastExpectedDays
-		share := math.Max(in.Attribute.ExactShare, .05)
-		if !in.Attribute.Valid {
-			share = .25
-		}
-		queue := 0
-		if in.Book != nil {
-			queue = in.Book.CountAttributesBetween(v.PatientAsk, v.PatientAsk*1.05, in.GiftID, in.OwnerID, in.Backdrop, in.Symbol)
-		}
-		v.PatientExpectedDays = float64(1+queue) / (in.Liq.Velocity * share)
-	} else {
-		v.DaysOfSupply, v.ExpectedDays, v.FastExpectedDays, v.PatientExpectedDays = math.Inf(1), math.Inf(1), math.Inf(1), math.Inf(1)
-	}
+	expectedDays(v, in)
+
 	v.Confidence = confidence(in.Liq, in.Attribute)
 	if v.MarketDisagreement {
 		v.Confidence *= .65
@@ -440,40 +330,3 @@ func historyWeight(distinct int) float64 {
 	}
 }
 
-// contiguousDepth counts how many of the cheapest asks belong to one pool of
-// liquidity. The run ends at the first jump wider than depthGapLimit, because
-// past a hole like 4.21 → 10.20 there is nothing to sell into.
-func contiguousDepth(asks []Ask, limit int) int {
-	n := minInt(limit, len(asks))
-	for i := 1; i < n; i++ {
-		if asks[i-1].Price <= 0 || asks[i].Price > asks[i-1].Price*(1+depthGapLimit) {
-			return i
-		}
-	}
-	return n
-}
-
-func medianFirst(asks []Ask, n int) float64 {
-	if len(asks) == 0 {
-		return 0
-	}
-	if n > len(asks) {
-		n = len(asks)
-	}
-	prices := make([]float64, n)
-	for i := 0; i < n; i++ {
-		prices[i] = asks[i].Price
-	}
-	sort.Float64s(prices)
-	if n%2 == 1 {
-		return prices[n/2]
-	}
-	return (prices[n/2-1] + prices[n/2]) / 2
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

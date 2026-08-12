@@ -82,7 +82,6 @@ func (d *Detector) params() pricing.Params {
 	return pricing.Params{
 		Fee:      d.cfg.TonnelFee,
 		Undercut: d.cfg.Undercut,
-		Window:   d.window(),
 	}
 }
 
@@ -294,16 +293,21 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 			fails = append(fails, fmt.Sprintf("лот стоит %.2f, а поднять сейчас можно максимум %.2f (тикет и свободный баланс)", v.Cost, room))
 		}
 	}
+	// The arithmetic of the trade, and the reason behind it, are two different
+	// statements and the operator needs both. Reporting only the second used to
+	// hide the first: "the market is cheaper than you" does not tell anyone how
+	// far under water the round trip actually is.
+	if v.Edge <= 0 {
+		fails = append(fails, fmt.Sprintf("реальный вход %.3f выше быстрого выхода %.3f — сделка уже %.1f%% в минусе до риск-буфера", v.Cost, v.FastExit, -v.Edge*100))
+	} else if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
+	}
 	// No trait premium, cheaper offers already standing in front of us: this is
 	// an expensive listing, not a mispriced one.
 	if v.PricedAboveMarket {
 		fails = append(fails, fmt.Sprintf(
 			"дешевле твоего входа %.3f уже стоит %d чужих асков на Tonnel и других площадках, а премии за трейты нет — это не мисприс",
 			v.Cost, v.AsksBelowEntry))
-	} else if v.Edge <= 0 {
-		fails = append(fails, fmt.Sprintf("реальный вход %.3f выше быстрого выхода %.3f — сделка уже %.1f%% в минусе до риск-буфера", v.Cost, v.FastExit, -v.Edge*100))
-	} else if v.ScoreBreakdown.RiskAdjustedEdge < g.MinEdge {
-		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%)", v.ScoreBreakdown.RiskAdjustedEdge*100, g.MinEdge*100, v.Edge*100))
 	}
 	if v.Liq.Velocity < g.MinVelocity {
 		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже %.2f", v.Liq.Velocity, g.MinVelocity))
@@ -346,13 +350,20 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	if v.Liq.Turnover < a.MinTurnover {
 		fails = append(fails, fmt.Sprintf(
 			"в истории всего %d разных гифтов на %d сделок (оборот %.2f, автобаю надо %.2f) — похоже на гон одного NFT",
-			v.Liq.DistinctGifts, v.Liq.Sales, v.Liq.Turnover, a.MinTurnover))
+			v.Liq.DistinctGifts, v.Liq.Prints, v.Liq.Turnover, a.MinTurnover))
 	}
 	if v.MarketDisagreement {
 		fails = append(fails, fmt.Sprintf("рынок спорит сам с собой: история и живой стакан разъехались на %.0f%% — только руками", v.MarketDivergence*100))
 	}
-	if v.CrossDivergence > .15 {
+	if v.CrossDivergence > pricing.CrossDivergenceLimit {
 		fails = append(fails, fmt.Sprintf("Tonnel и другие площадки разъехались на %.0f%% — только руками", v.CrossDivergence*100))
+	}
+	// Cross-market depth is the cap that keeps a hole in the Tonnel book from
+	// reading as room to sell into. Without it we are pricing blind, and "the
+	// other venues did not answer" must never be mistaken for "they had no
+	// objection".
+	if v.Cross.Unreachable > 0 {
+		fails = append(fails, fmt.Sprintf("%d площадк(и) не ответили — без их стакана автобай не работает", v.Cross.Unreachable))
 	}
 	if v.Liq.MADRatio > a.MaxMADRatio {
 		fails = append(fails, fmt.Sprintf("разброс цен %.0f%% выше максимума автобая %.0f%%", v.Liq.MADRatio*100, a.MaxMADRatio*100))

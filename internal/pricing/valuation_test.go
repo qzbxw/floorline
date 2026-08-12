@@ -48,7 +48,7 @@ func evalPrice(t *testing.T, price float64, book *Book, liq Liquidity, floor flo
 		Liq:    liq,
 		Floor:  floor,
 		Supply: supply,
-		Params: Params{Fee: testFee, Undercut: testUndercut, Window: 14 * 24 * time.Hour},
+		Params: Params{Fee: testFee, Undercut: testUndercut},
 	})
 }
 
@@ -174,6 +174,28 @@ func TestZeroPriceIsInvalid(t *testing.T) {
 	v := evalPrice(t, 0, bookOf(42, 0, 100), liqOf(100, 10), 100, 5)
 	if v.Valid {
 		t.Error("a listing with no price cannot be valued")
+	}
+}
+
+// Production, /val on a gift that had already been delisted: the price came
+// back as zero, Evaluate correctly refused — and then WithCrossDepth re-ran the
+// whole pipeline, which did not repeat the check. Edge became Net/0 and the
+// card read "✅ BUY — проходит фильтр сигнала · +Inf%".
+func TestDelistedGiftStaysInvalidThroughCrossMarket(t *testing.T) {
+	v := evalPrice(t, 0, bookOf(42, 0, 5, 5, 5.2), liqOf(3.28, 11), 5, 14)
+	v = WithCrossDepth(v, CrossMarket{Support: 3.76, Venues: 1, Asks: []float64{3.7, 3.76, 3.79}})
+
+	if v.Valid {
+		t.Fatalf("a delisted gift must stay unpriceable: exit %.3f edge %v", v.FastExit, v.Edge)
+	}
+	if v.Reason == "" {
+		t.Error("an invalid valuation must explain itself")
+	}
+	if math.IsInf(v.Edge, 0) || math.IsNaN(v.Edge) {
+		t.Errorf("edge = %v, want a finite number", v.Edge)
+	}
+	if s := BuildScore(v, 1); math.IsInf(s.Total, 0) || math.IsNaN(s.Total) {
+		t.Errorf("score = %v, want a finite number", s.Total)
 	}
 }
 
@@ -483,21 +505,55 @@ func TestGappyBookCannotInventAnExitAboveTheEntry(t *testing.T) {
 	if v.AsksBelowEntry < 5 {
 		t.Errorf("asks below entry = %d, want the 4.21 Tonnel ask plus 4 / 5 / 5 / 5.89 on Portals", v.AsksBelowEntry)
 	}
-	// "Nobody within 5% of your exit" is not the same statement as "you are the
-	// cheapest offer", and the card used to conflate the two.
-	if v.CheaperAsks < 1 {
-		t.Error("the 4.21 ask undercuts our exit; the card must not call us the best ask")
+	// The exit has to price *under* the one real ask in the book, not above the
+	// hole behind it. Getting this right is what makes CheaperAsks zero here:
+	// at 4.168 we genuinely would be the cheapest offer.
+	if v.FastExit >= 4.21 {
+		t.Errorf("fast exit %.3f must undercut the only real ask 4.21, not clear the hole above it", v.FastExit)
+	}
+	// Four independent offers sit more than 5% under our entry. That is a market
+	// telling us the entry is wrong, and no gap in the local book overrides it.
+	if v.UndercutsEntry < 4 {
+		t.Errorf("undercuts of entry = %d, want the 4.21 ask plus 4 / 5 / 5 on Portals", v.UndercutsEntry)
+	}
+	if !v.PricedAboveMarket {
+		t.Error("a market standing well under our entry must veto the trade outright")
 	}
 }
 
-// The backstop behind the depth fix: a stale-high history and one expensive
-// external venue can still blend their way to an exit above our own entry while
-// the whole live book sits under it. Without a measured trait premium that is
-// arithmetic, not an edge.
+// A stale-high history and one expensive external venue must not blend their
+// way to an exit above our own entry while the whole live book sits under it.
+//
+// This used to need the overpriced clamp to catch it. It no longer does: an
+// expensive foreign venue can no longer raise the ceiling, so the exit stays
+// pinned to the local queue and never gets above entry in the first place. The
+// clamp is still asserted separately, below.
 func TestBlendCannotPriceAboveEntryWhileTheBookIsCheaper(t *testing.T) {
 	v := evalPrice(t, 5, bookOf(42, 5, 4.9, 4.95, 5), liqOf(8, 40), 4.9, 20)
 	v = WithCrossDepth(v, CrossMarket{Support: 9, Venues: 1, Asks: []float64{9, 9.5}})
 
+	if v.FastExit > v.Cost {
+		t.Errorf("exit %.3f still above the %.3f entry", v.FastExit, v.Cost)
+	}
+	if v.Edge > 0 {
+		t.Errorf("edge %.4f must not survive: the whole live book is under our entry", v.Edge)
+	}
+	// The ceiling is the live queue, so a 9.00 quote elsewhere buys us nothing.
+	if v.FastExit > v.LiveDepth {
+		t.Errorf("exit %.3f cleared the live depth %.3f on the strength of a foreign quote", v.FastExit, v.LiveDepth)
+	}
+}
+
+// The clamp still has a job: when the local book is too thin to produce a
+// ceiling at all, a stale history can blend straight past the entry while
+// another venue's queue sits well under it.
+func TestOverpricedClampFiresWhenTheLocalBookHasNoDepth(t *testing.T) {
+	v := evalPrice(t, 5, bookOf(42, 5, 9), liqOf(8, 40), 9, 20)
+	v = WithCrossDepth(v, CrossMarket{Support: 4, Venues: 1, Asks: []float64{3.9, 4.0}})
+
+	if v.LiveDepth != 0 {
+		t.Fatalf("one competing ask must not become depth: %.3f", v.LiveDepth)
+	}
 	if !v.PricedAboveMarket {
 		t.Fatalf("guard did not fire: exit %.3f, entry %.3f, %d asks below entry", v.FastExit, v.Cost, v.AsksBelowEntry)
 	}
@@ -536,6 +592,115 @@ func TestCheaperExternalQueueCapsTheFastExit(t *testing.T) {
 	}
 	if capped.FastExit < capped.Liquidation-1e-9 {
 		t.Errorf("the cap must never push the exit below the live liquidation price %.3f", capped.Liquidation)
+	}
+}
+
+// Production, 12 Aug — the two signals that made the operator distrust the bot.
+//
+// Both have the same shape: a hole in the Tonnel book sitting far above a dense,
+// agreeing queue on Portals. The old engine priced the exit into the hole and
+// printed +9.5% and +41.9%. It could not do otherwise: the cross-market cap was
+// floored at a liquidation price derived from that same hole, so the cap was
+// arithmetically incapable of biting.
+func TestLocalGapCannotOutvoteAnAgreeingExternalQueue(t *testing.T) {
+	t.Run("Liberty Figure Deputy", func(t *testing.T) {
+		// Ask 4.5 (4.522 all in), next Tonnel ask 5.00, Portals 3.95–4.00.
+		liq := liqOf(3.764, 14)
+		liq.Velocity = 1.0
+		v := evalPrice(t, 4.5, bookOf(42, 4.5, 5, 5, 5.2), liq, 5, 28)
+		v = WithCrossDepth(v, CrossMarket{Support: 3.97, Venues: 1, Asks: []float64{3.95, 3.97, 4, 4, 4}})
+
+		if v.FastExit > 4.0 {
+			t.Errorf("fast exit %.3f: Portals is stacked at 3.95–4.00, the Tonnel 5.00 is a hole", v.FastExit)
+		}
+		if v.Edge > 0 {
+			t.Errorf("edge %+.1f%% — this trade lost money at 4.522 in", v.Edge*100)
+		}
+		if !v.PricedAboveMarket {
+			t.Error("five external asks more than 5% under entry must veto the trade")
+		}
+	})
+
+	t.Run("Ice Cream Beehive", func(t *testing.T) {
+		// Ask 3.47 (3.487 all in), next Tonnel ask 5.00, Portals 3.69–3.80.
+		// This one is a real buy — just a +5-7% one, not the +41.9% printed.
+		liq := liqOf(3.229, 7)
+		liq.Velocity = .5
+		v := evalPrice(t, 3.47, bookOf(42, 3.47, 5, 5, 5), liq, 5, 14)
+		v = WithCrossDepth(v, CrossMarket{Support: 3.7, Venues: 1, Asks: []float64{3.69, 3.7, 3.76, 3.79, 3.8}})
+
+		if v.FastExit > 3.8 {
+			t.Errorf("fast exit %.3f must respect the Portals queue at 3.69–3.80", v.FastExit)
+		}
+		if v.Edge <= 0 || v.Edge > .12 {
+			t.Errorf("edge %+.1f%%, want a realistic single-digit one, not the 41.9%% that was printed", v.Edge*100)
+		}
+		// Nothing on Portals is below entry here, so the veto must stay quiet:
+		// the guard has to separate a genuine discount from an overpriced lot.
+		if v.PricedAboveMarket {
+			t.Error("no external ask is under this entry; the veto must not fire")
+		}
+	})
+}
+
+// A price and the wait it implies have to agree. The two estimates come from
+// independent formulas, and production printed the same number on both rungs
+// with the patient one arriving three days sooner.
+func TestPatientRungIsNeverQuickerThanTheFastOne(t *testing.T) {
+	liq := liqOf(3.05, 14)
+	liq.Velocity = 1.0
+	v := evalPrice(t, 3.16, bookOf(42, 3.16, 3.5, 3.5, 3.55), liq, 3.5, 22)
+
+	if v.PatientAsk < v.FastExit {
+		t.Fatalf("patient %.3f below fast %.3f", v.PatientAsk, v.FastExit)
+	}
+	if v.PatientExpectedDays < v.FastExpectedDays {
+		t.Errorf("patient fills in %.1fd but fast takes %.1fd — waiting for more money cannot be quicker",
+			v.PatientExpectedDays, v.FastExpectedDays)
+	}
+	if SamePrice(v.PatientAsk, v.FastExit) && v.PatientExpectedDays != v.FastExpectedDays {
+		t.Errorf("one price (%.3f) cannot have two different waits: %.1fd vs %.1fd",
+			v.FastExit, v.FastExpectedDays, v.PatientExpectedDays)
+	}
+}
+
+// The whole ladder, on every shape of book the engine sees.
+func TestExitLadderIsMonotonic(t *testing.T) {
+	cases := []struct {
+		name  string
+		price float64
+		book  *Book
+		liq   Liquidity
+		cross *CrossMarket
+	}{
+		{"dense book", 3.10, bookOf(42, 3.10, 3.24, 3.25, 3.30), liqOf(3.20, 20), nil},
+		{"gap above the floor", 6, bookOf(42, 6, 4.21, 7.9, 10.2), liqOf(3.846, 9),
+			&CrossMarket{Support: 5, Venues: 1, Asks: []float64{4, 5, 5, 5.89, 6}}},
+		{"stale-low history", 3.20, bookOf(42, 3.20, 3.75, 3.85, 3.90), liqOf(3.14, 30),
+			&CrossMarket{Support: 3.91, Venues: 1, Asks: []float64{3.90, 3.95}}},
+		{"cheaper elsewhere", 4.5, bookOf(42, 4.5, 5, 5, 5.2), liqOf(3.764, 14),
+			&CrossMarket{Support: 3.97, Venues: 1, Asks: []float64{3.95, 3.97, 4, 4, 4}}},
+		{"single competing ask", 700, bookOf(42, 700, 5000), liqOf(900, 20), nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := evalPrice(t, c.price, c.book, c.liq, 0, 10)
+			if c.cross != nil {
+				v = WithCrossDepth(v, *c.cross)
+			}
+			if !v.Valid {
+				t.Fatalf("valuation invalid: %s", v.Reason)
+			}
+			if v.Liquidation > v.FastExit+1e-9 {
+				t.Errorf("liquidation %.4f above fast exit %.4f", v.Liquidation, v.FastExit)
+			}
+			if v.PatientAsk < v.FastExit-1e-9 {
+				t.Errorf("patient %.4f below fast %.4f", v.PatientAsk, v.FastExit)
+			}
+			if v.PatientExpectedDays < v.FastExpectedDays {
+				t.Errorf("patient %.1fd quicker than fast %.1fd", v.PatientExpectedDays, v.FastExpectedDays)
+			}
+		})
 	}
 }
 

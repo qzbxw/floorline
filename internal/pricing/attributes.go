@@ -109,7 +109,6 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 	portfolioFit = clamp(portfolioFit, 0, 1)
 	b := ScoreBreakdown{NetProfit: v.Net, ExpectedDays: v.ExpectedDays, Confidence: v.Confidence, PortfolioFit: portfolioFit, FXFactor: 1, DepthFactor: 1}
 	b.SafetyBuffer = .005 + math.Min(.03, v.Liq.MADRatio*.15/math.Sqrt(math.Max(float64(v.Liq.Sales), 1))) + math.Min(.01, float64(v.CompetitorsNear)*.001)
-	b.RiskAdjustedEdge = math.Max(v.Edge-b.SafetyBuffer, 0)
 	b.FillProbability = 1 / (1 + math.Max(v.ExpectedDays, 0)/3)
 	if v.FX.Valid {
 		b.FXFactor = clamp(1-math.Max(v.FX.FloorLag, 0)*1.5+math.Max(-v.FX.FloorLag, 0)*.35, .5, 1.15)
@@ -117,16 +116,24 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 			b.FXFactor *= .85
 		}
 	}
+	// The queue in front of the exit. A wide gap above us is room to sell into;
+	// a tight one — or a competing ask already at or below our price, which the
+	// clamp at AskGap1 reports as a flat zero — means we are one of a crowd and
+	// the modelled exit needs a wider margin of error.
 	switch {
 	case v.AskGap1 >= .05 || v.AskGap3 >= .08:
 		b.DepthFactor = 1.18
-	case v.AskGap1 > 0 && v.AskGap1 < .02 && v.AskGap3 > 0 && v.AskGap3 < .04:
+	case v.AskGap1 < .02 && v.AskGap3 < .04:
 		b.DepthFactor = .72
 		b.SafetyBuffer += .01
 	}
 	if v.MarketDisagreement {
 		b.DepthFactor *= .45
 	}
+	// Every penalty above must land before this line: the risk-adjusted edge is
+	// what the gates read, so a buffer added after it would only ever decorate
+	// the recorded breakdown.
+	b.RiskAdjustedEdge = math.Max(v.Edge-b.SafetyBuffer, 0)
 	if v.Valid && b.RiskAdjustedEdge > 0 && !math.IsInf(v.ExpectedDays, 1) {
 		b.ProfitPerDay = v.Net / math.Max(v.ExpectedDays, .25)
 		b.DailyROI = b.RiskAdjustedEdge / math.Max(v.ExpectedDays, .25)

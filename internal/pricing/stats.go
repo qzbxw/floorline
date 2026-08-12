@@ -18,15 +18,22 @@ type Liquidity struct {
 	Window   time.Duration // the window the caller asked for
 	Coverage time.Duration // how much history we actually hold
 
-	Sales  int // trades in the window
-	Sales7 int // trades in the most recent 7 days
+	// Prints is every trade in the window, repeats included. It is the raw tape.
+	Prints int
+	// Sales is the deduplicated count: one trade per physical gift. Every
+	// statistic that a repeated flip could inflate — velocity, median, MAD — is
+	// built on this, not on Prints.
+	Sales  int
+	Sales7 int // deduplicated trades in the most recent 7 days
 	// DistinctGifts is how many different physical gifts those trades involved.
 	// The endpoint carries no counterparty identities, so this is the available
 	// wash-trading signal: forty "trades" of the same gift_num is one item being
 	// passed around, not a market.
 	DistinctGifts int
-	// Turnover is DistinctGifts / Sales. Near 1 means genuinely different items
-	// changing hands; near 0 means the same one going in circles.
+	// Turnover is DistinctGifts / Prints. Near 1 means genuinely different items
+	// changing hands; near 0 means the same one going in circles. It must be
+	// measured against the raw tape: comparing distinct gifts to the already
+	// deduplicated count would make it identically 1 and the guard inert.
 	Turnover float64
 
 	Velocity   float64 // trades per day, normalised to the history we really have
@@ -73,6 +80,7 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 		if physicalID == 0 {
 			continue // unverifiable identity must not support unattended trading
 		}
+		l.Prints++
 		if prev, ok := latest[physicalID]; !ok || s.TS.After(prev.TS) {
 			latest[physicalID] = s
 		}
@@ -96,7 +104,7 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 	if l.Sales == 0 {
 		return l
 	}
-	l.Turnover = float64(l.DistinctGifts) / float64(l.Sales)
+	l.Turnover = float64(l.DistinctGifts) / float64(l.Prints)
 
 	l.Median = median(prices)
 	l.MAD = medianAbsDev(prices, l.Median)
