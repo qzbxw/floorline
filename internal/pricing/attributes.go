@@ -156,7 +156,7 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 	// recorded breakdown.
 	b.RiskAdjustedEdge = math.Max(v.Edge-b.SafetyBuffer, 0)
 
-	b.Quality = clamp(v.Confidence*b.DepthFactor*b.CrossFactor*b.LiquidityFactor*b.FXFactor*portfolioFit, 0, 1)
+	b.Quality = evidenceQuality(v, b, portfolioFit)
 
 	if v.Valid && b.RiskAdjustedEdge > 0 && !math.IsInf(v.ExpectedDays, 1) {
 		b.ProfitPerDay = v.Net / math.Max(v.ExpectedDays, .25)
@@ -170,12 +170,60 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 	return b
 }
 
+// evidenceQuality is how much the trade deserves to be believed, in [0,1].
+//
+// Multiplying every trust factor together was wrong twice over. Six numbers
+// each below one collapse towards zero, so an ordinary well-evidenced trade
+// scored like a broken one: a +9.5% flip on ten distinct gifts with Portals
+// confirming came out at 7% quality and five points out of a hundred.
+//
+// And it double-counted. History disagreeing with the book discounted
+// confidence, discounted depth, and showed up a third time through
+// cross-market divergence — one fact, three penalties, compounding.
+//
+// So the dimensions are averaged rather than multiplied. A geometric mean still
+// punishes a genuinely broken dimension hard (one near-zero term drags the
+// whole thing down) without letting four merely-imperfect ones bottom out. The
+// disagreement discount is then applied exactly once, on top.
+func evidenceQuality(v Valuation, b ScoreBreakdown, portfolioFit float64) float64 {
+	dims := []float64{
+		clamp(v.Confidence, .01, 1),      // how much history there is
+		clamp(b.DepthFactor, .01, 1.18),  // whether there is a queue to sell into
+		clamp(b.CrossFactor, .01, 1.05),  // whether other venues corroborate
+		clamp(b.LiquidityFactor, .01, 1), // whether the model actually trades
+	}
+	product := 1.0
+	for _, d := range dims {
+		product *= d
+	}
+	q := math.Pow(product, 1/float64(len(dims)))
+
+	// One fact, one penalty. The history and the price we settled on telling
+	// different stories is a reason for a human to look, and it is already a
+	// hard auto-buy gate; here it costs rank once rather than three times.
+	if v.MarketDisagreement {
+		q *= .75
+	}
+	// These two are about us and the wider market rather than about the
+	// evidence, so they stay multiplicative.
+	return clamp(q*b.FXFactor*portfolioFit, 0, 1)
+}
+
 // depthFactor judges the queue we would have to sell through.
 //
-// The order of these cases is the fix: a gap only counts as room to sell into
-// when there is a real run of prices under it. Above a single ask the same gap
-// is the hole itself.
+// A gap only counts as room to sell into when there is a real run of prices
+// under it. Above a single ask the same gap is the hole itself — that is what
+// used to earn the highest score the desk ever printed.
+//
+// The judgement is about whichever book the exit actually rests on. When
+// another venue's queue caps the price, a hole in the local book is no longer
+// load-bearing and penalising it is penalising a number we did not use.
 func depthFactor(v Valuation, b *ScoreBreakdown) float64 {
+	if v.ExitFromCross {
+		// Priced off the external queue; its own depth is what matters, and
+		// crossFactor already scores that.
+		return 1
+	}
 	f := 1.0
 	switch {
 	case v.DepthCapped || (v.HasCompetingAsk && v.LiveDepthCount < 2):
@@ -191,9 +239,6 @@ func depthFactor(v Valuation, b *ScoreBreakdown) float64 {
 	}
 	if !v.HasCompetingAsk {
 		f = math.Min(f, .5) // nothing to price against but history
-	}
-	if v.MarketDisagreement {
-		f *= .45
 	}
 	return f
 }

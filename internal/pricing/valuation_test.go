@@ -752,8 +752,9 @@ func TestGapAboveASingleAskIsNotRewardedAsDepth(t *testing.T) {
 // The score has to be readable at a glance and comparable between cards. The
 // old one was an unbounded product that ranged from 9 to 136.
 func TestScoreStaysOnAHundredPointScale(t *testing.T) {
-	// A deliberately extreme case: huge edge, sells in hours, dense history.
-	liq := liqOf(10, 60)
+	// A deliberately extreme case: huge edge, sells in hours, dense history that
+	// agrees with the live book.
+	liq := liqOf(9.1, 60)
 	liq.DistinctGifts, liq.Velocity, liq.MADRatio = 60, 12, .01
 	v := evalPrice(t, 3, bookOf(42, 3, 9, 9.1, 9.2), liq, 9, 60)
 	v = WithCrossDepth(v, CrossMarket{Support: 9, Venues: 2, Asks: []float64{9, 9.1, 9.2}})
@@ -778,6 +779,86 @@ func TestScoreStaysOnAHundredPointScale(t *testing.T) {
 	slow := evalPrice(t, 4.6, bookOf(42, 4.6, 5, 5.2, 5.5), dead, 4.55, 16)
 	if slow.ScoreBreakdown.Total > 10 {
 		t.Errorf("a model trading twice a fortnight scored %.1f", slow.ScoreBreakdown.Total)
+	}
+}
+
+// The whole point of a 0..100 scale is that the bands mean something. This
+// pins the shape of the distribution: an ordinary good trade has to be clearly
+// separated from both a dead one and a near-perfect one, or the card's wording
+// is decoration.
+func TestScoreBandsAreDistinguishable(t *testing.T) {
+	// Ordinary good: 8% edge, sells in a couple of days, decent history, the
+	// external queue agreeing.
+	liq := liqOf(3.3, 24)
+	liq.DistinctGifts, liq.Velocity, liq.MADRatio = 20, 1.5, .04
+	good := evalPrice(t, 3.2, bookOf(42, 3.2, 3.55, 3.6, 3.65), liq, 3.55, 20)
+	good = WithCrossDepth(good, CrossMarket{Support: 3.6, Venues: 2, Asks: []float64{3.58, 3.6, 3.62}})
+
+	// Dead: four prints over two gifts, a fortnight to sell.
+	dead := liqOf(4.25, 4)
+	dead.DistinctGifts, dead.Velocity, dead.Turnover = 2, .14, .5
+	bad := evalPrice(t, 4.6, bookOf(42, 4.6, 5, 5.2, 5.5), dead, 4.55, 16)
+
+	t.Logf("good: score %.1f quality %.0f%% edge %+.1f%% days %.1f",
+		good.ScoreBreakdown.Total, good.ScoreBreakdown.Quality*100, good.Edge*100, good.ExpectedDays)
+	t.Logf("dead: score %.1f quality %.0f%% edge %+.1f%% days %.1f",
+		bad.ScoreBreakdown.Total, bad.ScoreBreakdown.Quality*100, bad.Edge*100, bad.ExpectedDays)
+
+	if good.ScoreBreakdown.Total < 20 {
+		t.Errorf("an ordinary good trade scored %.1f — the middle of the scale is unreachable",
+			good.ScoreBreakdown.Total)
+	}
+	if good.ScoreBreakdown.Total <= bad.ScoreBreakdown.Total+15 {
+		t.Errorf("good %.1f barely beats dead %.1f; the scale does not discriminate",
+			good.ScoreBreakdown.Total, bad.ScoreBreakdown.Total)
+	}
+}
+
+// Production, 12 Aug: Whip Cupcake, a +9.5% flip on ten distinct gifts with the
+// Portals queue confirming the exit, scored 5/100 on 7% "confidence".
+//
+// One fact — the trade history sitting away from the price — was charged three
+// times: it discounted confidence, discounted depth, and appeared again as
+// cross-market divergence. Compounded across six multiplied factors, an
+// ordinary well-evidenced trade scored like a broken one.
+func TestOneDisagreementIsNotChargedThreeTimes(t *testing.T) {
+	liq := liqOf(3.219, 12)
+	liq.DistinctGifts, liq.Velocity, liq.MADRatio, liq.Trend = 10, .71, .05, 1.08
+
+	v := evalPrice(t, 3.6, bookOf(42, 3.6, 5, 5, 5.2), liq, 5, 7)
+	v = WithCrossDepth(v, CrossMarket{Support: 4, Venues: 1, Asks: []float64{3.99, 4, 4, 4.21, 4.33}})
+
+	if v.Edge < .05 {
+		t.Fatalf("fixture is wrong: edge %.3f", v.Edge)
+	}
+	s := v.ScoreBreakdown
+	if s.Quality < .3 {
+		t.Errorf("quality %.0f%% on ten distinct gifts with an agreeing external queue", s.Quality*100)
+	}
+	if s.Total < 25 {
+		t.Errorf("a confirmed +%.1f%% trade scored %.1f", v.Edge*100, s.Total)
+	}
+}
+
+// The divergence anchor has to be the price we settle on, not the local book.
+// Whip Cupcake's history sat 36% from a Tonnel ask of 5.00 that the engine had
+// already discarded in favour of a Portals queue at 4.00 — and then that
+// discredited anchor was used as evidence against the trade.
+func TestDivergenceIsMeasuredAgainstThePriceWeActuallyUse(t *testing.T) {
+	liq := liqOf(3.219, 12)
+	liq.DistinctGifts, liq.Velocity = 10, .71
+
+	v := evalPrice(t, 3.6, bookOf(42, 3.6, 5, 5, 5.2), liq, 5, 7)
+	v = WithCrossDepth(v, CrossMarket{Support: 4, Venues: 1, Asks: []float64{3.99, 4, 4, 4.21, 4.33}})
+
+	if !v.ExitFromCross {
+		t.Fatalf("fixture is wrong: the exit should be capped by the external queue")
+	}
+	// Against the 5.00 hole the gap reads 36%; against the 3.96 we will actually
+	// ask, it is around 19%.
+	if v.MarketDivergence > .25 {
+		t.Errorf("divergence %.0f%% is still measured against the discarded local ask",
+			v.MarketDivergence*100)
 	}
 }
 

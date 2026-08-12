@@ -132,6 +132,10 @@ type Valuation struct {
 	// exit above our own entry. The exit was clamped and the trade is manual.
 	PricedAboveMarket bool
 	ExitCapped        string
+	// ExitFromCross records that another venue's queue, not the local book, is
+	// what bounds the exit. When it does, a hole in the local book is no longer
+	// something the price depends on, and must not be scored as if it were.
+	ExitFromCross bool
 	// CheaperAsks is how many live Tonnel asks undercut our own fast exit.
 	CheaperAsks int
 
@@ -275,7 +279,7 @@ func resetDerived(v *Valuation) {
 	v.LiveDepth, v.DepthPrice3, v.AskGap1, v.AskGap3, v.LiveDepthCount = 0, 0, 0, 0, 0
 	v.ExternalAsks, v.DepthCapped = 0, false
 	v.AsksBelowEntry, v.UndercutsEntry, v.CheaperAsks = 0, 0, 0
-	v.PricedAboveMarket, v.ExitCapped = false, ""
+	v.PricedAboveMarket, v.ExitCapped, v.ExitFromCross = false, "", false
 	v.Walkaway, v.WalkawayVenue = 0, ""
 	v.Liquidation, v.LiquidationBasis = 0, ""
 	v.MarketDivergence, v.MarketDisagreement, v.CrossDivergence = 0, false, 0
@@ -284,6 +288,7 @@ func resetDerived(v *Valuation) {
 
 // settle turns the priced ladder into the numbers a decision is made on.
 func settle(v *Valuation, in Input) {
+	measureDivergence(v, in)
 	v.Support = v.LiveDepth
 	v.SupportGuarded = in.Liq.Median > 0 && v.LiveDepth > in.Liq.Median*(1+marketDisagreementLimit) && v.FastExit > in.Liq.Median
 	v.Exit, v.ExitBasis, v.ChosenExit = v.FastExit, "быстрый выход", "быстрый"
@@ -297,10 +302,12 @@ func settle(v *Valuation, in Input) {
 	}
 	expectedDays(v, in)
 
+	// Confidence is about the trade history alone: how many independent prints
+	// there are and how tidy they look. It used to also absorb a disagreement
+	// penalty, which then reappeared in the depth factor and again through
+	// cross-market divergence — one fact charged three times. The discount now
+	// lives in exactly one place, evidenceQuality.
 	v.Confidence = confidence(in.Liq, in.Attribute)
-	if v.MarketDisagreement {
-		v.Confidence *= .65
-	}
 	v.Valid = true
 	v.ScoreBreakdown = BuildScore(*v, 1)
 }
@@ -334,4 +341,3 @@ func historyWeight(distinct int) float64 {
 		return .40
 	}
 }
-

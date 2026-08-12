@@ -185,9 +185,9 @@ func blendWeights(v *Valuation, in Input) bool {
 	if in.Liq.Median > 0 && v.LiveDepth > 0 {
 		trust := hw / .40
 		v.HistoryReference = v.LiveDepth + (in.Liq.Median-v.LiveDepth)*trust
-		v.MarketDivergence = math.Abs(in.Liq.Median/v.LiveDepth - 1)
-		v.MarketDisagreement = v.MarketDivergence > marketDisagreementLimit
 	}
+	// MarketDivergence is measured later, against the price we actually settle
+	// on — see measureDivergence.
 	if v.CrossMarketSupport > 0 && v.LiveDepth > 0 {
 		v.CrossDivergence = math.Abs(v.CrossMarketSupport/v.LiveDepth - 1)
 	}
@@ -230,6 +230,7 @@ func priceExits(v *Valuation, in Input, undercut float64) bool {
 		if crossFast := v.CrossMarketSupport * (1 - undercut); crossFast < ceiling {
 			ceiling = crossFast
 			v.ExitCapped = "выход прижат к стакану других площадок"
+			v.ExitFromCross = true
 		}
 	}
 	if ceiling > 0 && v.FastExit > ceiling {
@@ -328,6 +329,28 @@ func expectedDays(v *Valuation, in Input) {
 	if v.PatientExpectedDays < v.FastExpectedDays {
 		v.PatientExpectedDays = v.FastExpectedDays
 	}
+}
+
+// measureDivergence asks whether the trade history and the price we intend to
+// sell at tell the same story.
+//
+// The anchor has to be the price we actually settled on, not the local order
+// book. Those are different numbers whenever another venue caps the exit, and
+// using the book produced exactly the wrong verdict: a Tonnel ask of 5.00 above
+// a Portals queue at 4.00 made a 3.22 history look 36% adrift, when the history
+// and the venue we were pricing against were 19% apart and the 5.00 was the
+// outlier both of them disagreed with. The bot then treated its own discredited
+// anchor as evidence against the trade.
+func measureDivergence(v *Valuation, in Input) {
+	anchor := v.FastExit
+	if anchor <= 0 {
+		anchor = v.LiveDepth
+	}
+	if in.Liq.Median <= 0 || anchor <= 0 {
+		return
+	}
+	v.MarketDivergence = math.Abs(in.Liq.Median/anchor - 1)
+	v.MarketDisagreement = v.MarketDivergence > marketDisagreementLimit
 }
 
 // hasTraitEvidence reports whether the attribute premium rests on enough prints

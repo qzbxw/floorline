@@ -201,20 +201,37 @@ func mixLine(v pricing.Valuation) string {
 		v.LiveWeight*100, v.HistoryWeight*100, v.CrossWeight*100, v.TraitWeight*100)
 }
 
+// fxLine reports the coin the prices are denominated in.
+//
+// The floor lag is the part worth reading and the part nobody could read: it is
+// how far the model's floor has drifted from where the GRAM move over the last
+// hour says it should be. Negative means the floor has not caught up yet and
+// gifts are cheap in real terms. "Лаг флора −0.2%" said none of that, so it now
+// only appears when it is large enough to matter, and says which way it points.
 func fxLine(v pricing.Valuation) string {
 	if !v.FX.Valid {
 		return ""
 	}
-	s := fmt.Sprintf("💱 GRAM/USDT %s · 15м %s", num(v.FX.CurrentUSD), pct(v.FX.Move15m))
-	if v.FX.ExpectedFloor > 0 {
-		s += fmt.Sprintf(" · лаг флора %s", pct(v.FX.FloorLag))
+	s := fmt.Sprintf("💱 GRAM/USDT %s · за 15м %s", num(v.FX.CurrentUSD), pct(v.FX.Move15m))
+	if v.FX.ExpectedFloor > 0 && math.Abs(v.FX.FloorLag) >= .02 {
+		if v.FX.FloorLag < 0 {
+			s += fmt.Sprintf(" · флор отстал на %.0f%% — гифты дешевле, чем должны", -v.FX.FloorLag*100)
+		} else {
+			s += fmt.Sprintf(" · флор убежал на +%.0f%% вперёд курса", v.FX.FloorLag*100)
+		}
 	}
 	return s + "\n"
 }
 
 // pct renders a signed percentage with the same typographic minus num uses, so
 // a card never mixes "−1.139" with "-18.9%" two lines apart.
+//
+// A move too small to show at this precision prints as a flat zero. "−0.0%" is
+// not a direction, and reading one costs a beat working out that nothing moved.
 func pct(v float64) string {
+	if p := v * 100; math.Abs(p) < 0.05 {
+		return "0%"
+	}
 	s := fmt.Sprintf("%+.1f%%", v*100)
 	return strings.Replace(s, "-", "−", 1)
 }
