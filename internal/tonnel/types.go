@@ -2,6 +2,7 @@ package tonnel
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -310,6 +311,34 @@ func (e *APIError) IsAuth() bool {
 	}
 	m := strings.ToLower(e.Message)
 	return strings.Contains(m, "auth") || strings.Contains(m, "unauthorized")
+}
+
+// IsRateLimited reports a refusal that is explicitly temporary.
+//
+// Tonnel throttles writes with HTTP 200 and a body reading "Please try again in
+// a minute", which is indistinguishable from a business rejection by status
+// code alone — so it was being classified as one and never retried. That is
+// tolerable on a purchase, where not buying is a safe outcome. It is not
+// tolerable on a relist: the reprice sequence withdraws the old ask before
+// placing the new one, so a single throttled call leaves a gift off the market
+// with nothing but a chat message saying so.
+func (e *APIError) IsRateLimited() bool {
+	if e.Status == 429 {
+		return true
+	}
+	m := strings.ToLower(e.Message)
+	return strings.Contains(m, "try again") ||
+		strings.Contains(m, "too many") ||
+		strings.Contains(m, "rate limit") ||
+		strings.Contains(m, "slow down")
+}
+
+// RateLimited reports whether an error anywhere in the chain is a temporary
+// throttle. Callers that must not stop half-way use it to decide whether
+// waiting is worth anything.
+func RateLimited(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.IsRateLimited()
 }
 
 func truncate(s string, n int) string {

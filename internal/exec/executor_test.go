@@ -45,6 +45,9 @@ type fakeAPI struct {
 	buyErr     error
 	listResult *tonnel.Result
 	listErr    error
+	// throttleFor is how many listing attempts to refuse as temporarily rate
+	// limited before allowing one through.
+	throttleFor int
 }
 
 type buyCall struct {
@@ -102,6 +105,12 @@ func (f *fakeAPI) ListForSale(ctx context.Context, giftID int64, price float64) 
 	f.listCalls = append(f.listCalls, listCall{giftID, price})
 	if f.listedNow[giftID] {
 		return &tonnel.Result{Status: "error", Message: "Gift not found"}, nil
+	}
+	// throttleFor mimics Tonnel's write limiter: the next N listing attempts are
+	// refused with the temporary message it actually sends, then it lets us in.
+	if f.throttleFor > 0 {
+		f.throttleFor--
+		return nil, &tonnel.APIError{Op: "/api/listForSale", Status: 200, Message: "Please try again in a minute"}
 	}
 	if f.listResult == nil && f.listErr == nil {
 		return &tonnel.Result{Status: "success"}, nil
@@ -652,4 +661,121 @@ func TestListPriceIsTruncatedNotRounded(t *testing.T) {
 	if got := roundDown2(100); got != 100 {
 		t.Errorf("roundDown2(100) = %v, want 100", got)
 	}
+}
+
+// Production, 13 Aug: "КРИТИЧНО: снял старый аск, но новый по 3.26 не встал
+// (http 200: Please try again in a minute) — гифт 10048230 сейчас без листинга,
+// поставь руками".
+//
+// Tonnel has no reprice call, so a relist withdraws the live ask and then
+// places the new one. It throttles writes with an HTTP 200 body rather than a
+// status code, which the client classified as a business rejection and never
+// retried — so one throttled call in the middle of that pair took a position
+// off the market and handed the problem to the operator.
+//
+// Waiting out a throttle costs seconds. A gift sitting unlisted costs whatever
+// it would have sold for.
+func TestThrottledRelistKeepsTryingInsteadOfLeavingTheGiftUnlisted(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 1500, 1600)
+	h.seedSales(t, 2000, 30)
+	h.api.listedNow = map[int64]bool{1: true} // already on sale, so this is a reprice
+	h.api.throttleFor = 2
+
+	// The real schedule waits minutes; the behaviour under test is the retrying,
+	// not the waiting.
+	defer swapBackoff(t, []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond})()
+
+	if err := h.st.UpsertPosition(ctx, store.Position{
+		GiftID: 1, Key: key, BuyPrice: 1000, BoughtAt: time.Now(),
+		Status: store.StatusListed, ListPrice: 1600, Source: "manual",
+	}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+
+	price, note, err := h.ex.Relist(ctx, 1, key, 1000, time.Now())
+	if err != nil {
+		t.Fatalf("a temporary throttle must not fail the relist: %v (note %q)", err, note)
+	}
+	if price != 1485 {
+		t.Errorf("list price = %v, want 1485", price)
+	}
+	// One withdrawal, and exactly one of them: retrying must not cancel again.
+	if len(h.api.cancels()) != 1 {
+		t.Errorf("cancel calls = %v, want exactly one withdrawal", h.api.cancels())
+	}
+	pos, _ := h.st.GetPosition(ctx, 1)
+	if pos.Status != store.StatusListed || pos.ListPrice != 1485 {
+		t.Errorf("position = %+v, want listed at 1485 rather than stranded", pos)
+	}
+}
+
+// A refusal that is not temporary must still fail fast. Repeating "you do not
+// own this gift" neither helps nor tells the truth about what went wrong.
+func TestPermanentListingRefusalIsNotRetried(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 1500, 1600)
+	h.seedSales(t, 2000, 30)
+	h.api.listedNow = map[int64]bool{1: true}
+	h.api.listResult = &tonnel.Result{Status: "error", Message: "Gift is not yours"}
+	defer swapBackoff(t, []time.Duration{time.Millisecond, time.Millisecond})()
+
+	if err := h.st.UpsertPosition(ctx, store.Position{
+		GiftID: 1, Key: key, BuyPrice: 1000, BoughtAt: time.Now(),
+		Status: store.StatusListed, ListPrice: 1600, Source: "manual",
+	}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+
+	if _, _, err := h.ex.Relist(ctx, 1, key, 1000, time.Now()); err == nil {
+		t.Fatal("a permanent refusal must surface as an error")
+	}
+	// The first attempt answers "Gift not found" because it is listed; after the
+	// withdrawal exactly one more attempt is made, and no retries beyond it.
+	if n := len(h.api.lists()); n != 2 {
+		t.Errorf("list attempts = %d, want 2 — a business rejection must not be hammered", n)
+	}
+}
+
+// The operator tapped /relist twice in the same second. That ran two
+// withdraw-and-list pairs back to back — four writes on a throttled endpoint —
+// so the second tap was itself what produced the rate limit that stranded the
+// gift.
+func TestDoubleTappedRelistDoesNotRunTwice(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 1500, 1600)
+	h.seedSales(t, 2000, 30)
+	h.api.listedNow = map[int64]bool{1: true}
+
+	if err := h.st.UpsertPosition(ctx, store.Position{
+		GiftID: 1, Key: key, BuyPrice: 1000, BoughtAt: time.Now(),
+		Status: store.StatusListed, ListPrice: 1600, Source: "manual",
+	}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+
+	// ListAt is the path /relist actually takes: the app layer prices the gift
+	// itself and calls straight in, bypassing Relist entirely.
+	now := time.Now()
+	if _, _, err := h.ex.ListAt(ctx, 1, key, 1485, 1000, now); err != nil {
+		t.Fatalf("first relist: %v", err)
+	}
+	price, note, err := h.ex.ListAt(ctx, 1, key, 1485, 1000, now)
+	if err != nil {
+		t.Fatalf("the second tap must be a no-op, not an error: %v", err)
+	}
+	if price != 0 || note == "" {
+		t.Errorf("second tap = (%v, %q), want a refusal with an explanation", price, note)
+	}
+	if n := len(h.api.cancels()); n != 1 {
+		t.Errorf("withdrawals = %d, want 1 — the second tap must not touch the market", n)
+	}
+}
+
+// swapBackoff shortens the retry schedule for the duration of a test.
+func swapBackoff(t *testing.T, d []time.Duration) func() {
+	t.Helper()
+	prev := relistBackoff
+	relistBackoff = d
+	return func() { relistBackoff = prev }
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"floorline/internal/config"
@@ -52,6 +53,13 @@ type Executor struct {
 	books *pricing.BookCache
 	rm    *risk.Manager
 	cfg   *config.Config
+
+	// relisting stamps the last reprice attempt per gift. Repricing is not
+	// idempotent the way a purchase is — it withdraws a live ask before placing
+	// the new one — so overlapping attempts are kept out in process rather than
+	// reconciled afterwards.
+	relistMu  sync.Mutex
+	relisting map[int64]time.Time
 }
 
 // New builds an Executor.
@@ -313,6 +321,32 @@ func (e *Executor) relist(ctx context.Context, giftID int64, key tonnel.ModelKey
 	return e.ListAt(ctx, giftID, key, target, entry, now)
 }
 
+// relistQuiet is how long after a reprice the same gift refuses another one.
+// Long enough to absorb a double tap, short enough not to obstruct a decision
+// to move the price again.
+const relistQuiet = 20 * time.Second
+
+// claimRelist serialises reprices of one gift. The second return reports that
+// another one is already in flight or too recent.
+func (e *Executor) claimRelist(giftID int64, now time.Time) (func(), bool) {
+	e.relistMu.Lock()
+	defer e.relistMu.Unlock()
+	if e.relisting == nil {
+		e.relisting = make(map[int64]time.Time)
+	}
+	if at, ok := e.relisting[giftID]; ok && now.Sub(at) < relistQuiet {
+		return func() {}, true
+	}
+	e.relisting[giftID] = now
+	return func() {
+		e.relistMu.Lock()
+		defer e.relistMu.Unlock()
+		// The stamp stays behind deliberately: the quiet window is measured
+		// from the attempt, so a retry burst cannot restart it early.
+		e.relisting[giftID] = time.Now()
+	}, false
+}
+
 // suggestListing is the read-only half of a relist: it prices the gift and says
 // what it would have asked, without touching the market. This is what the
 // operator gets when automatic selling is switched off.
@@ -389,6 +423,20 @@ func (e *Executor) ListAt(ctx context.Context, giftID int64, key tonnel.ModelKey
 		return 0, fmt.Sprintf("не выставил: цель %.2f ниже входа с наценкой %.2f", target, floorPrice), nil
 	}
 
+	// One gift, one reprice at a time. A double-tapped /relist ran two
+	// withdraw-and-list pairs back to back — four writes in a second on an
+	// endpoint that throttles — so the second tap was itself what produced the
+	// "try again in a minute" that left the gift off the market.
+	//
+	// The guard belongs here rather than in relist() because this is the one
+	// function both paths pass through: /relist prices the gift in the app layer
+	// and calls straight in.
+	release, busy := e.claimRelist(giftID, now)
+	if busy {
+		return 0, "этот гифт уже переставляется — подожди пару секунд", nil
+	}
+	defer release()
+
 	res, err := e.api.ListForSale(ctx, giftID, target)
 	// Tonnel has no reprice call. listForSale searches the gifts that are *not*
 	// currently on sale, so repricing an active listing answers "Gift not found"
@@ -398,10 +446,14 @@ func (e *Executor) ListAt(ctx context.Context, giftID int64, key tonnel.ModelKey
 		if why := e.withdraw(ctx, giftID); why != "" {
 			return 0, "", fmt.Errorf("не переставил по %.2f: %s", target, why)
 		}
-		res, err = e.api.ListForSale(ctx, giftID, target)
+		// Past this line the gift is off the market and the only acceptable
+		// outcome is getting it back on. Tonnel throttles writes with an HTTP
+		// 200 body reading "Please try again in a minute", and one attempt
+		// against that left a position unlisted with a chat message telling the
+		// operator to fix it by hand. Waiting out a throttle is cheap; a gift
+		// sitting off the market until someone notices is not.
+		res, err = e.relistWithRetry(ctx, giftID, target)
 		if err != nil || (res != nil && !res.OK()) {
-			// The old ask is already gone, so the gift is now sitting unlisted.
-			// Say so plainly: silence here reads as "nothing happened".
 			detail := "неизвестная причина"
 			if err != nil {
 				detail = err.Error()
@@ -425,6 +477,49 @@ func (e *Executor) ListAt(ctx context.Context, giftID int64, key tonnel.ModelKey
 	}
 	e.books.Invalidate(key)
 	return target, "", nil
+}
+
+// relistBackoff is how long to keep trying to put a withdrawn gift back on the
+// market. Tonnel's own wording is "try again in a minute", so the schedule
+// covers rather more than a minute before giving up and asking for hands.
+var relistBackoff = []time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second, 45 * time.Second}
+
+// relistWithRetry places the new ask, waiting out a temporary throttle.
+//
+// It retries only refusals the marketplace has explicitly marked as temporary.
+// A genuine rejection — wrong price, gift not owned, session dead — is returned
+// at once, because repeating it would neither help nor be honest about what
+// went wrong.
+func (e *Executor) relistWithRetry(ctx context.Context, giftID int64, target float64) (*tonnel.Result, error) {
+	res, err := e.api.ListForSale(ctx, giftID, target)
+	for _, wait := range relistBackoff {
+		if err == nil && (res == nil || res.OK()) {
+			return res, nil
+		}
+		if !retryableListing(res, err) {
+			return res, err
+		}
+		select {
+		case <-ctx.Done():
+			return res, err
+		case <-time.After(wait):
+		}
+		res, err = e.api.ListForSale(ctx, giftID, target)
+	}
+	return res, err
+}
+
+// retryableListing reports whether a failed listing is worth repeating. The
+// refusal arrives either as an error or as a non-OK body, so both are checked.
+func retryableListing(res *tonnel.Result, err error) bool {
+	if err != nil {
+		return tonnel.RateLimited(err)
+	}
+	if res == nil || res.OK() {
+		return false
+	}
+	m := strings.ToLower(res.Message)
+	return strings.Contains(m, "try again") || strings.Contains(m, "too many") || strings.Contains(m, "rate limit")
 }
 
 // isNotListable reports the specific rejection that means "this gift is already

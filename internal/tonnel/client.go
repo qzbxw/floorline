@@ -214,7 +214,9 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 			// than transient server errors.
 			base := 400 * time.Millisecond
 			var ae *APIError
-			if errors.As(lastErr, &ae) && ae.IsBlocked() {
+			if errors.As(lastErr, &ae) && (ae.IsBlocked() || ae.IsRateLimited()) {
+				// Both are the server asking for room. Coming back in
+				// milliseconds is how a throttle becomes a ban.
 				base = 3 * time.Second
 			}
 			d := time.Duration(float64(base) * math.Pow(2, float64(attempt-1)))
@@ -250,6 +252,13 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 				if n >= 3 && c.onBlocked != nil {
 					c.onBlocked(lastErr)
 				}
+				continue
+			}
+			// An explicit "try again in a minute" is the one refusal that asks
+			// to be repeated. It arrives as HTTP 200 with a message, so without
+			// this it fell through to the business-rejection branch below and
+			// was never retried at all.
+			if ae.IsRateLimited() {
 				continue
 			}
 			if ae.Status >= 500 {
