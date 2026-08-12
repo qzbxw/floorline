@@ -764,6 +764,9 @@ func trimNum(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 // fast path for anyone who knows them, and the way to pass an id or a price —
 // and /help documents all of them.
 var commandMenu = []tele.Command{
-	{Text: "start", Description: "главное меню"},
+	{Text: "start", Description: "дашборд"},
+	{Text: "trade", Description: "сессия по ликвидным парам"},
+	{Text: "pos", Description: "открытые лоты"},
+	{Text: "autobuy", Description: "автобай: что включено и что мешает"},
 	{Text: "help", Description: "все команды"},
 }

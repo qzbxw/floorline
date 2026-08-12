@@ -136,8 +136,23 @@ func riskLines(v pricing.Valuation) []string {
 	if v.Cross.Unreachable > 0 {
 		out = append(out, plural(v.Cross.Unreachable, "площадка не ответила", "площадки не ответили", "площадок не ответили")+" — сравнивать не с чем")
 	}
+	// Getting stuck is the failure mode that costs the most and shows up least
+	// in the arithmetic. Expected days counts only the sellers within a whisker
+	// of our exit; this counts the whole standing queue against the flow, which
+	// is what decides how long we sit there after one undercut. It is a warning
+	// rather than a score term on purpose — the score already divides by
+	// expected days, and charging the same fact twice is what made the old
+	// ranking useless.
+	if v.DaysOfSupply > crowdedDaysOfSupply && !math.IsInf(v.DaysOfSupply, 1) {
+		out = append(out, fmt.Sprintf("саплай %d при %.1f продажи в день — очереди на %s, после андерката будешь сидеть",
+			v.Supply, v.Liq.Velocity, days(v.DaysOfSupply)))
+	}
 	return out
 }
+
+// crowdedDaysOfSupply is where the standing queue stops being a market and
+// starts being a warehouse: three weeks of flow already listed.
+const crowdedDaysOfSupply = 21
 
 // evidenceBlock is the market in four lines: the local queue, the other venues,
 // the tape, and the look. One line each, because the operator is deciding

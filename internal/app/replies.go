@@ -555,9 +555,15 @@ func (a *App) BuySignal(ctx context.Context, signalID int64) bot.Reply {
 	text, giftID := a.buySignal(ctx, signalID)
 	r := bot.Text(text)
 	if giftID > 0 {
-		r = r.WithRow(bot.Link("🔗 Открыть в Tonnel", bot.TonnelGiftURL(giftID)))
+		// The two things wanted immediately after a purchase: look at the lot,
+		// or price the exit. The card used to end with "Управление — /pos" as
+		// text, which is a command to retype on a phone.
+		r = r.WithRow(
+			bot.Link("🔗 Tonnel", bot.TonnelGiftURL(giftID)),
+			bot.Callback("♻️ Переставить", cbRelist, giftID),
+		)
 	}
-	return r
+	return r.WithRow(bot.Callback("📍 Лоты", cbRefresh, "pos"))
 }
 
 // BookForSignal shows the ladder behind a card.
@@ -587,11 +593,11 @@ func (a *App) renderPurchase(ctx context.Context, sigID int64, out *exec.Outcome
 	}
 
 	if err != nil || out == nil || !out.Bought {
-		msg := fmt.Sprintf("❌ <b>%s — не прошло</b>", kind)
+		msg := fmt.Sprintf("❌ <b>%s не прошла</b>", kind)
 		if out != nil {
 			msg += "\n" + bot.Esc(out.Key.String())
 			if out.Note != "" {
-				msg += "\n" + bot.Esc(out.Note)
+				msg += "\n<i>" + bot.Esc(out.Note) + "</i>"
 			}
 		}
 		if err != nil {
@@ -604,18 +610,20 @@ func (a *App) renderPurchase(ctx context.Context, sigID int64, out *exec.Outcome
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "✅ <b>%s</b> — %s\nЛистинг %s · реально списалось %s", kind, bot.Esc(out.Key.String()), num(out.AskPrice), num(out.BuyPrice))
+	fmt.Fprintf(&b, "✅ <b>%s</b> · %s\n", kind, bot.Esc(out.Key.String()))
+	// The ask and the debit differ by the referral, and the gap is the one
+	// number worth checking on every purchase.
+	fmt.Fprintf(&b, "Аск %s → списалось <b>%s</b>\n", num(out.AskPrice), num(out.BuyPrice))
 	if out.Listed {
 		gain := out.ListPrice - out.BuyPrice
-		fmt.Fprintf(&b, "\nОжидаемая продажа %s · на руки %s\nНет %s (%+.1f%%)",
-			num(out.ListPrice), num(out.ListPrice), num(gain), gain/out.BuyPrice*100)
+		fmt.Fprintf(&b, "Выставил %s · заберут — <b>%s</b> (%+.1f%%)\n",
+			num(out.ListPrice), num(gain), gain/out.BuyPrice*100)
 	} else {
-		b.WriteString("\n⚠️ <b>Не выставил.</b>")
+		b.WriteString("⚠️ <b>Не выставил</b>\n")
 	}
 	if out.Note != "" {
-		fmt.Fprintf(&b, "\n<i>%s</i>", bot.Esc(out.Note))
+		fmt.Fprintf(&b, "<i>%s</i>\n", bot.Esc(out.Note))
 	}
-	fmt.Fprintf(&b, "\n\nУправление — <code>/pos</code>.")
 
 	if sigID > 0 {
 		_ = a.st.SetSignalAction(ctx, sigID, "bought")

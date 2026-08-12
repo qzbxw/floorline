@@ -86,41 +86,44 @@ func (a *App) statusText(ctx context.Context) string {
 	now := time.Now()
 	var b strings.Builder
 
-	b.WriteString("<b>Floorline</b>\n")
-	fmt.Fprintf(&b, "Аптайм %s\n", dur(now.Sub(a.startedAt)))
+	fmt.Fprintf(&b, "🔄 <b>Статус</b> · аптайм %s\n\n", dur(now.Sub(a.startedAt)))
 
-	armed := "🔴 выключен"
-	if a.rm.Armed() {
-		armed = "🟢 ВКЛЮЧЁН"
+	// The switches live on /autobuy and are only summarised here — one line, not
+	// a repeat of that whole panel. The mode is read from the risk manager
+	// rather than from config: shadow moved into the database when it became a
+	// button, and reading the startup value here would have reported "боевой"
+	// while the desk was recording.
+	switch {
+	case !a.rm.Armed():
+		b.WriteString("🔴 автобай выключен")
+		if reason := a.rm.LastReason(); reason != "" {
+			fmt.Fprintf(&b, " — %s", bot.Esc(reason))
+		}
+	case a.rm.ShadowMode():
+		b.WriteString("🌑 shadow — считает, но не покупает")
+	default:
+		b.WriteString("🟢 торгует сам")
 	}
-	fmt.Fprintf(&b, "Автобай %s", armed)
-	if reason := a.rm.LastReason(); reason != "" {
-		fmt.Fprintf(&b, " — %s", bot.Esc(reason))
-	}
-	b.WriteString("\n")
-
-	resell := "🔴 выключен — покупает, но не продаёт"
 	if a.rm.ResellEnabled() {
-		resell = "🟢 включён — сам выставляет купленное"
-	}
-	fmt.Fprintf(&b, "Ресейл %s\n", resell)
-	fmt.Fprintf(&b, "%s\n", bot.Esc(a.sessionLine()))
-	fmt.Fprintf(&b, "%s\n", bot.Esc(a.venuesLine()))
-	fmt.Fprintf(&b, "%s\n", bot.Esc(a.scanLine()))
-
-	n, first, _ := a.st.CalibrationStats(ctx)
-	mode := "боевой"
-	if a.cfg.ShadowMode {
-		mode = "SHADOW — сам ничего не покупает"
-	}
-	fmt.Fprintf(&b, "Скоринг %s · калибровка %d/%d сигналов", mode, n, a.cfg.CalibrationMinSignals)
-	if !first.IsZero() {
-		fmt.Fprintf(&b, " · %s/%dд", dur(now.Sub(first)), a.cfg.CalibrationMinDays)
+		b.WriteString(" · ♻️ ресейл")
 	}
 	b.WriteString("\n")
 	if until := a.rm.DisabledUntil(); until.After(now) {
-		fmt.Fprintf(&b, "На паузе ещё %s\n", dur(until.Sub(now)))
+		fmt.Fprintf(&b, "⏸ на паузе ещё %s\n", dur(until.Sub(now)))
 	}
+
+	n, first, _ := a.st.CalibrationStats(ctx)
+	fmt.Fprintf(&b, "Калибровка %d/%d", n, a.cfg.CalibrationMinSignals)
+	if !first.IsZero() {
+		fmt.Fprintf(&b, " · %s из %dд", dur(now.Sub(first)), a.cfg.CalibrationMinDays)
+	}
+	if a.rm.CalibrationWaived() {
+		b.WriteString(" · снята вручную")
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "%s\n", bot.Esc(a.sessionLine()))
+	fmt.Fprintf(&b, "%s\n", bot.Esc(a.venuesLine()))
+	fmt.Fprintf(&b, "%s\n", bot.Esc(a.scanLine()))
 
 	warm := "прогрев"
 	if a.Warm() {

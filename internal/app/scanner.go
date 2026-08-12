@@ -228,29 +228,32 @@ func (a *App) scanText(ctx context.Context, collection string) string {
 	found := a.scanPass(ctx, keys, time.Now())
 
 	var b strings.Builder
-	b.WriteString("🔭 <b>Скан рынка</b>\n")
+	fmt.Fprintf(&b, "🔭 <b>Скан</b> · %s", plural(len(keys), "модель", "модели", "моделей"))
 	if hasRoom {
-		fmt.Fprintf(&b, "Смотрю только то, что влезает в %s\n", num(room))
+		fmt.Fprintf(&b, " · в пределах %s", num(room))
 	}
-	fmt.Fprintf(&b, "Прошёл %s\n\n", plural(len(keys), "модель", "модели", "моделей"))
+	b.WriteString("\n\n")
 
 	if len(found) == 0 {
-		b.WriteString("Ничего с плюсовым эджем не нашлось. Это нормально: чаще всего рынок честный.")
+		b.WriteString("Пусто. Это норма — рынок чаще честный, чем нет.")
 		return b.String()
 	}
 
 	for _, c := range found {
+		// A candidate that fails a gate still earns its place on the list: the
+		// operator can take a trade the unattended path may not. But it must not
+		// look like one that passed.
 		verdict := "✅"
 		if len(c.Fails) > 0 {
-			verdict = "⚠️"
+			verdict = "⚪️"
 		}
 		fmt.Fprintf(&b, "%s <b>%s</b>\n", verdict, bot.Esc(c.Val.Key.String()))
-		fmt.Fprintf(&b, "вход %s → выход %s · <b>%s</b> · скор %.0f\n",
-			num(c.Val.Cost), num(c.Val.FastExit), pct(c.Val.Edge), c.Score)
+		fmt.Fprintf(&b, "   %s → %s · <b>%s</b> · %s · скор %.0f\n",
+			num(c.Val.Cost), num(c.Val.FastExit), pct(c.Val.Edge), days(c.Val.FastExpectedDays), c.Score)
 		if len(c.Fails) > 0 {
-			fmt.Fprintf(&b, "<i>%s</i>\n", bot.Esc(c.Fails[0]))
+			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(c.Fails[0]))
 		}
-		fmt.Fprintf(&b, "<code>/val %d</code>\n\n", c.Gift.GiftID.Int())
+		fmt.Fprintf(&b, "   <code>/val %d</code>\n\n", c.Gift.GiftID.Int())
 	}
 	return b.String()
 }

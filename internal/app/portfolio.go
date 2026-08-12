@@ -276,7 +276,12 @@ func (a *App) portfolioText(ctx context.Context) string {
 	if daysCapital > 0 {
 		avgDays = weightedDays / daysCapital
 	}
-	fmt.Fprintf(&b, "<b>Портфель · %d позиций</b>\nКонсервативная оценка %s GRAM · вложено %s\nОжидаемый нет %s · выход в среднем ~%s · EV/день %s · эффективность %+.2f%%/день\n", len(ps), num(nav), num(invested), num(expectedNet), days(avgDays), num(evDay), efficiency)
+	// Six metrics on one wrapped line is a paragraph, not a dashboard. They go
+	// two to a line, biggest first, so the eye can stop after the first one.
+	fmt.Fprintf(&b, "💼 <b>%s</b>\n", plural(len(ps), "позиция", "позиции", "позиций"))
+	fmt.Fprintf(&b, "Оценка %s · вложено %s\n", num(nav), num(invested))
+	fmt.Fprintf(&b, "Ожидаем %s · выход ~%s\n", num(expectedNet), days(avgDays))
+	fmt.Fprintf(&b, "EV %s/день · %+.2f%% на вложенное\n", num(evDay), efficiency)
 	topCollection, topCollectionValue, topModel, topModelValue := "", 0.0, "", 0.0
 	for k, v := range collections {
 		if v > topCollectionValue {
@@ -288,23 +293,46 @@ func (a *App) portfolioText(ctx context.Context) string {
 			topModel, topModelValue = k, v
 		}
 	}
-	if nav > 0 {
-		fmt.Fprintf(&b, "Больше всего в %s %.0f%% · модель %s %.0f%%\n", bot.Esc(topCollection), topCollectionValue/nav*100, bot.Esc(strings.ReplaceAll(topModel, "|", " · ")), topModelValue/nav*100)
+	// Concentration only matters when it is concentrated. Below a third of the
+	// book in one place it is a line of noise on every refresh.
+	if nav > 0 && topCollectionValue/nav > .33 {
+		fmt.Fprintf(&b, "⚠️ %.0f%% книги в одной коллекции — %s\n", topCollectionValue/nav*100, bot.Esc(topCollection))
+	} else if nav > 0 && topModelValue/nav > .25 {
+		fmt.Fprintf(&b, "⚠️ %.0f%% книги в одной модели — %s\n", topModelValue/nav*100,
+			bot.Esc(strings.ReplaceAll(topModel, "|", " · ")))
 	}
+
 	for _, ad := range ads {
 		p := ad.Position
-		fmt.Fprintf(&b, "\n<b>%s</b> %s\n", ad.Action, bot.Esc(p.Key.String()))
-		if ad.Val.Valid {
-			fmt.Fprintf(&b, "аск %s → цель %s · нет %+.1f%% · ~%s\n", num(p.ListPrice), num(ad.Val.Exit), ad.Val.Edge*100, days(ad.Val.ExpectedDays))
-			if ad.CrossReference > 0 {
-				fmt.Fprintf(&b, "внешняя глубина асков %s · расхождение %.0f%%\n", num(ad.CrossReference), ad.CrossDivergence*100)
-			}
-		} else {
-			fmt.Fprintf(&b, "%s\n", bot.Esc(ad.Reason))
+		fmt.Fprintf(&b, "\n%s <b>%s</b>\n", actionMark(ad.Action), bot.Esc(p.Key.String()))
+		if !ad.Val.Valid {
+			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(ad.Reason))
+			continue
 		}
-		fmt.Fprintf(&b, "<code>/advice %d</code>\n", p.GiftID)
+		fmt.Fprintf(&b, "   %s → %s · <b>%+.1f%%</b> · ~%s\n",
+			num(p.ListPrice), num(ad.Val.Exit), ad.Val.Edge*100, days(ad.Val.ExpectedDays))
+		if ad.CrossReference > 0 && ad.CrossDivergence > .10 {
+			fmt.Fprintf(&b, "   <i>площадки на %s, расхождение %.0f%%</i>\n", num(ad.CrossReference), ad.CrossDivergence*100)
+		}
 	}
 	return b.String()
+}
+
+// actionMark puts a light next to a recommendation, so a book of eight
+// positions can be read by colour before it is read by word.
+func actionMark(action string) string {
+	switch action {
+	case actHold:
+		return "🟢 " + action
+	case actRelist:
+		return "🟡 " + action
+	case actExit:
+		return "🔴 " + action
+	default:
+		// Review and set-cost are not verdicts about the position, they are the
+		// desk saying it cannot form one yet.
+		return "⚪️ " + action
+	}
 }
 
 func (a *App) setCostText(ctx context.Context, giftID int64, price float64) string {

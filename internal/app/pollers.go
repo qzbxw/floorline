@@ -750,7 +750,12 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 	// Safe automatic repricing: never below cost+markup, never a large jump,
 	// and never more than once per six hours. Loss-taking remains manual, and
 	// the whole branch is off unless selling has been switched on.
-	if a.rm.ResellEnabled() && !a.cfg.ShadowMode && a.rm.Armed() && p.BuyPrice > 0 {
+	//
+	// Shadow comes from the risk manager, not from config. It became a button,
+	// and reading the startup value here meant leaving shadow in the bot still
+	// left this branch dead — the desk would answer undercuts on a screen and
+	// nowhere else.
+	if a.rm.ResellEnabled() && !a.rm.ShadowMode() && a.rm.Armed() && p.BuyPrice > 0 {
 		last, _ := a.st.LastReprice(ctx, p.GiftID)
 		if last.IsZero() || now.Sub(last) >= 6*time.Hour {
 			ad := a.advisePosition(ctx, p, now)
