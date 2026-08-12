@@ -65,9 +65,10 @@ func TestExitPricesAgainstTheNextAskNotTheOneBeingBought(t *testing.T) {
 	if v.CompetingAsk != 1050 {
 		t.Errorf("competing ask = %v, want 1050 (the second ask, not our own)", v.CompetingAsk)
 	}
-	// Fast exit uses robust depth (middle of the first three external asks), not
-	// one brittle top ask. Here two asks produce depth 1075.
-	want := 1075 * (1 - testUndercut)
+	// And the fast exit undercuts that ask rather than averaging past it. The
+	// robust depth median of 1075 sits *behind* the 1050 offer: nobody can sell
+	// there quickly, because a buyer takes the 1050 first.
+	want := 1050 * (1 - testUndercut)
 	if math.Abs(v.Exit-want) > 1e-9 {
 		t.Errorf("exit = %v, want %v", v.Exit, want)
 	}
@@ -435,8 +436,12 @@ func TestSparseHistoryShrinksTowardLiveDepth(t *testing.T) {
 	if v.HistoryWeight > .10 || v.HistoryReference < 3.55 {
 		t.Fatalf("sparse history got too much power: weight %.2f ref %.3f", v.HistoryWeight, v.HistoryReference)
 	}
-	if v.FastExit < 3.50 || v.PatientAsk < v.FastExit {
-		t.Fatalf("broken exit ladder: liquidation %.3f fast %.3f patient %.3f", v.Liquidation, v.FastExit, v.PatientAsk)
+	// Three prints are not a tape, so the stale 3.26 median must not drag the
+	// exit under the live queue. The exit is the undercut of the 3.50 ask —
+	// close to it, but never through it.
+	if want := 3.50 * (1 - testUndercut); math.Abs(v.FastExit-want) > 1e-9 || v.PatientAsk < v.FastExit {
+		t.Fatalf("broken exit ladder: liquidation %.3f fast %.3f (want %.3f) patient %.3f",
+			v.Liquidation, v.FastExit, want, v.PatientAsk)
 	}
 }
 
@@ -465,11 +470,20 @@ func TestCrossMarketDepthMovesPriceDiscoveryButDisagreementIsFlagged(t *testing.
 	}
 }
 
-func TestAskGapRewardsThinDepthAndTightQueueCannotFakeEdge(t *testing.T) {
+// A gap above the cheapest ask is not room to sell into, and rewarding it is
+// how the desk produced its highest ever score — 136.5 — on a book reading
+// 8 → 14.4 with a single live price. We sell *under* the cheapest ask whatever
+// stands above it, so the gap earns nothing. A tight queue still costs, because
+// sellers stacked on each other will undercut us tomorrow.
+func TestWideGapIsNeutralAndTightQueueCannotFakeEdge(t *testing.T) {
 	thin := evalPrice(t, 3.869, bookOf(42, 3.869, 4.221, 4.30, 4.35), liqOf(4.20, 20), 3.869, 10)
 	tight := evalPrice(t, 4.49, bookOf(42, 4.49, 4.50, 4.51, 4.52), liqOf(4.80, 20), 4.49, 10)
-	if thin.AskGap1 < .05 || thin.ScoreBreakdown.DepthFactor <= 1 {
-		t.Fatalf("Jester-shaped gap was not rewarded: gap %.2f factor %.2f", thin.AskGap1, thin.ScoreBreakdown.DepthFactor)
+	if thin.AskGap1 < .05 {
+		t.Fatalf("fixture is wrong: expected a Jester-shaped gap, got %.2f", thin.AskGap1)
+	}
+	if thin.ScoreBreakdown.DepthFactor > 1 {
+		t.Fatalf("a gap above the cheapest ask was rewarded as depth: factor %.2f",
+			thin.ScoreBreakdown.DepthFactor)
 	}
 	if tight.Edge >= 0 || tight.ScoreBreakdown.DepthFactor >= 1 {
 		t.Fatalf("tight queue still looks buyable: edge %.3f factor %.2f", tight.Edge, tight.ScoreBreakdown.DepthFactor)

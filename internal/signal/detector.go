@@ -181,6 +181,7 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 
 	val := pricing.Evaluate(pricing.Input{
 		GiftID:     g.GiftID.Int(),
+		GiftNum:    g.GiftNum.Int(),
 		OwnerID:    ownerID(d.OwnerID),
 		Key:        key,
 		Price:      price,
@@ -196,11 +197,15 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		Now:        now,
 		FX:         fxContext,
 		Params:     d.params(),
+		TicketRef:  limits.MaxTicket,
 	})
 	if d.CrossSupport != nil {
-		if cm := d.CrossSupport(ctx, val); cm.Support > 0 {
-			val = pricing.WithCrossDepth(val, cm)
-		}
+		// Applied unconditionally: a venue that could not be read is an input,
+		// not an absence of one. Guarding this on Support > 0 meant an
+		// unreachable venue never reached the valuation, so the score treated
+		// "priced blind" as "priced on Tonnel alone" and the auto-buy gate that
+		// exists to catch it could not fire.
+		val = pricing.WithCrossDepth(val, d.CrossSupport(ctx, val))
 	}
 
 	dec := &Decision{Gift: g, Val: val}
@@ -357,6 +362,13 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	}
 	if v.CrossDivergence > pricing.CrossDivergenceLimit {
 		fails = append(fails, fmt.Sprintf("Tonnel и другие площадки разъехались на %.0f%% — только руками", v.CrossDivergence*100))
+	}
+	// A specimen priced off the ordinary examples of its model is a price we do
+	// not have. The exit is deliberately the conservative one, which makes this
+	// look safe to buy — but the same blindness that hides the upside would hide
+	// a mistake, and nothing here has established what the thing is worth.
+	if v.AppearanceUnpriced {
+		fails = append(fails, "выход посчитан по обычным экземплярам — по этим трейтам сравнить не с чем, оценивай руками")
 	}
 	// Cross-market depth is the cap that keeps a hole in the Tonnel book from
 	// reading as room to sell into. Without it we are pricing blind, and "the

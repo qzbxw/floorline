@@ -108,6 +108,10 @@ type ScoreBreakdown struct {
 	// from the score entirely.
 	CrossFactor     float64 `json:"cross_factor"`
 	LiquidityFactor float64 `json:"liquidity_factor"`
+	// SizeFactor is how much of a real position this trade is. Without it the
+	// ranking is pure daily return, and dust outranks the trades worth waking
+	// up for.
+	SizeFactor float64 `json:"size_factor"`
 	// Quality is every trust multiplier collapsed into one number in [0,1], so
 	// the card can say "how good is the evidence" separately from "how good is
 	// the price".
@@ -118,6 +122,19 @@ type ScoreBreakdown struct {
 // on perfect evidence. 3%/day is a very good flip on this market, so the scale
 // saturates where reality does.
 const scoreHalfPoint = 0.03
+
+const (
+	// hardDisagreementLimit is where "the tape and the queue disagree" stops
+	// being a caution and becomes a reason not to rank the trade at all. It is
+	// the same threshold the exit clamp uses, so a price the engine had to
+	// invent cannot then be ranked as though it were observed.
+	hardDisagreementLimit = 0.25
+	// sizeReference is the share of one full ticket a trade has to earn before
+	// its absolute profit stops holding the score back. Score is a daily return,
+	// which by itself ranks +0.15 GRAM on a 3-GRAM lot level with +5 GRAM on a
+	// 50-GRAM one — and the chat fills with the former.
+	sizeReferenceShare = 0.06
+)
 
 // BuildScore turns a valuation into a single number in 0..100.
 //
@@ -150,6 +167,7 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 	b.DepthFactor = depthFactor(v, &b)
 	b.CrossFactor = crossFactor(v)
 	b.LiquidityFactor = liquidityFactor(v.Liq)
+	b.SizeFactor = sizeFactor(v)
 
 	// Every penalty must land before this line: the risk-adjusted edge is what
 	// the gates read, so a buffer added afterwards would only decorate the
@@ -165,9 +183,27 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 		// the ranking: doubling an already-excellent daily return is worth a few
 		// points, not a multiple.
 		price := b.DailyROI / (b.DailyROI + scoreHalfPoint)
-		b.Total = clamp(100*price*b.Quality, 0, 100)
+		b.Total = clamp(100*price*b.Quality*b.SizeFactor, 0, 100)
 	}
 	return b
+}
+
+// sizeFactor is how much of a real position this trade is.
+//
+// Score is otherwise a pure daily return, which ranks +0.15 GRAM on a 3-GRAM
+// lot exactly level with +5 GRAM on a 50-GRAM one. Both are the same percentage
+// per day; only one is worth a notification, a slot in the portfolio and the
+// risk of being wrong. The reference is the desk's own ticket limit, so the
+// same code behaves differently at a 15-GRAM bank and a 750-GRAM one instead of
+// encoding today's balance as a constant.
+func sizeFactor(v Valuation) float64 {
+	ticket := v.input.TicketRef
+	if ticket <= 0 || v.Net <= 0 {
+		return 1 // no size policy supplied — rank on return alone
+	}
+	// The floor matters: a small trade that is genuinely excellent should be
+	// held back, not erased.
+	return clamp(v.Net/(ticket*sizeReferenceShare), .25, 1)
 }
 
 // evidenceQuality is how much the trade deserves to be believed, in [0,1].
@@ -198,10 +234,17 @@ func evidenceQuality(v Valuation, b ScoreBreakdown, portfolioFit float64) float6
 	}
 	q := math.Pow(product, 1/float64(len(dims)))
 
-	// One fact, one penalty. The history and the price we settled on telling
-	// different stories is a reason for a human to look, and it is already a
-	// hard auto-buy gate; here it costs rank once rather than three times.
-	if v.MarketDisagreement {
+	// One fact, one penalty — but the penalty has to scale with how bad the
+	// fact is. A tape and a queue ten percent apart is a reason for a human to
+	// look. Sixty percent apart is not a disagreement, it is one of the two
+	// being wrong, and the exit clamp has already had to invent a price out of
+	// the middle. Ranking that as though it were observed is what put Xmas
+	// Stocking — a 3.13 entry quoted against a 5.00 ask with a 2.97 median — at
+	// the top of the board claiming +58%.
+	switch {
+	case v.ExitInvented, v.MarketDivergence > hardDisagreementLimit:
+		q *= .12
+	case v.MarketDisagreement:
 		q *= .75
 	}
 	// These two are about us and the wider market rather than about the
@@ -211,9 +254,12 @@ func evidenceQuality(v Valuation, b ScoreBreakdown, portfolioFit float64) float6
 
 // depthFactor judges the queue we would have to sell through.
 //
-// A gap only counts as room to sell into when there is a real run of prices
-// under it. Above a single ask the same gap is the hole itself — that is what
-// used to earn the highest score the desk ever printed.
+// It only ever penalises now. A wide gap above the cheapest ask used to earn a
+// 1.18 bonus as "room to sell into", and that bonus produced the highest score
+// the desk ever printed — 136.5, on a book reading 8 → 14.4 with one live price
+// under it. The premise was wrong twice: the gap is usually the hole itself,
+// and we sell *under* the cheapest ask regardless, so what is above it is not
+// room we can reach.
 //
 // The judgement is about whichever book the exit actually rests on. When
 // another venue's queue caps the price, a hole in the local book is no longer
@@ -231,9 +277,9 @@ func depthFactor(v Valuation, b *ScoreBreakdown) float64 {
 		// nobody is currently making.
 		f = .45
 		b.SafetyBuffer += .01
-	case v.AskGap1 >= .05 || v.AskGap3 >= .08:
-		f = 1.18
 	case v.AskGap1 < .02 && v.AskGap3 < .04:
+		// Sellers stacked on top of each other: whatever we list at, someone is
+		// a hair under it tomorrow.
 		f = .72
 		b.SafetyBuffer += .01
 	}
@@ -250,7 +296,16 @@ func depthFactor(v Valuation, b *ScoreBreakdown) float64 {
 // listed: we are guessing where we could have been checking.
 func crossFactor(v Valuation) float64 {
 	if v.Cross.Unreachable > 0 {
-		return .5
+		// Blind on one side is bad; blind on both is disqualifying. With a
+		// dense local queue we still have a real price to undercut, so the
+		// trade is merely poorly evidenced. With a gappy or single-ask book as
+		// well, there is nothing left holding the exit down and the engine is
+		// guessing outright — which is precisely how a hole in one venue's book
+		// used to read as room to sell into.
+		if v.DepthCapped || v.LiveDepthCount < 2 || !v.HasCompetingAsk {
+			return .05
+		}
+		return .35
 	}
 	if v.CrossMarketSupport <= 0 {
 		return .8 // priced on Tonnel alone

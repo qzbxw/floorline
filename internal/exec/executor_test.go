@@ -256,7 +256,7 @@ func TestResellOffBuysButDoesNotList(t *testing.T) {
 	if out.Listed || len(h.api.lists()) != 0 {
 		t.Errorf("gift was listed with resell off: %+v", h.api.lists())
 	}
-	if !strings.Contains(out.Note, "1207.65") {
+	if !strings.Contains(out.Note, "1188") {
 		t.Errorf("note must carry the price we would have asked: %q", out.Note)
 	}
 
@@ -281,12 +281,12 @@ func TestRepricingAListedGiftWithdrawsTheOldAskFirst(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
 	h.api.listedNow[1] = true // the gift is already on the market
 
-	price, note, err := h.ex.ListAt(ctx, 1, key, 1207.65, 800, time.Now())
+	price, note, err := h.ex.ListAt(ctx, 1, key, 1188, 800, time.Now())
 	if err != nil {
 		t.Fatalf("relist: %v (note %q)", err, note)
 	}
-	if price != 1207.65 {
-		t.Errorf("listed at %v, want 1207.65", price)
+	if price != 1188 {
+		t.Errorf("listed at %v, want 1188", price)
 	}
 	if got := h.api.cancels(); len(got) != 1 || got[0] != 1 {
 		t.Errorf("cancel calls = %v, want exactly one for gift 1", got)
@@ -305,7 +305,7 @@ func TestFailedRepriceAfterWithdrawalIsReportedLoudly(t *testing.T) {
 	h.api.listedNow[1] = true
 	h.api.listErr = errors.New("upstream exploded")
 
-	_, _, err := h.ex.ListAt(ctx, 1, key, 1207.65, 800, time.Now())
+	_, _, err := h.ex.ListAt(ctx, 1, key, 1188, 800, time.Now())
 	if err == nil {
 		t.Fatal("a gift left unlisted must surface as an error")
 	}
@@ -322,7 +322,7 @@ func TestUnrecognisedListFailureDoesNotWithdraw(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
 	h.api.listResult = &tonnel.Result{Status: "error", Message: "insufficient balance"}
 
-	if _, _, err := h.ex.ListAt(ctx, 1, key, 1207.65, 800, time.Now()); err == nil {
+	if _, _, err := h.ex.ListAt(ctx, 1, key, 1188, 800, time.Now()); err == nil {
 		t.Fatal("the rejection must still be an error")
 	}
 	if got := h.api.cancels(); len(got) != 0 {
@@ -396,17 +396,18 @@ func TestBuyThenRelistAtTheUndercutPrice(t *testing.T) {
 		t.Fatalf("the gift was bought but never relisted: %s", out.Note)
 	}
 
-	// Fast exit blends the robust first-three depth with the sale history.
-	if len(h.api.lists()) != 1 || h.api.lists()[0].price != 1207.65 {
-		t.Errorf("list calls = %+v, want one at 1207.65", h.api.lists())
+	// We relist where the gift can actually sell: just under the cheapest
+	// competing ask of 1200, not at a blend that stands behind it.
+	if len(h.api.lists()) != 1 || h.api.lists()[0].price != 1188 {
+		t.Errorf("list calls = %+v, want one at 1188", h.api.lists())
 	}
 
 	pos, err := h.st.GetPosition(ctx, 1)
 	if err != nil || pos == nil {
 		t.Fatalf("position not recorded: %v", err)
 	}
-	if pos.Status != store.StatusListed || pos.BuyPrice != 804 || pos.ListPrice != 1207.65 {
-		t.Errorf("position = %+v, want listed at 1207.65 with an actual debit of 804", pos)
+	if pos.Status != store.StatusListed || pos.BuyPrice != 804 || pos.ListPrice != 1188 {
+		t.Errorf("position = %+v, want listed at 1188 with an actual debit of 804", pos)
 	}
 
 	spend, _ := h.st.SpendToday(ctx, time.Now().UTC().Format("2006-01-02"))
@@ -630,14 +631,15 @@ func TestRelistPricesAgainstTheLiveBook(t *testing.T) {
 	if note != "" {
 		t.Errorf("unexpected note: %s", note)
 	}
-	// Two live asks establish depth at 1550; the fast exit sits just under it.
-	if price != 1534.5 {
-		t.Errorf("list price = %v, want 1534.5", price)
+	// The cheapest live ask is 1500, so that is what we have to beat — the
+	// 1550 midpoint of the two asks is a price standing behind a queue.
+	if price != 1485 {
+		t.Errorf("list price = %v, want 1485", price)
 	}
 
 	pos, _ := h.st.GetPosition(ctx, 1)
-	if pos.Status != store.StatusListed || pos.ListPrice != 1534.5 {
-		t.Errorf("position = %+v, want listed at 1534.5", pos)
+	if pos.Status != store.StatusListed || pos.ListPrice != 1485 {
+		t.Errorf("position = %+v, want listed at 1485", pos)
 	}
 }
 

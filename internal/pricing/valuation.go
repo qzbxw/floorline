@@ -29,8 +29,10 @@ const (
 	// depthWindow is how many of the cheapest external asks feed the reference.
 	depthWindow = 3
 	// minAsksBelowEntry is how many independent cheaper offers it takes to call
-	// a listing overpriced rather than mispriced.
-	minAsksBelowEntry = 2
+	// a listing overpriced rather than mispriced. One is enough: a single
+	// genuinely cheaper offer is where our buyer goes, whatever the local book
+	// wishes.
+	minAsksBelowEntry = 1
 )
 
 // Params are the economics of a round trip.
@@ -43,6 +45,7 @@ type Params struct {
 
 type Input struct {
 	GiftID  int64
+	GiftNum int64
 	OwnerID int64
 	Key     tonnel.ModelKey
 	Price   float64
@@ -61,6 +64,11 @@ type Input struct {
 	Now        time.Time
 	FX         FXContext
 	Params     Params
+	// TicketRef is the largest single purchase the desk allows, used only to
+	// judge whether a trade is big enough to be worth a slot. Zero disables the
+	// size term entirely, which is what every caller that is pricing an owned
+	// position rather than ranking a candidate wants.
+	TicketRef float64
 }
 
 // Valuation keeps four different questions separate. Liquidation is an
@@ -75,6 +83,13 @@ type Valuation struct {
 	Rarity             float64
 	Backdrop, Symbol   string
 	Attribute          AttributeValue
+	Appearance         Appearance
+	// AppearanceUnpriced records that this specimen looks like it should trade
+	// above the plain ones, and that nothing on any venue was comparable enough
+	// to say by how much. The exit stays the conservative one — we do not invent
+	// a premium — but the operator is told the number is a floor on the truth
+	// rather than an estimate of it.
+	AppearanceUnpriced bool
 
 	CompetingAsk    float64
 	HasCompetingAsk bool
@@ -114,6 +129,16 @@ type Valuation struct {
 	MarketDisagreement bool
 	MarketDivergence   float64
 	CrossDivergence    float64
+	// ExitInvented records that neither the queue nor the tape could be
+	// believed on its own, so the exit is an interpolation the engine had to
+	// make rather than a price anyone has quoted or paid.
+	//
+	// It has to be remembered separately because the clamp erases its own
+	// evidence: once the exit is pulled into the band the history supports, the
+	// measured divergence falls below the threshold that triggered it, and a
+	// score reading only that number would rank the invented price as if it had
+	// been observed.
+	ExitInvented bool
 
 	// AsksBelowEntry counts independent offers — ours excluded, every venue
 	// included — that are already cheaper than what this listing costs us.
@@ -171,6 +196,7 @@ func Evaluate(in Input) Valuation {
 	if in.Floor > 0 {
 		v.DiscountToFloor = (in.Floor - in.Price) / in.Floor
 	}
+	v.Appearance = Appraise(in.Backdrop, in.Symbol, in.GiftNum)
 	if !in.Now.IsZero() {
 		bookAt := time.Time{}
 		if in.Book != nil {
@@ -195,13 +221,50 @@ func Evaluate(in Input) Valuation {
 // shop there instead, whatever Tonnel's own thin book suggests.
 type CrossMarket struct {
 	Support float64
-	Asks    []float64 // merged across venues, ascending
+	Asks    []float64 // merged across venues, ascending, in each venue's own gross terms
 	Venues  int
+	// BestBuyerCost is what a buyer actually pays for the cheapest external
+	// offer. Today that is the displayed ask — Portals and MRKT charge their
+	// sellers, not their buyers — but the bound has to be stated in the unit
+	// the buyer compares, because our own side is not fee-free: a Tonnel ask
+	// costs its buyer the referral on top. Keeping the field in buyer terms is
+	// what lets a venue that does charge buyers be added without moving the
+	// comparison back onto mismatched stickers.
+	BestBuyerCost float64
+	// DepthBuyerCost is the same measure for the third rung of the merged
+	// queue: the price a patient seller has to outlast, rather than the one a
+	// fast seller has to undercut.
+	DepthBuyerCost float64
+	// Comparable reports that the cheapest external offer was matched on the
+	// attributes that move the price, not merely on the model. A model-wide
+	// queue is the ordinary specimens of that model, and pricing an Onyx Black
+	// gift against them is comparing two different assets.
+	Comparable bool
 	// Unreachable counts venues that could not be read at all — a timeout or a
 	// rejected session, as opposed to a venue with nothing listed. Losing this
 	// data silently removes the cap that holds an optimistic exit down, so the
 	// count travels with the quote and blocks unattended buying.
 	Unreachable int
+}
+
+// fillBuyerCosts derives the buyer-cost bounds from the raw queue when the
+// caller did not supply them.
+//
+// Every producer of a CrossMarket should set them, because only the caller
+// knows each venue's buyer fee. But a caller that forgets would otherwise lose
+// the cross-market cap entirely and silently — turning the one guard that holds
+// an optimistic exit down into a no-op. Falling back to the gross asks keeps
+// the cap in place and merely gives up the fee correction.
+func (cm *CrossMarket) fillBuyerCosts() {
+	if len(cm.Asks) == 0 {
+		return
+	}
+	if cm.BestBuyerCost <= 0 {
+		cm.BestBuyerCost = cm.Asks[0]
+	}
+	if cm.DepthBuyerCost <= 0 {
+		cm.DepthBuyerCost = cm.Asks[minInt(depthWindow, len(cm.Asks))-1]
+	}
 }
 
 // WithCrossMarket promotes external depth from a footnote to a pricing input.
@@ -212,6 +275,7 @@ func WithCrossMarket(v Valuation, support float64) Valuation {
 
 // WithCrossDepth is the full form: the reference and the queue behind it.
 func WithCrossDepth(v Valuation, cm CrossMarket) Valuation {
+	cm.fillBuyerCosts()
 	if cm.Support <= 0 {
 		// No usable price, but "a venue could not be reached" is itself an input:
 		// it blocks unattended buying and costs the trade rank, so it has to be
@@ -255,7 +319,7 @@ func recompute(v *Valuation) {
 	}
 
 	external := readLocalBook(v, in)
-	readWalkaway(v, external, v.Cost)
+	readWalkaway(v, external, v.Cost, in.Params.Fee)
 	setLiquidation(v, in, undercut)
 
 	if !blendWeights(v, in) {
@@ -264,6 +328,7 @@ func recompute(v *Valuation) {
 	if !priceExits(v, in, undercut) {
 		return
 	}
+	clampToHistory(v, in)
 	clampOverpriced(v, v.Cost)
 	buildLadder(v, in, undercut)
 
@@ -280,9 +345,11 @@ func resetDerived(v *Valuation) {
 	v.ExternalAsks, v.DepthCapped = 0, false
 	v.AsksBelowEntry, v.UndercutsEntry, v.CheaperAsks = 0, 0, 0
 	v.PricedAboveMarket, v.ExitCapped, v.ExitFromCross = false, "", false
+	v.AppearanceUnpriced = false
 	v.Walkaway, v.WalkawayVenue = 0, ""
 	v.Liquidation, v.LiquidationBasis = 0, ""
 	v.MarketDivergence, v.MarketDisagreement, v.CrossDivergence = 0, false, 0
+	v.ExitInvented = false
 	v.BearCase = 0
 }
 

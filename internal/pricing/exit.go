@@ -16,7 +16,9 @@ import (
 //	                on ANY venue — this is what actually bounds our exit
 //	setLiquidation  the price that makes us the cheapest offer on screen
 //	blendWeights    how much each source of truth is trusted
-//	priceExits      fast and fair, then every clamp
+//	priceExits      fair discovery, then the executable ceiling over the fast exit
+//	clampToHistory  what the prints say when they disagree with the queue
+//	clampOverpriced the guard against selling above what we just paid
 //	buildLadder     liquidation ≤ fast ≤ fair ≤ patient, and the wait each implies
 //	settle          edge, queue position, days, confidence, score
 
@@ -30,6 +32,21 @@ const (
 	// outright. Three independent venues-or-sellers pricing well under our
 	// entry is a market, not a coincidence.
 	minCrossUndercuts = 3
+	// historyGapLimit is how far the exit may stand above the trade history
+	// before the prints start pulling it back down. Beyond this the queue and
+	// the tape are not describing the same market, and a price nobody has paid
+	// is weaker evidence than a price several people have.
+	//
+	// It is deliberately loose. A model genuinely re-rating upward shows up as
+	// exactly this shape — a dense queue standing well above a fortnight-old
+	// median — and at 25% the clamp was firing on those too, punishing real
+	// moves to catch fake ones. The case it exists for is not subtle: Xmas
+	// Stocking quoted 4.95 against a median of 2.97, two thirds apart.
+	historyGapLimit = 0.35
+	// minHistoryForClamp is how many distinct gifts the tape needs before it is
+	// allowed to overrule the live queue. Three prints of one flipped item are
+	// not a market either.
+	minHistoryForClamp = 5
 )
 
 // readLocalBook measures the Tonnel queue: who competes with us, how much of
@@ -93,7 +110,13 @@ func readLocalBook(v *Valuation, in Input) []Ask {
 // This is the number the old engine did not have. It priced the exit against
 // the Tonnel queue alone, so a hole in one venue's book read as room to sell
 // into even while three other venues were quoting well below it.
-func readWalkaway(v *Valuation, external []Ask, cost float64) {
+//
+// The comparison happens in the unit a buyer actually compares: money leaving
+// their wallet. A venue charging its buyers 2% is 2% dearer than its sticker
+// price, so external asks arrive here already restated as buyer cost and are
+// converted back into the Tonnel ask that would cost the same. Matching gross
+// stickers across venues quietly gave that difference away on every trade.
+func readWalkaway(v *Valuation, external []Ask, cost, tonnelFee float64) {
 	for _, a := range external {
 		if a.Price > 0 && a.Price < cost {
 			v.AsksBelowEntry++
@@ -112,15 +135,23 @@ func readWalkaway(v *Valuation, external []Ask, cost float64) {
 	}
 
 	v.Walkaway = v.CompetingAsk
-	if len(v.Cross.Asks) > 0 {
-		if best := v.Cross.Asks[0]; best > 0 && (v.Walkaway <= 0 || best < v.Walkaway) {
-			v.Walkaway = best
-			v.WalkawayVenue = "площадки"
-		}
+	if best := tonnelEquivalent(v.Cross.BestBuyerCost, tonnelFee); best > 0 && (v.Walkaway <= 0 || best < v.Walkaway) {
+		v.Walkaway = best
+		v.WalkawayVenue = "площадки"
 	}
 	if v.Walkaway > 0 && v.WalkawayVenue == "" {
 		v.WalkawayVenue = "Tonnel"
 	}
+}
+
+// tonnelEquivalent converts what a buyer pays on another venue into the Tonnel
+// ask that would cost them the same. Zero in, zero out: an unknown external
+// price must not silently become a free one.
+func tonnelEquivalent(buyerCost, tonnelFee float64) float64 {
+	if buyerCost <= 0 {
+		return 0
+	}
+	return buyerCost / (1 + math.Max(tonnelFee, 0))
 }
 
 // setLiquidation prices the emergency exit: what we would have to ask to be the
@@ -201,57 +232,131 @@ func blendWeights(v *Valuation, in Input) bool {
 	return true
 }
 
-// priceExits builds the fast and fair prices and then applies every clamp that
-// stands between a blend and a price someone would actually pay.
+// priceExits builds the fair price by discovery and the fast price by
+// execution. They are different questions and used to be answered the same way.
+//
+// FairValue asks what the model is worth: depth, tape, the external reference
+// and traits, blended. FastExit asks what we can actually get out at soon, and
+// that has a much harder answer — to sell quickly you have to be the cheapest
+// offer on screen, so the whole market's best price is a ceiling.
+//
+// Getting this backwards is the single largest error the engine has made. The
+// fast exit used to be blended off the median of the first three asks, which by
+// construction stands *behind* a queue, and the walkaway price was applied only
+// as a floor beneath it. Every trade came out roughly twice as good as it was:
+// a Jolly Chimp bought at 6.593 was quoted a fast exit of 7.326 with a 7.00 ask
+// standing in front of it, and sold for 6.98 — which is exactly the undercut of
+// that 7.00 the engine had already computed and then ignored.
 func priceExits(v *Valuation, in Input, undercut float64) bool {
-	liveFast := v.LiveDepth
-	if liveFast > 0 {
-		liveFast *= 1 - undercut
-	}
-	v.FastExit = weighted(
-		component{liveFast, v.LiveWeight}, component{v.HistoryReference, v.HistoryWeight},
-		component{v.CrossMarketSupport, v.CrossWeight}, component{in.Attribute.Fair, v.TraitWeight},
-	)
 	v.FairValue = weighted(
 		component{v.LiveDepth, v.LiveWeight}, component{v.HistoryReference, v.HistoryWeight},
 		component{v.CrossMarketSupport, v.CrossWeight}, component{in.Attribute.Fair, v.TraitWeight},
 	)
-
-	// The visible queue is the ceiling. History can pull a price down but must
-	// not lift it through the offers standing in front of us.
-	//
-	// A cheaper venue lowers that ceiling, because that is where our buyer goes.
-	// A more expensive one does NOT raise it: we sell into the Tonnel queue, and
-	// another venue asking more is not evidence that our lot will fetch more.
-	// Letting it raise the ceiling is how a single expensive foreign quote used
-	// to manufacture an edge.
-	ceiling := liveFast
-	if ceiling > 0 && v.CrossMarketSupport > 0 && len(v.Cross.Asks) >= 2 {
-		if crossFast := v.CrossMarketSupport * (1 - undercut); crossFast < ceiling {
-			ceiling = crossFast
-			v.ExitCapped = "выход прижат к стакану других площадок"
+	// A patient price still has to wait for the cheap end of the other venues to
+	// clear, so the external queue caps discovery too — just at its third rung
+	// rather than its first. Without this a hole in the local book put "фэйр
+	// 10.9" on a card whose external queue read 3.77 / 3.81 / 3.92.
+	if depth := tonnelEquivalent(v.Cross.DepthBuyerCost, in.Params.Fee); depth > 0 && len(v.Cross.Asks) >= 2 {
+		if v.FairValue > depth {
+			v.FairValue = depth
 			v.ExitFromCross = true
 		}
 	}
-	if ceiling > 0 && v.FastExit > ceiling {
-		v.FastExit = ceiling
+
+	// With a genuine competing offer anywhere, the fast exit is not a blend at
+	// all — it is arithmetic. Being the cheapest offer on screen is the only
+	// way to sell quickly, and Liquidation already *is* that price: walkaway
+	// derived, undercut, taken across every venue. So it is the fast exit.
+	//
+	// The blend answers a different question, and mixing the two is what broke
+	// this. Averaging a stale tape and a robust depth median into an execution
+	// price produced numbers standing behind a queue, and then the walkaway was
+	// applied underneath as a floor — so the one honest number in the
+	// calculation could only ever raise the answer, never cap it.
+	if v.Walkaway > 0 {
+		v.FastExit = v.Liquidation
+		switch v.LiquidationBasis {
+		case "другие площадки дешевле":
+			v.ExitCapped = "выход прижат к самому дешёвому аску на других площадках"
+			v.ExitFromCross = true
+		case "история при тонком стакане":
+			v.ExitCapped = "в стакане одна живая цена — выход прижат к истории"
+		default:
+			v.ExitCapped = "выход прижат к чужому аску в стакане Tonnel"
+		}
+	} else {
+		// Nothing to undercut: no competing ask here and no external queue. The
+		// only evidence left is what the model is worth, so discovery stands in
+		// for execution and the floor under it is the best we can say.
+		v.FastExit = math.Max(v.FairValue, v.Liquidation)
 	}
 	if v.FastExit <= 0 {
 		v.Reason = "быстрый выход не посчитался"
 		return false
 	}
-	// Being the cheapest offer on screen is always available to us, so the fast
-	// exit is never worse than that. Liquidation is derived from the walkaway
-	// price, so this can no longer lift the exit above what other venues charge.
-	if v.Liquidation > 0 && v.FastExit < v.Liquidation {
-		v.FastExit = v.Liquidation
+
+	// A specimen whose whole value is its appearance, bounded by a queue of
+	// ordinary ones, is a number we do not actually have. The exit stays
+	// conservative — inventing a premium is how the engine got into trouble in
+	// the first place — but it must be labelled, or the desk reads a floor on
+	// the truth as an estimate of it and passes on the bargains this bot exists
+	// to find. An Onyx Black gift capped at the plain model's queue does not
+	// look mispriced; it looks like it has no edge.
+	if v.Appearance.Premium && v.ExitFromCross && !v.Cross.Comparable && !hasTraitEvidence(in.Attribute) {
+		v.AppearanceUnpriced = true
 	}
 	return true
+}
+
+// clampToHistory pulls the exit back towards the tape when the two disagree
+// hard.
+//
+// A hole in the book can put the cheapest competing ask far above every price
+// anyone has actually paid. Xmas Stocking priced a 3.126 entry against a 5.00
+// second ask and claimed +58.4% while the median of thirteen real trades was
+// 2.97. Prints are harder evidence than an ask nobody has taken.
+//
+// The exit is pulled to the edge of the band the history supports rather than
+// all the way onto the median: the live queue is evidence too, and it is more
+// recent. And the tape only gets this vote once it is a tape — a handful of
+// prints over one or two physical gifts is not allowed to overrule the market.
+func clampToHistory(v *Valuation, in Input) {
+	med := in.Liq.Median
+	if med <= 0 || in.Liq.DistinctGifts < minHistoryForClamp {
+		return
+	}
+	band := med * (1 + historyGapLimit)
+	if v.FastExit <= band {
+		return
+	}
+	// Record how far apart they really were before closing the gap, or the
+	// clamp destroys the only evidence that it was needed.
+	v.MarketDivergence = math.Abs(med/v.FastExit - 1)
+	v.MarketDisagreement = true
+	v.ExitInvented = true
+	v.FastExit = band
+	v.ExitCapped = "выход прижат к истории — стакан ушёл далеко от реальных сделок"
+	if v.FairValue > band {
+		v.FairValue = band
+	}
+	// Liquidation has to come down with it, or the ladder contradicts itself:
+	// if the queue is 60% above every price anyone has paid, then dumping into
+	// that queue is not an available exit either, however cheap we undercut it.
+	if v.Liquidation > band {
+		v.Liquidation = band
+		v.LiquidationBasis = "история — стакан оторвался от сделок"
+	}
 }
 
 // clampOverpriced is the guard against claiming we can get out above what we
 // just paid. That claim needs a reason, and "the model averaged its way there"
 // is not one.
+//
+// Most of the work now happens upstream: once the fast exit is capped by the
+// cheapest offer on any venue, an offer below our entry mechanically drags the
+// exit below it too. What is left here is the verdict — naming the situation so
+// the gates and the card can say plainly that this is an expensive listing
+// rather than a mispriced one.
 func clampOverpriced(v *Valuation, cost float64) {
 	if v.TraitWeight > 0 || cost <= 0 {
 		return // a measured trait premium is a real reason to price above the crowd
@@ -267,10 +372,13 @@ func clampOverpriced(v *Valuation, cost float64) {
 		}
 		return
 	}
-	if v.AsksBelowEntry >= minAsksBelowEntry && v.FastExit > cost {
-		if capped := math.Max(v.Liquidation, cost); capped < v.FastExit {
-			v.FastExit = capped
-			v.PricedAboveMarket = true
+	// One genuinely cheaper independent offer is enough. That used to take two,
+	// and the log is full of trades sold on a local gap with exactly one
+	// external ask sitting under the entry — Lunar Snake printed "дешевле
+	// твоего входа: 1" next to a claimed +12.3% that was really negative.
+	if v.AsksBelowEntry >= minAsksBelowEntry && v.FastExit <= cost {
+		v.PricedAboveMarket = true
+		if v.ExitCapped == "" {
 			v.ExitCapped = "выход прижат ко входу: рынок дешевле нас"
 		}
 	}
@@ -284,6 +392,11 @@ func buildLadder(v *Valuation, in Input, undercut float64) {
 		if ask, ok := in.Book.BestAttributesExcluding(in.GiftID, in.OwnerID, in.Backdrop, in.Symbol); ok {
 			v.PatientAsk = math.Max(math.Max(v.FastExit, v.FairValue), math.Min(v.PatientAsk, ask*(1-undercut)))
 		}
+	}
+	// Waiting does not exempt us from the other venues either. A patient seller
+	// still has to outlast their cheap end, not price straight through it.
+	if depth := tonnelEquivalent(v.Cross.DepthBuyerCost, in.Params.Fee); depth > 0 && len(v.Cross.Asks) >= 2 {
+		v.PatientAsk = math.Max(v.FastExit, math.Min(v.PatientAsk, depth))
 	}
 	v.PatientExit = v.PatientAsk
 	if in.Liq.Trend > 0 && in.Liq.Trend < .98 {
@@ -349,8 +462,13 @@ func measureDivergence(v *Valuation, in Input) {
 	if in.Liq.Median <= 0 || anchor <= 0 {
 		return
 	}
-	v.MarketDivergence = math.Abs(in.Liq.Median/anchor - 1)
-	v.MarketDisagreement = v.MarketDivergence > marketDisagreementLimit
+	// Never below what clampToHistory already found: the exit it produced is
+	// closer to the tape by construction, and reporting that narrowed figure
+	// would understate a disagreement the engine had to intervene in.
+	if d := math.Abs(in.Liq.Median/anchor - 1); d > v.MarketDivergence {
+		v.MarketDivergence = d
+	}
+	v.MarketDisagreement = v.MarketDisagreement || v.MarketDivergence > marketDisagreementLimit
 }
 
 // hasTraitEvidence reports whether the attribute premium rests on enough prints

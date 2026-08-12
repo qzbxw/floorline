@@ -176,15 +176,7 @@ func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backd
 			var err error
 			scope := "floor only"
 			if ds, ok := s.(DepthSource); ok {
-				asks, err = ds.ModelAsks(ctx, collection, model, backdrop, symbol, 20)
-				if err == nil && len(asks) == 0 && (backdrop != "" || symbol != "") {
-					asks, err = ds.ModelAsks(ctx, collection, model, "", "", 20)
-					scope = "model"
-				} else if len(asks) > 0 && (backdrop != "" || symbol != "") {
-					scope = "exact attributes"
-				} else if len(asks) > 0 {
-					scope = "model"
-				}
+				asks, scope, err = askLadder(ctx, ds, collection, model, backdrop, symbol)
 				if len(asks) > 0 {
 					floor = asks[0]
 				}
@@ -218,6 +210,57 @@ func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backd
 		}
 	}
 	return out, n
+}
+
+// Scope values, ordered from the tightest comparable to the loosest. They
+// travel with the quote because the difference decides money: a queue matched
+// only on the model is a different asset from the gift being priced whenever
+// its backdrop is what makes it worth anything.
+const (
+	ScopeExact    = "exact attributes"
+	ScopeBackdrop = "backdrop"
+	ScopeModel    = "model"
+	ScopeFloor    = "floor only"
+)
+
+// Comparable reports whether a quote is tight enough to bound the exit of a
+// gift with distinctive attributes, rather than merely inform it.
+func Comparable(scope string) bool { return scope == ScopeExact || scope == ScopeBackdrop }
+
+// askLadder walks from the tightest comparable down to the loosest.
+//
+// The middle rung is the point. Backdrop is the dominant price driver on this
+// market — an Onyx Black specimen is not the same asset as the ordinary model,
+// whatever they share — and the exact backdrop+symbol pair is often the
+// sparsest bucket there is, so requiring both means the common outcome is no
+// match at all. Dropping straight from there to the whole model queue priced
+// Onyx gifts off ordinary ones, and after the exit began keying on the cheapest
+// external offer that stopped being a cosmetic problem on the card and became
+// the number the trade is decided by.
+func askLadder(ctx context.Context, ds DepthSource, collection, model, backdrop, symbol string) ([]float64, string, error) {
+	if backdrop != "" || symbol != "" {
+		asks, err := ds.ModelAsks(ctx, collection, model, backdrop, symbol, 20)
+		if err != nil {
+			return nil, ScopeFloor, err
+		}
+		if len(asks) > 0 {
+			return asks, ScopeExact, nil
+		}
+	}
+	if backdrop != "" {
+		asks, err := ds.ModelAsks(ctx, collection, model, backdrop, "", 20)
+		if err != nil {
+			return nil, ScopeFloor, err
+		}
+		if len(asks) > 0 {
+			return asks, ScopeBackdrop, nil
+		}
+	}
+	asks, err := ds.ModelAsks(ctx, collection, model, "", "", 20)
+	if err != nil {
+		return nil, ScopeFloor, err
+	}
+	return asks, ScopeModel, nil
 }
 
 // Probing is the diagnostic form of Quotes: it keeps the per-venue error so

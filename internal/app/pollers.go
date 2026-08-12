@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"floorline/internal/bot"
+	"floorline/internal/market"
 	"floorline/internal/pricing"
 	"floorline/internal/signal"
 	"floorline/internal/store"
@@ -106,12 +107,16 @@ func (a *App) spendable() (float64, bool) {
 }
 
 // crossMarketDepth is robust price discovery: each venue contributes the middle
-// of its first three asks, then venues are combined by their median. Gross asks
-// are used because selling on Tonnel has no second referral fee.
+// of its first three asks, then venues are combined by their median.
 //
 // The individual asks travel with the reference. A single number can only ever
 // nudge the blend; the queue behind it is what proves a buyer has somewhere
 // cheaper to go, which is the difference between a misprice and an overprice.
+//
+// Two of those asks are also restated as buyer cost, fee included. This is the
+// only place that knows which venue an ask came from, so it is the only place
+// that can make the fee correction — and comparing gross stickers across venues
+// with different buyer fees quietly mispriced the walkaway on every trade.
 func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing.CrossMarket {
 	if !a.cross.Enabled() {
 		return pricing.CrossMarket{} // no venue configured is a choice, not a failure
@@ -126,7 +131,11 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 	quotes, unreachable := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
 
 	cm := pricing.CrossMarket{Unreachable: unreachable}
-	var refs []float64
+	var refs, buyerCosts []float64
+	// The cheapest offer is what bounds the exit, so it is that offer's match
+	// quality — not the average across venues — that decides whether the bound
+	// is about the same asset at all.
+	cheapest, comparable := 0.0, false
 	for _, q := range quotes {
 		ref := q.Reference()
 		if ref <= 0 {
@@ -134,10 +143,24 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 		}
 		refs = append(refs, ref)
 		cm.Venues++
-		if len(q.Asks) > 0 {
-			cm.Asks = append(cm.Asks, q.Asks...)
-		} else {
-			cm.Asks = append(cm.Asks, q.Floor)
+		asks := q.Asks
+		if len(asks) == 0 {
+			asks = []float64{q.Floor}
+		}
+		if cheapest <= 0 || asks[0] < cheapest {
+			cheapest, comparable = asks[0], market.Comparable(q.Scope)
+		}
+		cm.Asks = append(cm.Asks, asks...)
+		// The displayed ask is what the buyer pays. Quote.Fee is deliberately
+		// not added here: on these venues it is the *seller's* commission —
+		// Quote.Net is Floor*(1-Fee) — so charging it to the buyer would inflate
+		// the walkaway price and hand back exactly the optimism being removed.
+		// The fee that does fall on a buyer is Tonnel's own referral, and it is
+		// applied on our side of the comparison in pricing.
+		for _, p := range asks {
+			if p > 0 {
+				buyerCosts = append(buyerCosts, p)
+			}
 		}
 	}
 	if len(refs) == 0 {
@@ -145,7 +168,13 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 	}
 	sort.Float64s(refs)
 	sort.Float64s(cm.Asks)
+	sort.Float64s(buyerCosts)
 	cm.Support = refs[len(refs)/2]
+	cm.Comparable = comparable
+	if len(buyerCosts) > 0 {
+		cm.BestBuyerCost = buyerCosts[0]
+		cm.DepthBuyerCost = buyerCosts[minInt(3, len(buyerCosts))-1]
+	}
 	return cm
 }
 

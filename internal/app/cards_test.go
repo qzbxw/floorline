@@ -44,7 +44,7 @@ func TestGappyBookCardWarnsInsteadOfTempting(t *testing.T) {
 	card, v := mambaCard(t)
 	for _, want := range []string{
 		"Дырявый стакан",
-		"Дешевле твоего входа по всем площадкам",
+		"Дешевле твоего входа стоит 6 чужих асков",
 	} {
 		if !strings.Contains(card, want) {
 			t.Errorf("card is missing %q:\n%s", want, card)
@@ -58,9 +58,10 @@ func TestGappyBookCardWarnsInsteadOfTempting(t *testing.T) {
 	}
 }
 
-// The card claimed "nobody within 5% of your exit → you are the best ask" two
-// lines under a competing ask it had printed itself. Whenever real asks sit
-// below the exit, the queue line has to say so.
+// The card claimed "nobody is cheaper than you" two lines under competing asks
+// it had printed itself. The exit now undercuts the cheapest of them, so being
+// first in the queue is true by construction and no longer worth saying — what
+// the card must not hide is that we paid more than the market is asking.
 func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
 	key := tonnel.ModelKey{Name: "Pet Snake", Model: "Black Mamba"}
 	// Our own 4.90 listing behind three cheaper sellers: the exit lands above
@@ -80,14 +81,15 @@ func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
 	card := a.renderCard(context.Background(),
 		&signal.Decision{Gift: tonnel.Gift{GiftID: 10380168, GiftNum: 150969}, Val: v}, "")
 
-	if v.CheaperAsks == 0 {
-		t.Fatalf("fixture is wrong: three asks must undercut the %.3f exit", v.FastExit)
+	if v.AsksBelowEntry < 3 {
+		t.Fatalf("fixture is wrong: three asks must sit below the %.3f entry, got %d",
+			v.Cost, v.AsksBelowEntry)
 	}
-	if strings.Contains(card, "Дешевле тебя никого") {
-		t.Errorf("card calls us the best ask with %d cheaper asks in the book:\n%s", v.CheaperAsks, card)
+	if strings.Contains(card, "Выходишь первым") {
+		t.Errorf("card calls us the best offer with %d asks under our entry:\n%s", v.AsksBelowEntry, card)
 	}
-	if !strings.Contains(card, "Перед тобой в очереди") {
-		t.Errorf("card must say we are behind a queue:\n%s", card)
+	if !strings.Contains(card, "рынок ниже нас") {
+		t.Errorf("card must say the market is cheaper than we paid:\n%s", card)
 	}
 }
 

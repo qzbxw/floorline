@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"floorline/internal/bot"
+	"floorline/internal/market"
 	"floorline/internal/pricing"
 	"floorline/internal/signal"
 	"floorline/internal/tonnel"
@@ -138,19 +139,20 @@ func (a *App) bookBlock(v pricing.Valuation) string {
 		} else {
 			fmt.Fprintf(&b, "Гэп до следующего %.1f%% · до глубины-3 %.1f%%\n", v.AskGap1*100, v.AskGap3*100)
 		}
+		// Since the exit undercuts the cheapest competing ask, we are always
+		// first in the queue at that price — so saying so is not news. What the
+		// operator needs to know is whether getting there meant pricing under
+		// the market itself, and how tight the sellers behind us are.
 		switch {
-		case v.CheaperAsks > 0:
-			fmt.Fprintf(&b, "Перед тобой в очереди %s дешевле выхода, самый дешёвый %s\n",
-				plural(v.CheaperAsks, "аск", "аска", "асков"), num(v.CompetingAsk))
+		case v.AsksBelowEntry > 0:
+			fmt.Fprintf(&b, "⚠️ Дешевле твоего входа стоит %s — рынок ниже нас\n",
+				plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков"))
 		case v.CompetitorsNear > 0:
-			fmt.Fprintf(&b, "Дешевле тебя никого, но %s в 5%% над выходом — риск андерката\n",
+			fmt.Fprintf(&b, "Выходишь первым, но %s в 5%% над выходом — риск андерката\n",
 				plural(v.CompetitorsNear, "продавец", "продавца", "продавцов"))
 		default:
-			b.WriteString("Дешевле тебя никого — выходишь первым в очереди\n")
+			b.WriteString("Выходишь первым в очереди, никто не дышит в спину\n")
 		}
-	}
-	if v.AsksBelowEntry > 0 {
-		fmt.Fprintf(&b, "Дешевле твоего входа по всем площадкам: <b>%d</b>\n", v.AsksBelowEntry)
 	}
 	fmt.Fprintf(&b, "Саплай %d · запаса %s\n", v.Supply, days(v.DaysOfSupply))
 	return b.String()
@@ -184,6 +186,15 @@ func traitBlock(v pricing.Valuation, g tonnel.Gift) string {
 		fmt.Fprintf(&b, "Премии нет: всего %d точных сделок, в цену не лезут\n", v.Attribute.ExactSamples)
 	default:
 		b.WriteString("Премии нет: точных сделок по этим трейтам не было\n")
+	}
+	// The look, stated separately from the premium, because they answer
+	// different questions: one is what this specimen is, the other is what the
+	// tape can prove it is worth. The floor sees neither.
+	if len(v.Appearance.Reasons) > 0 {
+		fmt.Fprintf(&b, "✨ %s\n", bot.Esc(strings.Join(v.Appearance.Reasons, " · ")))
+	}
+	if v.AppearanceUnpriced {
+		b.WriteString("⚠️ Выход посчитан по обычным экземплярам модели — по этим трейтам сравнить не с чем. Реальная цена может быть выше; смотри руками\n")
 	}
 	return b.String()
 }
@@ -494,11 +505,16 @@ func (a *App) crossMarketLines(ctx context.Context, v pricing.Valuation) []strin
 // decides whether the quote is about this exact gift or the whole model.
 func scopeNote(scope string) string {
 	switch scope {
-	case "exact attributes":
+	case market.ScopeExact:
 		return " · точно по трейтам"
-	case "model":
-		return " · по модели"
-	case "floor only":
+	case market.ScopeBackdrop:
+		return " · по фону"
+	case market.ScopeModel:
+		// Worth saying out loud rather than hiding in a word: this queue is the
+		// ordinary specimens of the model, and for anything whose value is its
+		// backdrop that is a different asset.
+		return " · <b>по модели, не по трейтам</b>"
+	case market.ScopeFloor:
 		return " · только флор"
 	default:
 		return ""
@@ -592,14 +608,20 @@ func passReasons(v pricing.Valuation, fails []string) []string {
 
 // scoreVerdict puts a word to the number, so the score is readable without
 // remembering what counts as good on this scale.
+//
+// The bands are anchored on what this market actually produces once the exit is
+// priced honestly, not on where a hundred-point scale looks tidy. Jolly Chimp —
+// the one card in the 12 Aug log that was taken and made money — lands at 17,
+// and everything else that night lands under 10. A band structure that called
+// 17 "слабый" would be describing the desk's best trade of the day as noise.
 func scoreVerdict(total float64) string {
 	switch {
-	case total >= 50:
-		return "отличный"
-	case total >= 30:
-		return "хороший"
-	case total >= 15:
-		return "средний"
+	case total >= 40:
+		return "редкий"
+	case total >= 20:
+		return "сильный"
+	case total >= 10:
+		return "рабочий"
 	case total > 0:
 		return "слабый"
 	default:

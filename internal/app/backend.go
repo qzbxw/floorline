@@ -56,7 +56,7 @@ func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64
 	}
 
 	v := pricing.Evaluate(pricing.Input{
-		GiftID: g.GiftID.Int(), OwnerID: a.api.UserID(),
+		GiftID: g.GiftID.Int(), GiftNum: g.GiftNum.Int(), OwnerID: a.api.UserID(),
 		Key:      key,
 		Price:    g.Price.Float(),
 		Cost:     cost,
@@ -68,11 +68,15 @@ func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64
 		Backdrop: tonnel.BaseAttr(g.Backdrop), Symbol: tonnel.BaseAttr(g.Symbol),
 		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
 		SnapshotAt: snapshotAt, Now: now, FX: fxContext,
-		Params: pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut},
+		Params:    pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut},
+		TicketRef: a.rm.Limits().MaxTicket,
 	})
-	if cm := a.crossMarketDepth(ctx, v); cm.Support > 0 {
-		v = pricing.WithCrossDepth(v, cm)
-	}
+	// Unconditionally, not only when a venue answered. A venue we could not
+	// read is itself an input — it removes the cap that holds an optimistic
+	// exit down — and guarding this on Support > 0 threw that fact away: the
+	// card printed "1 площадка не ответила" while the valuation behind it had
+	// no idea, so neither the score nor the auto-buy gate ever saw it.
+	v = pricing.WithCrossDepth(v, a.crossMarketDepth(ctx, v))
 	return v, nil
 }
 
