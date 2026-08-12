@@ -526,6 +526,32 @@ func (a *App) pollInventory(ctx context.Context) error {
 	return nil
 }
 
+// acquisitionWindow is how far back a trade may sit and still plausibly be our
+// own purchase of a gift we have just noticed. Beyond it the trade belongs to
+// whoever held the gift before us, and "unknown, tell me with /cost" is the
+// honest answer.
+const acquisitionWindow = 12 * time.Hour
+
+// Cost-basis provenance, strongest first. The first two are facts; the rest are
+// guesses that a fuller trade tape may improve.
+const (
+	costSourceExecuted = "floorline" // we placed the order and saw the debit
+	costSourceManual   = "manual"    // the operator told us
+)
+
+// costIsProvisional reports whether the acquisition price is still a guess.
+//
+// Everything downstream is measured from this number — edge, PnL, the refusal
+// to relist below cost — so a guess that stops being revisited quietly poisons
+// all of them.
+func costIsProvisional(p *store.Position) bool {
+	switch p.CostSource {
+	case costSourceExecuted, costSourceManual:
+		return false
+	}
+	return true
+}
+
 // reconcileOwned makes the local position table agree with the marketplace,
 // importing anything bought outside the bot so /pnl stays honest.
 func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, now time.Time) error {
@@ -543,6 +569,16 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 		if reacquired {
 			after = existing.SoldAt
 		}
+		// Only a *recent* trade can be our acquisition.
+		//
+		// Without the window this took the newest sale of the gift at any age,
+		// which is whoever owned it before us. A Fresh Socks bought by hand at
+		// 4.2 was imported at 3.8 — the previous owner's price — because the
+		// trade tape had not caught up with ours yet, and the guess was then
+		// frozen at 85% confidence and never revisited.
+		if after.Before(now.Add(-acquisitionWindow)) {
+			after = now.Add(-acquisitionWindow)
+		}
 		buyPrice, boughtAt, found, lookupErr := a.st.AcquisitionForGiftAfter(ctx, id, after)
 		if lookupErr != nil {
 			return lookupErr
@@ -551,7 +587,8 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 		note := "импортирован из инвентаря; цена входа неизвестна — задай через /cost"
 		if found {
 			buyPrice *= 1 + math.Max(a.cfg.TonnelFee, 0)
-			costSource, costConfidence, note = "sale_history", .85, "импортирован из инвентаря; цену входа восстановил по истории сделок"
+			costSource, costConfidence = "sale_history", .6
+			note = "импортирован из инвентаря; цену входа взял из ленты сделок — проверь и поправь через /cost"
 		} else {
 			boughtAt = now
 		}
@@ -592,21 +629,41 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 		return nil
 	}
 
-	if existing.BuyPrice <= 0 {
-		after := time.Time{}
-		if existing.Source == "reacquired" {
-			if cycles, _ := a.st.PositionTradesForGift(ctx, id); len(cycles) > 0 {
-				after = cycles[0].SoldAt
+	// A recovered cost basis stays provisional until something authoritative
+	// replaces it, and it is re-checked on every pass rather than frozen at
+	// import.
+	//
+	// The trade tape lags the inventory: a gift shows up as ours before our own
+	// purchase appears in saleHistory, so the newest trade at that moment is the
+	// *previous* owner's. That number used to be written once at 85% confidence
+	// and kept forever, which is how a 4.2 purchase was reported as 3.8 and then
+	// as a +16.6% listing that was really break-even.
+	//
+	// While we hold the gift, any sale of it newer than the one we recorded can
+	// only be our own acquisition — we cannot have sold something we still own —
+	// so adopting the newest is safe and converges as the tape fills in.
+	if costIsProvisional(existing) {
+		after := existing.BoughtAt
+		if existing.BuyPrice <= 0 {
+			after = time.Time{}
+			if existing.Source == "reacquired" {
+				if cycles, _ := a.st.PositionTradesForGift(ctx, id); len(cycles) > 0 {
+					after = cycles[0].SoldAt
+				}
+			}
+			if after.Before(now.Add(-acquisitionWindow)) {
+				after = now.Add(-acquisitionWindow)
 			}
 		}
 		if price, boughtAt, found, err := a.st.AcquisitionForGiftAfter(ctx, id, after); err != nil {
 			return err
 		} else if found {
 			price *= 1 + math.Max(a.cfg.TonnelFee, 0)
-			if err := a.st.SetRecoveredCostBasis(ctx, id, price, boughtAt, "sale_history", .85); err != nil {
+			if err := a.st.SetRecoveredCostBasis(ctx, id, price, boughtAt, "sale_history", .6); err != nil {
 				return err
 			}
-			_ = a.st.RecordPositionEvent(ctx, id, "cost_recovered", 0, price, "matched physical gift in Tonnel sales", now)
+			_ = a.st.RecordPositionEvent(ctx, id, "cost_recovered", existing.BuyPrice, price,
+				"нашёл более свежую сделку по этому гифту в ленте Tonnel", now)
 			existing.BuyPrice, existing.BoughtAt = price, boughtAt
 		}
 	}
