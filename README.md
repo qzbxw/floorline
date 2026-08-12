@@ -12,6 +12,7 @@ cp .env.example .env && chmod 600 .env    # заполни три обязате
 ./floorline gram                           # GRAM/USDT и лаг отслеживаемых флоров
 ./floorline history 10368454               # полный lifecycle конкретной позиции
 ./floorline val 10368454 10382082          # оценка лотов без Telegram: цена и гейты
+./floorline login                          # разовый вход в Telegram: мини-аппы MRKT/Portals
 ./floorline backfill                       # 60 дней: ликвидность + премии атрибутов
 ./floorline run                            # поллеры + бот
 ```
@@ -122,6 +123,8 @@ Web → DevTools → Network → POST на `api.tgmrkt.io/api/v1/auth` → по�
   /book  Plush Pepe / Pink Diamond     лестница асков и глубина
   /hist  Plush Pepe / Pink Diamond     реальные сделки, медиана, velocity
   /val 123456                          полная оценка лота + какие гейты не прошёл
+  /scan                                скан стоящих лотов под твой бюджет
+  /scan Plush Pepe                     то же самое по одной коллекции
   <ссылка из Tonnel>                   то же самое: кинь боту Share-ссылку на гифт
 
 Книга

@@ -51,6 +51,7 @@ func marketMenu() Reply {
 		Text: "📊 <b>Анализ рынка</b>\n\n" +
 			"Что хочешь посмотреть?",
 		Rows: [][]Button{
+			{Callback("🔭 Скан рынка", cbRefresh, "scan")},
 			{Callback("💹 GRAM/USDT", cbRefresh, "gram")},
 			{Callback("📈 Флор", cbPick, "floor"), Callback("📖 Стакан", cbPick, "book")},
 			{Callback("🕒 Сделки", cbPick, "hist"), Callback("💰 Оценка лота", cbMarket, "val")},

@@ -36,6 +36,12 @@ type MRKT struct {
 	// is enough, and initData is preferable because it self-renews.
 	initData string
 
+	// session, when present, mints a fresh initData on demand by opening the
+	// mini app as the real account. It supersedes the pasted value: a scraped
+	// payload expires and cannot be renewed without the operator, which is the
+	// state that reads to the marketplace as an API being driven directly.
+	session InitDataSource
+
 	tokenMu sync.Mutex
 	token   string
 	static  bool // token came from config and cannot be refreshed
@@ -44,9 +50,9 @@ type MRKT struct {
 	books  *cache[[]float64]
 }
 
-// NewMRKT builds the MRKT reader. Supply either a bearer token or the WebApp
-// initData; with neither, the source is disabled.
-func NewMRKT(initData, token string, fee float64, ttl time.Duration) (*MRKT, error) {
+// NewMRKT builds the MRKT reader. Supply a Telegram session, a bearer token or
+// the WebApp initData; with none of them, the source is disabled.
+func NewMRKT(session InitDataSource, initData, token string, fee float64, ttl time.Duration) (*MRKT, error) {
 	hc, err := newHTTPClient(15)
 	if err != nil {
 		return nil, fmt.Errorf("mrkt: %w", err)
@@ -55,12 +61,14 @@ func NewMRKT(initData, token string, fee float64, ttl time.Duration) (*MRKT, err
 	return &MRKT{
 		http:     hc,
 		fee:      fee,
-		lim:      rate.NewLimiter(rate.Limit(1), 2),
+		lim:      humanPace(),
+		session:  session,
 		initData: strings.TrimSpace(initData),
 		token:    token,
-		static:   token != "" && strings.TrimSpace(initData) == "",
-		floors:   newCache[float64](ttl),
-		books:    newCache[[]float64](ttl),
+		// A session can always mint a new payload, so the token is never final.
+		static: session == nil && token != "" && strings.TrimSpace(initData) == "",
+		floors: newCache[float64](ttl),
+		books:  newCache[[]float64](ttl),
 	}, nil
 }
 
@@ -68,7 +76,9 @@ func NewMRKT(initData, token string, fee float64, ttl time.Duration) (*MRKT, err
 func (m *MRKT) Venue() string { return "MRKT" }
 
 // Enabled implements Source.
-func (m *MRKT) Enabled() bool { return m != nil && (m.initData != "" || m.token != "") }
+func (m *MRKT) Enabled() bool {
+	return m != nil && (m.session != nil || m.initData != "" || m.token != "")
+}
 
 // Fee implements Source.
 func (m *MRKT) Fee() float64 { return m.fee }
@@ -237,11 +247,12 @@ func (m *MRKT) ensureToken(ctx context.Context) (string, error) {
 	}
 	m.tokenMu.Unlock()
 
-	if m.initData == "" {
-		return "", fmt.Errorf("mrkt: no token and no initData")
+	initData, err := m.freshInitData(ctx)
+	if err != nil {
+		return "", err
 	}
 
-	status, raw, err := m.do(ctx, "/auth", map[string]any{"data": m.initData}, "")
+	status, raw, err := m.do(ctx, "/auth", map[string]any{"data": initData}, "")
 	if err != nil {
 		return "", fmt.Errorf("mrkt auth: %w", err)
 	}
@@ -264,12 +275,34 @@ func (m *MRKT) ensureToken(ctx context.Context) (string, error) {
 	return out.Token, nil
 }
 
+// freshInitData prefers a payload minted right now by the real account, and
+// falls back to whatever was pasted into the environment.
+func (m *MRKT) freshInitData(ctx context.Context) (string, error) {
+	if m.session != nil {
+		if data, err := m.session.InitData(ctx, "MRKT"); err == nil && data != "" {
+			return data, nil
+		} else if err != nil && m.initData == "" {
+			return "", fmt.Errorf("mrkt: could not open the mini app: %w", err)
+		}
+	}
+	if m.initData == "" {
+		return "", fmt.Errorf("mrkt: no token, no initData and no Telegram session")
+	}
+	return m.initData, nil
+}
+
 // invalidate drops a token that the server rejected, but only if it is still
 // the current one — a concurrent request may already have replaced it.
+//
+// The cached mini-app payload goes with it: if the token it produced is no
+// longer accepted, the payload behind it is stale too.
 func (m *MRKT) invalidate(stale string) {
 	m.tokenMu.Lock()
 	if m.token == stale {
 		m.token = ""
 	}
 	m.tokenMu.Unlock()
+	if m.session != nil {
+		m.session.Invalidate("MRKT")
+	}
 }

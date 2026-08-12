@@ -25,6 +25,7 @@ import (
 
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"golang.org/x/time/rate"
 )
 
 // userAgent is fixed per process and matched to the TLS profile below, for the
@@ -69,6 +70,26 @@ func (q Quote) Reference() float64 {
 }
 
 func (q Quote) NetReference() float64 { return q.Reference() * (1 - q.Fee) }
+
+// InitDataSource mints a Telegram mini-app payload on demand. It is satisfied
+// by *tgsession.Client; the interface keeps this package free of the MTProto
+// dependency and lets the venues be tested without one.
+type InitDataSource interface {
+	InitData(ctx context.Context, venue string) (string, error)
+	Invalidate(venue string)
+}
+
+// humanPace is the request budget for a venue.
+//
+// MRKT banned this account for two weeks for reading its API without going
+// through the mini app, and the request rate is half of what gave that away: a
+// person tapping through listings does not sustain a request a second, and
+// never does so at four in the morning with no gaps. One request every two
+// seconds with a small burst is roughly a fast human, and it is still far more
+// throughput than the desk needs.
+func humanPace() *rate.Limiter {
+	return rate.NewLimiter(rate.Every(2*time.Second), 3)
+}
 
 // Source is one marketplace we can read a model floor from.
 type Source interface {

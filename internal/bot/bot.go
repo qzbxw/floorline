@@ -26,6 +26,9 @@ type Backend interface {
 	BookText(ctx context.Context, collection, model string) Reply
 	Hist(ctx context.Context, collection, model string) Reply
 	Val(ctx context.Context, giftID int64) Reply
+	// Scan sweeps the standing book rather than the arrival feed. An empty
+	// collection means the busiest slice of the whole market.
+	Scan(ctx context.Context, collection string) Reply
 
 	Positions(ctx context.Context) Reply
 	Portfolio(ctx context.Context) Reply
@@ -247,6 +250,10 @@ func (b *Bot) register() {
 			return Text("Формат: <code>/val 123456</code> — ID лота на Tonnel.\nИли просто кинь сюда ссылку из мини-аппа: «Share» → отправить боту.")
 		}
 		return b.back.Val(ctx, id)
+	}))
+
+	tb.Handle("/scan", b.reply(func(ctx context.Context, c tele.Context) Reply {
+		return b.back.Scan(ctx, strings.TrimSpace(c.Message().Payload))
 	}))
 
 	tb.Handle("/pos", b.reply(func(ctx context.Context, c tele.Context) Reply {
@@ -490,6 +497,8 @@ func (b *Bot) registerCallbacks() {
 			r = back(b.back.Portfolio(ctx), cbPortfolio, "🔙 Портфель")
 		case "balance":
 			r = back(b.back.BalanceText(ctx), cbPortfolio, "🔙 Портфель")
+		case "scan":
+			r = back(b.back.Scan(ctx, ""), cbMarket, "🔙 Рынок")
 		case "gram":
 			r = back(b.back.Gram(ctx), cbMarket, "🔙 Рынок")
 		case "watchlist":

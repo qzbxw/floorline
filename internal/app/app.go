@@ -19,7 +19,9 @@ import (
 	"floorline/internal/risk"
 	"floorline/internal/signal"
 	"floorline/internal/store"
+	"floorline/internal/tgsession"
 	"floorline/internal/tonnel"
+	"floorline/internal/venue"
 )
 
 // App owns every long-lived component.
@@ -35,6 +37,13 @@ type App struct {
 	cross *market.Comparison
 	fx    *fx.Client
 	tg    *bot.Bot
+	// session is the real Telegram account the marketplaces' mini apps are
+	// opened through. Nil when it is not configured; everything degrades to
+	// pasted credentials rather than failing.
+	session *tgsession.Client
+	// venues is the tradeable view of the marketplaces, as opposed to `cross`
+	// which only reads them for pricing.
+	venues *venue.Registry
 
 	// nav holds short handles for keyboard buttons, because collection and
 	// model names do not fit in Telegram's 64-byte callback payload.
@@ -47,7 +56,12 @@ type App struct {
 	coverage    time.Duration
 	backfillDon bool
 	collections map[string]struct{}
-	rotation    collectionRotation
+	// scanCursor walks the ranked model list across passes, so a sweep resumes
+	// where the previous one stopped instead of re-reading the same busiest few.
+	scanCursor    int
+	lastScan      time.Time
+	lastScanFound int
+	rotation      collectionRotation
 	// alertCooldown throttles the non-trade alerts (undercut, stale, sweep)
 	// which have no natural dedupe key in the database.
 	alertCooldown map[string]time.Time
@@ -129,21 +143,48 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	a.ex = exec.New(a.api, st, a.books, a.rm, cfg)
 	a.fx = fx.New(cfg.GramQuoteURL, cfg.HTTPTimeout)
 
-	// Cross-market venues are read-only price references. A venue that fails to
-	// build is dropped with a warning rather than taking the process down —
-	// none of them is required to trade.
+	// The Telegram account, when configured, is what lets the other venues be
+	// read as a person using their mini app rather than as a bare API client.
+	// It is optional: without it the venues fall back to pasted credentials.
+	var venueSession market.InitDataSource
+	if sc := sessionConfig(cfg); sc.Valid() {
+		if s, err := tgsession.New(sc); err != nil {
+			log.Warn().Err(err).Msg("telegram session unavailable")
+		} else {
+			a.session = s
+			venueSession = sessionAdapter{c: s}
+		}
+	}
+
+	// A venue that fails to build is dropped with a warning rather than taking
+	// the process down — none of them is required to trade on Tonnel.
 	var sources []market.Source
-	if p, err := market.NewPortals(cfg.PortalsAuth, cfg.PortalsFee, cfg.CrossMarkTTL); err != nil {
+	if p, err := market.NewPortals(venueSession, cfg.PortalsAuth, cfg.PortalsFee, cfg.CrossMarkTTL); err != nil {
 		log.Warn().Err(err).Msg("portals comparison unavailable")
 	} else {
 		sources = append(sources, p)
 	}
-	if mk, err := market.NewMRKT(cfg.MrktInit, cfg.MrktToken, cfg.MrktFee, cfg.CrossMarkTTL); err != nil {
+	if mk, err := market.NewMRKT(venueSession, cfg.MrktInit, cfg.MrktToken, cfg.MrktFee, cfg.CrossMarkTTL); err != nil {
 		log.Warn().Err(err).Msg("mrkt comparison unavailable")
 	} else {
 		sources = append(sources, mk)
 	}
 	a.cross = market.NewComparison(sources...)
+
+	// The tradeable view of the same marketplaces. Reading and buying are
+	// separate concerns: `cross` prices against every venue, `venues` is what
+	// can actually execute. Portals and MRKT appear here as soon as their
+	// purchase call is captured — everything around it is already wired.
+	vhttp, err := venue.NewHTTPClient(15)
+	if err != nil {
+		log.Warn().Err(err).Msg("venue transport unavailable")
+	} else {
+		a.venues = venue.NewRegistry(
+			venue.NewTonnel(a.api, cfg.TonnelFee),
+			venue.NewPortals(vhttp, venueSession, cfg.PortalsFee, venue.HumanPace()),
+			venue.NewMRKT(vhttp, venueSession, cfg.MrktFee, venue.HumanPace()),
+		)
+	}
 	a.det.CrossSupport = a.crossMarketDepth
 	a.det.Spendable = a.spendable
 
@@ -214,6 +255,11 @@ func (a *App) Run(ctx context.Context) error {
 	start("inventory", a.cfg.InventoryInterval, a.pollInventory)
 	start("gram", a.cfg.GramQuoteInterval, a.pollGram)
 	start("maintenance", time.Hour, a.maintenance)
+	start("scan", a.cfg.ScanInterval, a.pollScan)
+
+	// The Telegram account comes up alongside the pollers: the venues need it
+	// before the first card is priced.
+	a.startSession(ctx)
 
 	wg.Add(1)
 	go func() {

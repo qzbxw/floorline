@@ -99,6 +99,9 @@ func (a *App) statusText(ctx context.Context) string {
 		resell = "🟢 включён — сам выставляет купленное"
 	}
 	fmt.Fprintf(&b, "Ресейл %s\n", resell)
+	fmt.Fprintf(&b, "%s\n", bot.Esc(a.sessionLine()))
+	fmt.Fprintf(&b, "%s\n", bot.Esc(a.venuesLine()))
+	fmt.Fprintf(&b, "%s\n", bot.Esc(a.scanLine()))
 
 	n, first, _ := a.st.CalibrationStats(ctx)
 	mode := "боевой"

@@ -317,6 +317,11 @@ func (a *App) Arm(ctx context.Context) bot.Reply { return bot.Text(a.armText(ctx
 // Disarm stops unattended buying.
 func (a *App) Disarm(ctx context.Context) bot.Reply { return bot.Text(a.disarmText(ctx)) }
 
+// Scan sweeps the standing book for mispriced lots.
+func (a *App) Scan(ctx context.Context, collection string) bot.Reply {
+	return bot.Text(a.scanText(ctx, collection))
+}
+
 // Resell shows or switches automatic selling.
 func (a *App) Resell(ctx context.Context, arg string) bot.Reply {
 	return bot.Text(a.resellText(ctx, arg))

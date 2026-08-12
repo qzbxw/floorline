@@ -265,11 +265,11 @@ func TestNanoToGRAM(t *testing.T) {
 }
 
 func TestSourcesImplementTheInterface(t *testing.T) {
-	p, err := NewPortals("token", 0.02, time.Minute)
+	p, err := NewPortals(nil, "token", 0.02, time.Minute)
 	if err != nil {
 		t.Fatalf("NewPortals: %v", err)
 	}
-	m, err := NewMRKT("initdata", "", 0.02, time.Minute)
+	m, err := NewMRKT(nil, "initdata", "", 0.02, time.Minute)
 	if err != nil {
 		t.Fatalf("NewMRKT: %v", err)
 	}
@@ -290,12 +290,12 @@ func TestSourcesImplementTheInterface(t *testing.T) {
 // Portals answers its read endpoints anonymously, so it works with no setup.
 // MRKT does not, and must stay quiet until it has credentials.
 func TestSourceCredentialRequirements(t *testing.T) {
-	p, _ := NewPortals("", 0.02, time.Minute)
+	p, _ := NewPortals(nil, "", 0.02, time.Minute)
 	if !p.Enabled() {
 		t.Error("Portals needs no credentials and must be enabled by default")
 	}
 
-	m, _ := NewMRKT("", "", 0.02, time.Minute)
+	m, _ := NewMRKT(nil, "", "", 0.02, time.Minute)
 	if m.Enabled() {
 		t.Error("MRKT must be disabled without initData or a token")
 	}
@@ -355,11 +355,11 @@ func TestPortalsDecodesFilters(t *testing.T) {
 
 // A pasted bearer token cannot be renewed, so the client must not try.
 func TestMRKTStaticTokenIsNotRefreshable(t *testing.T) {
-	static, _ := NewMRKT("", "pasted-token", 0.02, time.Minute)
+	static, _ := NewMRKT(nil, "", "pasted-token", 0.02, time.Minute)
 	if !static.static {
 		t.Error("a token supplied without initData should be marked static")
 	}
-	renewable, _ := NewMRKT("initdata", "", 0.02, time.Minute)
+	renewable, _ := NewMRKT(nil, "initdata", "", 0.02, time.Minute)
 	if renewable.static {
 		t.Error("a source with initData can renew and must not be marked static")
 	}

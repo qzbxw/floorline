@@ -57,6 +57,15 @@ type Config struct {
 	MrktInit    string // Telegram WebApp initData, exchanged for a token that self-renews
 	MrktToken   string // a ready bearer token, if you would rather paste that
 
+	// A real Telegram account, used to open the marketplaces' mini apps and
+	// mint a fresh initData whenever one is needed. This is what makes the
+	// HTTPS calls look like a person using the app rather than an API being
+	// driven directly — the distinction MRKT bans accounts over.
+	TelegramAppID   int
+	TelegramAppHash string
+	TelegramPhone   string
+	SessionPath     string
+
 	DBPath   string
 	LogLevel string
 
@@ -71,7 +80,11 @@ type Config struct {
 	LookbackDays          int
 	AttributeLookbackDays int
 
-	FeedInterval      time.Duration
+	FeedInterval time.Duration
+	// ScanInterval is how often the standing book is swept. The feed only ever
+	// shows new listings; most of the market is a gift that has been sitting at
+	// the same price and became interesting because everything moved around it.
+	ScanInterval      time.Duration
 	StatsInterval     time.Duration
 	SalesInterval     time.Duration
 	InventoryInterval time.Duration
@@ -144,6 +157,11 @@ func Load() (*Config, error) {
 		MrktInit:     os.Getenv("MRKT_INIT_DATA"),
 		MrktToken:    os.Getenv("MRKT_TOKEN"),
 
+		TelegramAppID:   envInt("TELEGRAM_APP_ID", 0),
+		TelegramAppHash: os.Getenv("TELEGRAM_APP_HASH"),
+		TelegramPhone:   os.Getenv("TELEGRAM_PHONE"),
+		SessionPath:     envStr("TELEGRAM_SESSION", "./tgsession.json"),
+
 		DBPath:   envStr("DB_PATH", "./floorline.db"),
 		LogLevel: envStr("LOG_LEVEL", "info"),
 
@@ -176,6 +194,7 @@ func Load() (*Config, error) {
 		AttributeLookbackDays: envInt("ATTRIBUTE_LOOKBACK_DAYS", 60),
 
 		FeedInterval:      envDur("POLL_FEED", 2*time.Second),
+		ScanInterval:      envDur("POLL_SCAN", 12*time.Minute),
 		StatsInterval:     envDur("POLL_STATS", 60*time.Second),
 		SalesInterval:     envDur("POLL_SALES", 25*time.Second),
 		InventoryInterval: envDur("POLL_INVENTORY", 60*time.Second),

@@ -490,6 +490,33 @@ FROM model_current WHERE name = ? AND model = ?`, key.Name, key.Model).
 	return &r, nil
 }
 
+// ModelStats returns the whole current market snapshot.
+//
+// The scanner needs every model at once: it ranks the market by how much each
+// one trades and then walks the busiest slice, which cannot be done a
+// collection at a time.
+func (s *Store) ModelStats(ctx context.Context) ([]ModelStatRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT name, model, COALESCE(floor,0), COALESCE(supply,0), COALESCE(rarity,0), ts
+FROM model_current WHERE floor > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ModelStatRow
+	for rows.Next() {
+		var r ModelStatRow
+		var ts int64
+		if err := rows.Scan(&r.Key.Name, &r.Key.Model, &r.Floor, &r.Supply, &r.Rarity, &ts); err != nil {
+			return nil, err
+		}
+		r.TS = fromUnix(ts)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ModelsForCollection lists a collection's models, cheapest floor first.
 func (s *Store) ModelsForCollection(ctx context.Context, name string) ([]ModelStatRow, error) {
 	rows, err := s.db.QueryContext(ctx, `

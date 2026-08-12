@@ -36,24 +36,42 @@ type Portals struct {
 	fee  float64
 	lim  *rate.Limiter
 
+	// session mints a mini-app payload on demand. Portals answers reads
+	// anonymously today, but writes will not, and an account that only ever
+	// appears as bare HTTPS traffic is the pattern MRKT banned.
+	session InitDataSource
+
 	floors *cache[map[string]float64]
 	books  *cache[[]float64]
 }
 
-// NewPortals builds the Portals reader. authData is optional.
-func NewPortals(authData string, fee float64, ttl time.Duration) (*Portals, error) {
+// NewPortals builds the Portals reader. Both the session and authData are
+// optional: the read endpoints answer without either.
+func NewPortals(session InitDataSource, authData string, fee float64, ttl time.Duration) (*Portals, error) {
 	hc, err := newHTTPClient(15)
 	if err != nil {
 		return nil, fmt.Errorf("portals: %w", err)
 	}
 	return &Portals{
-		http:   hc,
-		auth:   strings.TrimSpace(authData),
-		fee:    fee,
-		lim:    rate.NewLimiter(rate.Limit(1), 2),
-		floors: newCache[map[string]float64](ttl),
-		books:  newCache[[]float64](ttl),
+		http:    hc,
+		auth:    strings.TrimSpace(authData),
+		fee:     fee,
+		lim:     humanPace(),
+		session: session,
+		floors:  newCache[map[string]float64](ttl),
+		books:   newCache[[]float64](ttl),
 	}, nil
+}
+
+// authHeader returns the Authorization value to send, preferring a payload
+// minted by the real account over anything pasted into the environment.
+func (p *Portals) authHeader(ctx context.Context) string {
+	if p.session != nil {
+		if data, err := p.session.InitData(ctx, "Portals"); err == nil && data != "" {
+			return "tma " + data
+		}
+	}
+	return p.auth
 }
 
 // ModelAsks reads the actual Portals sell queue, with optional exact
@@ -87,8 +105,8 @@ func (p *Portals) ModelAsks(ctx context.Context, collection, model, backdrop, sy
 			return nil, err
 		}
 		req.Header = http.Header{"accept": {"application/json"}, "origin": {"https://portals.tg"}, "referer": {"https://portals.tg/"}, "user-agent": {userAgent}}
-		if p.auth != "" {
-			req.Header.Set("authorization", p.auth)
+		if h := p.authHeader(ctx); h != "" {
+			req.Header.Set("authorization", h)
 		}
 		resp, err := p.http.Do(req)
 		if err != nil {
@@ -169,8 +187,8 @@ func (p *Portals) fetch(ctx context.Context, short string) (map[string]float64, 
 		"referer":    {"https://portals.tg/"},
 		"user-agent": {userAgent},
 	}
-	if p.auth != "" {
-		req.Header.Set("authorization", p.auth)
+	if h := p.authHeader(ctx); h != "" {
+		req.Header.Set("authorization", h)
 	}
 
 	resp, err := p.http.Do(req)

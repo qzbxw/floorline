@@ -61,10 +61,16 @@ func main() {
 
 func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	switch cmd {
-	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history", "val":
+	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history", "val", "login", "scan":
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+
+	// Signing in needs neither a Tonnel session nor a database — it is the step
+	// that happens before any of that works.
+	if cmd == "login" {
+		return app.Login(ctx, cfg, os.Stdin, os.Stdout)
 	}
 
 	if err := cfg.RequireAuth(); err != nil {
@@ -78,6 +84,16 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	defer a.Close()
 
 	switch cmd {
+	case "scan":
+		// The same sweep the poller runs, on demand. The feed only shows new
+		// listings; this walks the standing book.
+		collection := ""
+		if flag.NArg() > 1 {
+			collection = strings.Join(flag.Args()[1:], " ")
+		}
+		fmt.Println(stripHTML(a.Scan(ctx, collection).Text))
+		return nil
+
 	case "val":
 		// The same valuation the /val card shows, without needing Telegram. This
 		// is how a pricing change gets checked against real listings before it
@@ -203,6 +219,9 @@ Commands:
   gram       refresh and print GRAM/USDT plus tracked floor lag
   history ID sync inventory and print the full position lifecycle
   val ID...  price one or more listings and print why they pass or fail
+  scan [коллекция]  sweep the standing book for mispriced lots
+  login      sign in to Telegram once, so the other marketplaces can be
+             reached through their mini apps instead of as a bare API
   dump <x>   print one endpoint's raw JSON (feed, sales, sales-all, balance, mygifts)
 
 Flags:
