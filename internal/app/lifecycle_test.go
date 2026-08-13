@@ -238,3 +238,45 @@ func TestPositionWithOnlyItsPurchaseOnTapeGoesMissingNotSold(t *testing.T) {
 		t.Errorf("status = %q, want missing while the sale is unconfirmed", got.Status)
 	}
 }
+
+// Entries recovered before the referral was added to the derivation sit a clean
+// 0.5% low, which understates cost and so overstates edge on every card that
+// mentions them. A provisional cost has to equal what the current rule produces
+// from the same trade, not whichever rule was in force the day it was written.
+func TestProvisionalCostConvergesOnTheCurrentRule(t *testing.T) {
+	ctx := context.Background()
+	a, st := lifecycleApp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	key := tonnel.ModelKey{Name: "Snake Box", Model: "Bluebell"}
+	at := now.Add(-2 * time.Hour)
+
+	// Written by the old code: the raw trade price, no referral.
+	if err := st.UpsertPosition(ctx, store.Position{
+		GiftID: 31, GiftNum: 31, Key: key, BuyPrice: 3.09, BoughtAt: at,
+		CostSource: "sale_history", CostConfidence: .85,
+		ListPrice: 3.27, ListedAt: at, Status: store.StatusListed, Source: "import",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedSale(t, st, 31, key, 3.09, at)
+
+	g := tonnel.Gift{GiftID: 31, GiftNum: 31, Name: key.Name, Model: key.Model, Price: 3.27, Asset: tonnel.AssetGRAM}
+	if err := a.reconcileOwned(ctx, g, true, now); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := st.GetPosition(ctx, 31)
+	if want := 3.09 * 1.005; math.Abs(p.BuyPrice-want) > 0.001 {
+		t.Errorf("cost basis = %.4f, want %.4f — the referral belongs in the entry", p.BuyPrice, want)
+	}
+
+	// And it settles: a second pass over an already-corrected position must not
+	// keep rewriting it, or the lifecycle fills with events saying nothing.
+	before, _ := st.PositionEvents(ctx, 31, 50)
+	if err := a.reconcileOwned(ctx, g, true, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := st.PositionEvents(ctx, 31, 50)
+	if len(after) != len(before) {
+		t.Errorf("a settled cost basis was rewritten: %d events became %d", len(before), len(after))
+	}
+}

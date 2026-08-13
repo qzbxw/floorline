@@ -643,7 +643,16 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 	// only be our own acquisition — we cannot have sold something we still own —
 	// so adopting the newest is safe and converges as the tape fills in.
 	if costIsProvisional(existing) {
-		after := existing.BoughtAt
+		// Inclusive of the trade we already matched, not strictly after it.
+		//
+		// A provisional cost should always equal what the current derivation
+		// produces from the same trade, and it did not: entries written before
+		// the referral was added to the recovery are a clean 0.5% low, which
+		// understates cost and so overstates edge on every card that mentions
+		// them. Re-deriving from the same row rather than only from a newer one
+		// makes the record converge on the rule instead of preserving whichever
+		// rule was in force the day it was written.
+		after := existing.BoughtAt.Add(-time.Second)
 		if existing.BuyPrice <= 0 {
 			after = time.Time{}
 			if existing.Source == "reacquired" {
@@ -659,12 +668,20 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 			return err
 		} else if found {
 			price *= 1 + math.Max(a.cfg.TonnelFee, 0)
-			if err := a.st.SetRecoveredCostBasis(ctx, id, price, boughtAt, "sale_history", .6); err != nil {
-				return err
+			// Write only on a real change, or every inventory poll would record
+			// an event saying nothing happened.
+			newer := boughtAt.After(existing.BoughtAt)
+			if newer || math.Abs(price-existing.BuyPrice) > 0.001 {
+				if err := a.st.SetRecoveredCostBasis(ctx, id, price, boughtAt, "sale_history", .6); err != nil {
+					return err
+				}
+				note := "пересчитал вход по ленте Tonnel"
+				if newer {
+					note = "нашёл более свежую сделку по этому гифту в ленте Tonnel"
+				}
+				_ = a.st.RecordPositionEvent(ctx, id, "cost_recovered", existing.BuyPrice, price, note, now)
+				existing.BuyPrice, existing.BoughtAt = price, boughtAt
 			}
-			_ = a.st.RecordPositionEvent(ctx, id, "cost_recovered", existing.BuyPrice, price,
-				"нашёл более свежую сделку по этому гифту в ленте Tonnel", now)
-			existing.BuyPrice, existing.BoughtAt = price, boughtAt
 		}
 	}
 	if existing.Status == store.StatusMissing {
