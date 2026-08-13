@@ -56,7 +56,7 @@ func NewPortals(session InitDataSource, authData string, fee float64, ttl time.D
 		http:    hc,
 		auth:    strings.TrimSpace(authData),
 		fee:     fee,
-		lim:     humanPace(),
+		lim:     publicPace(),
 		session: session,
 		floors:  newCache[map[string]float64](ttl),
 		books:   newCache[[]float64](ttl),

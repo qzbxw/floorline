@@ -68,6 +68,10 @@ func sessionConfig(cfg *config.Config) tgsession.Config {
 // need, and maps a venue name onto the mini app that serves it.
 type sessionAdapter struct{ c *tgsession.Client }
 
+// Ready reports whether the account has been signed in. A session file is the
+// only evidence that `floorline login` ever completed.
+func (s sessionAdapter) Ready() bool { return s.c != nil && s.c.LoggedIn() }
+
 func (s sessionAdapter) InitData(ctx context.Context, venue string) (string, error) {
 	app, ok := miniApps[venue]
 	if !ok {

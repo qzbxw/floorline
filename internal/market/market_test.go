@@ -364,3 +364,51 @@ func TestMRKTStaticTokenIsNotRefreshable(t *testing.T) {
 		t.Error("a source with initData can renew and must not be marked static")
 	}
 }
+
+// notReady is a session that exists but has never been signed in — exactly what
+// putting TELEGRAM_APP_ID in the environment produces before `floorline login`.
+type notReadySession struct{}
+
+func (notReadySession) InitData(context.Context, string) (string, error) {
+	return "", errors.New("not logged in")
+}
+func (notReadySession) Invalidate(string) {}
+func (notReadySession) Ready() bool       { return false }
+
+type readySession struct{ notReadySession }
+
+func (readySession) Ready() bool { return true }
+
+// Holding app credentials is not the same as having a session, and the
+// difference decides money: an *unreachable* venue is a hard auto-buy block and
+// a heavy score penalty, on the sound principle that it might have objected to
+// the trade. A venue that was never set up cannot have objected.
+//
+// Production, 13 Aug: adding TELEGRAM_APP_ID to the environment — with no login
+// yet — turned MRKT from ignored into permanently unreachable, and every card
+// began reporting "2 площадки не ответили" while refusing to trade unattended.
+func TestVenueWithoutALoginIsUnconfiguredNotUnreachable(t *testing.T) {
+	unconfigured, err := NewMRKT(notReadySession{}, "", "", .02, time.Minute)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if unconfigured.Enabled() {
+		t.Error("a session that has never logged in must not count as configured")
+	}
+
+	// Once signed in, or given a pasted credential, it is a real venue again.
+	loggedIn, _ := NewMRKT(readySession{}, "", "", .02, time.Minute)
+	if !loggedIn.Enabled() {
+		t.Error("a signed-in session must enable the venue")
+	}
+	pasted, _ := NewMRKT(nil, "", "token", .02, time.Minute)
+	if !pasted.Enabled() {
+		t.Error("a pasted token must enable the venue without any session")
+	}
+
+	// And the comparison drops it, so it is never counted as a venue that
+	// failed to answer.
+	if c := NewComparison(unconfigured); c.Enabled() {
+		t.Error("an unconfigured venue must not make the comparison live")
+	}
+}

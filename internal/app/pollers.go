@@ -121,12 +121,13 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 	if !a.cross.Enabled() {
 		return pricing.CrossMarket{} // no venue configured is a choice, not a failure
 	}
-	// The budget has to fit a venue's own pacing. Each one may need two calls —
-	// exact attributes, then a model-wide fallback — and they are rate-limited
-	// to roughly one per second, so a four-second deadline silently starved the
-	// comparison whenever several cards were priced in a row. Losing it is not
-	// cosmetic: it is the cap that holds an optimistic exit down.
-	qctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	// The budget has to fit a venue's own pacing under contention. Each venue
+	// may need three calls down the exact → backdrop → model ladder, and the
+	// desk now prices a whole book at once, so several of those queues share one
+	// limiter. Twelve seconds was enough for a single card and not for six, and
+	// the failure was invisible in the worst way: every position reported
+	// "площадки не ответили", which caps the score and blocks unattended buying.
+	qctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	quotes, unreachable := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
 

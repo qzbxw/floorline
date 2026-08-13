@@ -76,8 +76,19 @@ func NewMRKT(session InitDataSource, initData, token string, fee float64, ttl ti
 func (m *MRKT) Venue() string { return "MRKT" }
 
 // Enabled implements Source.
+//
+// A session object that has never been logged in cannot mint anything, so it
+// does not make the venue configured. Counting it as configured turned MRKT
+// into a permanently unreachable venue the moment app credentials were put in
+// the environment — and an unreachable venue blocks unattended buying.
 func (m *MRKT) Enabled() bool {
-	return m != nil && (m.session != nil || m.initData != "" || m.token != "")
+	if m == nil {
+		return false
+	}
+	if m.initData != "" || m.token != "" {
+		return true
+	}
+	return m.session != nil && m.session.Ready()
 }
 
 // Fee implements Source.

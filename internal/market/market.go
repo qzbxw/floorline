@@ -77,6 +77,17 @@ func (q Quote) NetReference() float64 { return q.Reference() * (1 - q.Fee) }
 type InitDataSource interface {
 	InitData(ctx context.Context, venue string) (string, error)
 	Invalidate(venue string)
+	// Ready reports whether the account has actually been signed in. Holding
+	// app credentials is not the same as having a session: before `floorline
+	// login` there is nothing to mint a mini-app payload with, and a venue that
+	// depends on one is *not configured* rather than *unreachable*.
+	//
+	// The difference decides money. Unreachable is a hard auto-buy block and a
+	// heavy score penalty, on the sound principle that a venue we could not read
+	// might have objected. A venue we never set up cannot have objected, and
+	// treating the two alike meant that merely putting TELEGRAM_APP_ID in the
+	// environment silently stopped the desk from trading.
+	Ready() bool
 }
 
 // humanPace is the request budget for a venue.
@@ -89,6 +100,22 @@ type InitDataSource interface {
 // throughput than the desk needs.
 func humanPace() *rate.Limiter {
 	return rate.NewLimiter(rate.Every(2*time.Second), 3)
+}
+
+// publicPace is for a venue whose read endpoints are open and which has never
+// objected to being read.
+//
+// Portals answers /nfts/search without credentials, so the caution that
+// humanPace exists for — MRKT banning an account for API-shaped traffic —
+// does not apply to it. Pacing them identically was costing real money: the
+// desk prices six positions at once, each needing up to three queries down the
+// exact → backdrop → model ladder, and at one request every two seconds that
+// queue could not finish inside the cross-market deadline. Every card then read
+// "площадки не ответили", which is not cosmetic — it caps the score hard and
+// blocks unattended buying, because a venue we could not read is a venue whose
+// objection we did not hear.
+func publicPace() *rate.Limiter {
+	return rate.NewLimiter(rate.Every(400*time.Millisecond), 5)
 }
 
 // Source is one marketplace we can read a model floor from.
