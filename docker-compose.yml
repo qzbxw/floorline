@@ -55,3 +55,10 @@ services:
 
 volumes:
   floorline-data:
+    # Named explicitly and treated as pre-existing. This volume holds every
+    # position, trade and signal the desk has ever recorded, and a rename —
+    # which is all a different working directory or `-p` flag amounts to —
+    # would silently start the bot on an empty book. Create it once with
+    # `docker volume create floorline-data`.
+    name: floorline-data
+    external: true
