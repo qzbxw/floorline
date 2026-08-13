@@ -96,11 +96,30 @@ func New(cfg Config) (*Client, error) {
 	return &Client{cfg: cfg, cached: make(map[string]cachedData), ready: make(chan struct{})}, nil
 }
 
-// LoggedIn reports whether a session file already exists. It says nothing about
-// whether that session is still accepted — only Start can establish that.
+// LoggedIn reports whether `floorline login` has completed for this session.
+//
+// The session file itself cannot answer this. Telegram's client writes it as
+// soon as it has exchanged an auth key with the data centre, which happens
+// before the user is authorised — so an abandoned login leaves a perfectly
+// valid-looking file behind. Acting on that is how MRKT went from "not
+// configured" to "configured and permanently failing", and a venue that fails
+// slowly starves the ones that would have answered.
+//
+// So authorisation is recorded separately, by the code that actually observed
+// it. It still says nothing about whether the session is *still* accepted —
+// only Start can establish that.
 func (c *Client) LoggedIn() bool {
-	st, err := os.Stat(c.cfg.SessionFile)
+	st, err := os.Stat(c.authorizedMarker())
 	return err == nil && st.Size() > 0
+}
+
+// authorizedMarker sits next to the session file, so removing one obviously
+// invalidates the other.
+func (c *Client) authorizedMarker() string { return c.cfg.SessionFile + ".authorized" }
+
+// markAuthorized records that a login completed.
+func (c *Client) markAuthorized() error {
+	return os.WriteFile(c.authorizedMarker(), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
 }
 
 // Status is what /status prints about the account.
@@ -149,7 +168,8 @@ func (c *Client) Login(ctx context.Context, ask auth.UserAuthenticator) error {
 		if err := c.client().Auth().IfNecessary(ctx, flow); err != nil {
 			return fmt.Errorf("tgsession: login: %w", err)
 		}
-		return nil
+		// Recorded only here, where authorisation was actually observed.
+		return c.markAuthorized()
 	})
 }
 
