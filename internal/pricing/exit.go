@@ -144,14 +144,48 @@ func readWalkaway(v *Valuation, external []Ask, cost, tonnelFee float64) {
 	}
 }
 
-// tonnelEquivalent converts what a buyer pays on another venue into the Tonnel
+// TonnelEquivalent converts what a buyer pays on another venue into the Tonnel
 // ask that would cost them the same. Zero in, zero out: an unknown external
 // price must not silently become a free one.
-func tonnelEquivalent(buyerCost, tonnelFee float64) float64 {
+//
+// It is exported because the comparison is not confined to pricing: the undercut
+// watcher on an owned position is asking exactly the same question about exactly
+// the same two numbers, and a second, subtly different conversion there would
+// mean the desk disagreed with itself about who is cheapest.
+func TonnelEquivalent(buyerCost, tonnelFee float64) float64 {
 	if buyerCost <= 0 {
 		return 0
 	}
 	return buyerCost / (1 + math.Max(tonnelFee, 0))
+}
+
+func tonnelEquivalent(buyerCost, tonnelFee float64) float64 {
+	return TonnelEquivalent(buyerCost, tonnelFee)
+}
+
+// crossCompetition counts the external offers standing around a price of ours:
+// those level with it (within the same 5% band the local census uses) and those
+// already under it.
+//
+// The asks arrive as each venue's own sticker, so they are restated as the
+// Tonnel ask that costs a buyer the same before being compared — the same
+// correction the walkaway makes. Comparing gross stickers would count an offer
+// as "cheaper than us" purely because of who charges the referral.
+func crossCompetition(cm CrossMarket, price, fee float64) (near, below int) {
+	if price <= 0 {
+		return 0, 0
+	}
+	for _, p := range cm.Asks {
+		eq := TonnelEquivalent(p, fee)
+		switch {
+		case eq <= 0:
+		case eq < price:
+			below++
+		case eq <= price*1.05:
+			near++
+		}
+	}
+	return near, below
 }
 
 // setLiquidation prices the emergency exit: what we would have to ask to be the
@@ -212,10 +246,17 @@ func blendWeights(v *Valuation, in Input) bool {
 	// Seven trades over three gifts cannot drag a live 3.70 book down to a stale
 	// 3.26 median, so sparse history is pulled towards the live market first and
 	// only then allowed into the blend.
-	v.HistoryReference = in.Liq.Median
-	if in.Liq.Median > 0 && v.LiveDepth > 0 {
+	//
+	// Which median, though, depends on what the market is doing. In a falling one
+	// the older half of the window describes a price level that is gone, and
+	// averaging it in is how a model that was good last week keeps reading as
+	// cheap this week — the Instant Ramen shape. The regime decides how far the
+	// reference is pulled onto the recent tape.
+	med := v.Regime.Reference(in.Liq.Median, in.Liq.Median7)
+	v.HistoryReference = med
+	if med > 0 && v.LiveDepth > 0 {
 		trust := hw / .40
-		v.HistoryReference = v.LiveDepth + (in.Liq.Median-v.LiveDepth)*trust
+		v.HistoryReference = v.LiveDepth + (med-v.LiveDepth)*trust
 	}
 	// MarketDivergence is measured later, against the price we actually settle
 	// on — see measureDivergence.
@@ -321,7 +362,10 @@ func priceExits(v *Valuation, in Input, undercut float64) bool {
 // recent. And the tape only gets this vote once it is a tape — a handful of
 // prints over one or two physical gifts is not allowed to overrule the market.
 func clampToHistory(v *Valuation, in Input) {
-	med := in.Liq.Median
+	// The same regime-aware median the blend uses. Clamping a falling model back
+	// onto a band built from its good week is not a clamp, it is the stale price
+	// re-entering through the guard meant to keep it out.
+	med := v.Regime.Reference(in.Liq.Median, in.Liq.Median7)
 	if med <= 0 || in.Liq.DistinctGifts < minHistoryForClamp {
 		return
 	}
@@ -405,6 +449,18 @@ func buildLadder(v *Valuation, in Input, undercut float64) {
 }
 
 // expectedDays estimates how long each rung of the ladder takes to fill.
+//
+// It is the mean of the same arrival process the survival curve integrates, so
+// the two can never contradict each other: buyers arrive at the model's trade
+// rate, everyone standing cheaper than us absorbs one, and our expected wait is
+// the time for that many plus one to show up.
+//
+// The queue is the correction that matters. It used to be the sellers within 5%
+// of our exit on Tonnel; now it is every offer a buyer would actually take
+// first, on any venue. And it is still not the model's standing supply — forty
+// listed gifts with two of them under our price is a two-deep queue, and
+// dividing the forty by a fourteen-day average was how "~4.7д" got printed with
+// a straight face.
 func expectedDays(v *Valuation, in Input) {
 	if in.Liq.Velocity <= 0 {
 		v.DaysOfSupply, v.ExpectedDays = math.Inf(1), math.Inf(1)
@@ -412,7 +468,7 @@ func expectedDays(v *Valuation, in Input) {
 		return
 	}
 	v.DaysOfSupply = float64(in.Supply) / in.Liq.Velocity
-	v.FastExpectedDays = float64(1+v.CompetitorsNear) / in.Liq.Velocity
+	v.FastExpectedDays = float64(1+v.Fill.QueueAhead) / in.Liq.Velocity
 	v.ExpectedDays = v.FastExpectedDays
 
 	// The patient ask waits for a buyer who wants this exact backdrop and
@@ -421,11 +477,7 @@ func expectedDays(v *Valuation, in Input) {
 	if !in.Attribute.Valid {
 		share = .25
 	}
-	queue := 0
-	if in.Book != nil {
-		queue = in.Book.CountAttributesBetween(v.PatientAsk, v.PatientAsk*1.05, in.GiftID, in.OwnerID, in.Backdrop, in.Symbol)
-	}
-	v.PatientExpectedDays = float64(1+queue) / (in.Liq.Velocity * share)
+	v.PatientExpectedDays = float64(1+v.Patient.QueueAhead) / (in.Liq.Velocity * share)
 
 	// The two estimates come from independent formulas, which used to let the
 	// ladder contradict itself in both directions. Neither is allowed:

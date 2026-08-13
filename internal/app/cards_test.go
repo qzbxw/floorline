@@ -17,6 +17,13 @@ import (
 // GRAM with a 4.21 next ask, a hole at 7.90 / 10.20, and Portals showing five
 // asks at or under our own entry.
 func mambaCard(t *testing.T) (string, pricing.Valuation) {
+	short, _, v := mambaCards(t)
+	return short, v
+}
+
+// mambaCards renders the same fixture both ways: the compact card the operator
+// acts on, and the full one they open to argue with it.
+func mambaCards(t *testing.T) (short, full string, v pricing.Valuation) {
 	t.Helper()
 	key := tonnel.ModelKey{Name: "Pet Snake", Model: "Black Mamba"}
 	book := &pricing.Book{Key: key, FetchedAt: time.Now(), Asks: []pricing.Ask{
@@ -24,7 +31,7 @@ func mambaCard(t *testing.T) (string, pricing.Valuation) {
 	}}
 	liq := pricing.Liquidity{Prints: 9, Sales: 9, DistinctGifts: 9, Turnover: 1, Median: 3.846, Median7: 3.9,
 		Trend: 1.05, Velocity: .6, MADRatio: .15, LastSale: time.Now().Add(-2 * time.Hour)}
-	v := pricing.Evaluate(pricing.Input{
+	v = pricing.Evaluate(pricing.Input{
 		GiftID: 42, Key: key, Price: 6, Book: book, Liq: liq, Floor: 4.21, Supply: 13, Rarity: 1.4,
 		Backdrop: "Platinum", Symbol: "Khinkali", Now: time.Now(),
 		Params: pricing.Params{Fee: .005, Undercut: .01},
@@ -36,20 +43,35 @@ func mambaCard(t *testing.T) (string, pricing.Valuation) {
 		Gift: tonnel.Gift{GiftID: 10380168, GiftNum: 150969, Backdrop: "Platinum", Symbol: "Khinkali"},
 		Val:  v,
 	}
-	return a.renderCard(context.Background(), dec, "включён shadow-режим"), v
+	ctx := context.Background()
+	return a.renderCard(ctx, dec, "включён shadow-режим"),
+		a.renderCardFull(ctx, dec, "включён shadow-режим"), v
 }
 
 // The 12 Aug card read as an opportunity. It has to read as a warning: the book
 // is gappy, and six offers across the venues are already under our entry.
 func TestGappyBookCardWarnsInsteadOfTempting(t *testing.T) {
-	card, v := mambaCard(t)
+	short, full, v := mambaCards(t)
+	// The full card carries every warning; the compact one carries the most
+	// decisive and says how many it left behind.
 	for _, want := range []string{
 		"дырявый стакан: 4.21 → 10.2",
 		"дешевле твоего входа стоит 6 чужих асков",
 	} {
-		if !strings.Contains(card, want) {
-			t.Errorf("card is missing %q:\n%s", want, card)
+		if !strings.Contains(full, want) {
+			t.Errorf("full card is missing %q:\n%s", want, full)
 		}
+	}
+	if !strings.Contains(short, "рынок ниже нас") {
+		t.Errorf("the compact card led with something other than the upside-down trade:\n%s", short)
+	}
+	if !strings.Contains(short, "в /val") {
+		t.Errorf("the compact card hid the remaining warnings without saying so:\n%s", short)
+	}
+	// And it must not read as an invitation. This is the whole complaint: the
+	// headline said BUY while the numbers under it said otherwise.
+	if strings.Contains(short, ">BUY<") {
+		t.Errorf("a trade 36%% under water is headlined BUY:\n%s", short)
 	}
 	// The exit now undercuts the single real ask instead of clearing the hole
 	// above it, so we genuinely would be the cheapest offer at that price.
@@ -96,7 +118,7 @@ func TestCardNeverClaimsBestAskWhileCheaperAsksExist(t *testing.T) {
 
 // Readability is a feature here: the operator reads these at 2am on a phone.
 func TestCardIsSectionedAndUsesRussianPlurals(t *testing.T) {
-	card, _ := mambaCard(t)
+	_, card, _ := mambaCards(t)
 	for _, want := range []string{"📐 <b>Почему столько:</b>", "📚 Tonnel:", "📊 ", "🎨 "} {
 		if !strings.Contains(card, want) {
 			t.Errorf("card has no %q section:\n%s", want, card)
@@ -127,9 +149,17 @@ func TestCardLinksTheGiftSoTelegramShowsIt(t *testing.T) {
 // note and a manual-only footer all fire at once — so the bound is measured
 // there rather than on a clean card that would pass trivially.
 func TestCardStaysShortEnoughToRead(t *testing.T) {
-	card, _ := mambaCard(t)
-	if n := strings.Count(card, "\n"); n > 20 {
-		t.Errorf("card is %d lines; it replaced a 30-line one and has to stay readable:\n%s", n, card)
+	short, full, _ := mambaCards(t)
+	if n := strings.Count(short, "\n"); n > 7 {
+		t.Errorf("the acting card is %d lines; it is meant to be glanced at, not read:\n%s", n, short)
+	}
+	// The long form is still bounded — it is a reference, not a dump.
+	if n := strings.Count(full, "\n"); n > 24 {
+		t.Errorf("the detailed card is %d lines:\n%s", n, full)
+	}
+	// Everything cut from the short card has to remain reachable.
+	if len(full) <= len(short) {
+		t.Error("the detailed card carries no more than the compact one")
 	}
 }
 

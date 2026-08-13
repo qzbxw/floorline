@@ -61,7 +61,12 @@ type App struct {
 	collections map[string]struct{}
 	// scanCursor walks the ranked model list across passes, so a sweep resumes
 	// where the previous one stopped instead of re-reading the same busiest few.
-	scanCursor    int
+	scanCursor int
+	// scanRanked is that list, cached: building it costs a trade-history query
+	// per model on the whole market, and a fourteen-day velocity does not move
+	// between sweeps.
+	scanRanked    []tonnel.ModelKey
+	scanRankedAt  time.Time
 	lastScan      time.Time
 	lastScanFound int
 	rotation      collectionRotation

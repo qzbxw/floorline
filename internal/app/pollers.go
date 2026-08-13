@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -66,13 +65,21 @@ func (a *App) pollFeed(ctx context.Context) error {
 			log.Warn().Err(err).Int64("gift", id).Msg("evaluation failed")
 			continue
 		}
-		if dec != nil && dec.Signal {
-			if fit, _, err := a.rm.PortfolioFit(ctx, dec.Val.Key, dec.Val.Cost); err == nil {
-				dec.Val.ScoreBreakdown = pricing.BuildScore(dec.Val, fit)
-				dec.Score = dec.Val.ScoreBreakdown.Total
-			}
-			decisions = append(decisions, dec)
+		if dec == nil {
+			continue
 		}
+		if !dec.Signal {
+			// Written down rather than forgotten. A record of decisions taken and
+			// never of decisions declined can teach what a good trade looks like
+			// but never what a rejected one would have done.
+			a.observe(ctx, dec, now)
+			continue
+		}
+		if fit, _, err := a.rm.PortfolioFit(ctx, dec.Val.Key, dec.Val.Cost); err == nil {
+			dec.Val.ScoreBreakdown = pricing.BuildScore(dec.Val, fit)
+			dec.Score = dec.Val.ScoreBreakdown.Total
+		}
+		decisions = append(decisions, dec)
 	}
 
 	// Highest-conviction first, so a burst does not bury the best opportunity.
@@ -118,6 +125,14 @@ func (a *App) spendable() (float64, bool) {
 // that can make the fee correction — and comparing gross stickers across venues
 // with different buyer fees quietly mispriced the walkaway on every trade.
 func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing.CrossMarket {
+	return a.crossDepth(ctx, v.Key, v.Backdrop, v.Symbol)
+}
+
+// crossDepth is the same lookup addressed by model and attributes rather than by
+// a valuation, so callers that do not have one — the sweep, which prices a whole
+// book against a single model-wide read, and the undercut watcher on an owned
+// position — ask exactly the same question of the venues.
+func (a *App) crossDepth(ctx context.Context, key tonnel.ModelKey, backdrop, symbol string) pricing.CrossMarket {
 	if !a.cross.Enabled() {
 		return pricing.CrossMarket{} // no venue configured is a choice, not a failure
 	}
@@ -129,7 +144,7 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 	// "площадки не ответили", which caps the score and blocks unattended buying.
 	qctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	quotes, unreachable := a.cross.QuotesForGift(qctx, v.Key.Name, v.Key.Model, v.Backdrop, v.Symbol)
+	quotes, unreachable := a.cross.QuotesForGift(qctx, key.Name, key.Model, backdrop, symbol)
 
 	cm := pricing.CrossMarket{Unreachable: unreachable}
 	var refs, buyerCosts []float64
@@ -183,14 +198,7 @@ func (a *App) crossMarketDepth(ctx context.Context, v pricing.Valuation) pricing
 // and otherwise sends the card.
 func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time.Time) error {
 	v := dec.Val
-	payload, _ := json.Marshal(struct {
-		Score                 pricing.ScoreBreakdown `json:"score"`
-		Confidence            float64                `json:"confidence"`
-		ChosenExit            string                 `json:"chosen_exit"`
-		FastExit, PatientExit float64
-		Attribute             pricing.AttributeValue `json:"attribute"`
-		DataAgeSeconds        float64                `json:"data_age_seconds"`
-	}{v.ScoreBreakdown, v.Confidence, v.ChosenExit, v.FastExit, v.PatientExit, v.Attribute, v.DataAge.Seconds()})
+	payload, _ := observationPayload(dec)
 	sigID, err := a.st.InsertSignal(ctx, store.SignalRow{
 		TS:       now,
 		Kind:     signal.KindBuy,
@@ -201,7 +209,7 @@ func (a *App) handleDecision(ctx context.Context, dec *signal.Decision, now time
 		Edge:     v.Edge,
 		Velocity: v.Liq.Velocity,
 		Score:    dec.Score,
-		Payload:  string(payload),
+		Payload:  payload,
 	})
 	if err != nil {
 		return fmt.Errorf("record signal: %w", err)
@@ -844,6 +852,13 @@ func relativeChange(old, new float64) float64 {
 // one we have just relisted ourselves. Reading it produced the alert that fired
 // seconds after a purchase, telling the operator they had been undercut at
 // exactly the price they had paid.
+//
+// And it has to come from every book, not only Tonnel's. Being the cheapest lot
+// on one venue is not being the cheapest offer on screen: the whole pricing
+// engine is built on the fact that our buyer can shop anywhere, and yet the one
+// watcher whose entire job is "someone is now cheaper than you" was looking at a
+// single marketplace. A position could sit untouched for days behind a Portals
+// queue and the desk would report it as still holding the floor.
 func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time) {
 	if p.Status != store.StatusListed || p.ListPrice <= 0 {
 		return
@@ -858,8 +873,17 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 	}
 	// BestExcluding drops our own gift and everything else we are selling, so
 	// what is left is a genuine competitor.
-	best, ok := book.BestExcluding(p.GiftID, a.api.UserID())
-	if !ok || best <= 0 || best >= p.ListPrice {
+	best, venue := 0.0, "Tonnel"
+	if b, ok := book.BestExcluding(p.GiftID, a.api.UserID()); ok && b > 0 {
+		best = b
+	}
+	// The venue quotes are cached for minutes, so asking on every inventory pass
+	// costs one fan-out per model per cache window, not one per position.
+	cross := a.crossDepth(ctx, p.Key, p.Backdrop, p.Symbol)
+	if ext := pricing.TonnelEquivalent(cross.BestBuyerCost, a.cfg.TonnelFee); ext > 0 && (best <= 0 || ext < best) {
+		best, venue = ext, "другая площадка"
+	}
+	if best <= 0 || best >= p.ListPrice {
 		return
 	}
 	if !a.throttle(fmt.Sprintf("undercut:%d:%.2f", p.GiftID, best), 6*time.Hour) {
@@ -892,9 +916,9 @@ func (a *App) checkUndercut(ctx context.Context, p store.Position, now time.Time
 		}
 	}
 	a.notify(fmt.Sprintf(
-		"🥊 <b>Тебя андеркатнули</b> — %s\nТвой аск %s · чужой аск %s (−%.1f%%)\nВход %s · <code>/relist %d</code>",
+		"🥊 <b>Тебя андеркатнули</b> — %s\nТвой аск %s · чужой аск %s (−%.1f%%, %s)\nВход %s · <code>/relist %d</code>",
 		bot.Esc(p.Key.String()), num(p.ListPrice), num(best),
-		(p.ListPrice-best)/p.ListPrice*100, num(p.BuyPrice), p.GiftID))
+		(p.ListPrice-best)/p.ListPrice*100, bot.Esc(venue), num(p.BuyPrice), p.GiftID))
 }
 
 // checkStale warns when a position has been sitting far longer than the model's
@@ -980,7 +1004,12 @@ func (a *App) trackedModels(ctx context.Context) ([]tonnel.ModelKey, error) {
 // maintenance prunes data that no longer affects a decision.
 func (a *App) maintenance(ctx context.Context) error {
 	now := time.Now()
-	for _, h := range []int{1, 6, 24, 72} {
+	// 168 hours is new, and it is the horizon the fill curve most needs marked:
+	// the seven-day probability is the one the desk relies on when it decides a
+	// position is not stuck, and until now nothing ever checked whether it was
+	// right. The shorter ones stay because a signal that was gone in an hour and
+	// one that took three days are different outcomes for the same call.
+	for _, h := range []int{1, 6, 24, 72, 168} {
 		sigs, err := a.st.SignalsNeedingOutcome(ctx, h, now)
 		if err != nil {
 			return err

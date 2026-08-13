@@ -82,7 +82,7 @@ func (p *Portals) ModelAsks(ctx context.Context, collection, model, backdrop, sy
 		limit = 20
 	}
 	key := matchKey(collection) + "|" + matchKey(model) + "|" + matchKey(backdrop) + "|" + matchKey(symbol)
-	return p.books.get(key, func() ([]float64, error) {
+	return p.books.get(ctx, key, func() ([]float64, error) {
 		if err := p.lim.Wait(ctx); err != nil {
 			return nil, err
 		}
@@ -150,7 +150,7 @@ func (p *Portals) ModelFloor(ctx context.Context, collection, model string) (flo
 		return 0, errNoCredentials
 	}
 	short := PortalsShortName(collection)
-	floors, err := p.floors.get(short, func() (map[string]float64, error) {
+	floors, err := p.floors.get(ctx, short, func() (map[string]float64, error) {
 		return p.fetch(ctx, short)
 	})
 	if err != nil {

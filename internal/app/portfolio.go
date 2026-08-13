@@ -24,6 +24,14 @@ type positionAdvice struct {
 	CrossReference  float64
 	CrossDivergence float64
 	CapitalPressure float64
+	// CheaperElsewhere is how many offers on other venues undercut our own ask,
+	// restated as the Tonnel ask that would cost a buyer the same. A position can
+	// be the cheapest thing on Tonnel and still be the expensive one on screen,
+	// and until this was counted the desk had no way to see that: the undercut
+	// watcher, the relist target and this view all read the local book alone.
+	CheaperElsewhere int
+	// WalkawayVenue names where the cheapest competing offer actually is.
+	WalkawayVenue string
 	// FloorGuarded records that a sell recommendation was withheld because the
 	// live market contradicted it. It is not a normal hold and says so.
 	FloorGuarded bool
@@ -86,7 +94,7 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		return ad
 	}
 	g := tonnel.Gift{GiftID: tonnel.FlexInt(p.GiftID), Name: p.Key.Name, Model: p.Key.Model, Backdrop: p.Backdrop, Symbol: p.Symbol, Price: tonnel.Flex64(p.BuyPrice), Asset: tonnel.AssetGRAM}
-	v, err := a.priceGiftWithCost(ctx, g, p.BuyPrice, now)
+	v, err := a.pricePosition(ctx, g, p.BuyPrice, now)
 	ad.Val = v
 	if err != nil || !v.Valid {
 		switch {
@@ -103,11 +111,13 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 	}
 	ad.CrossReference = v.CrossMarketSupport
 	ad.CrossDivergence = v.CrossDivergence
+	ad.WalkawayVenue = v.WalkawayVenue
 
 	ask := p.ListPrice
 	if ask <= 0 {
 		ask = v.Price
 	}
+	ad.CheaperElsewhere = countCheaperElsewhere(v, ask, a.cfg.TonnelFee)
 	check := risk.ExitCheck{Ask: ask, Target: v.Exit, Floor: v.Floor, ExternalRef: ad.CrossReference}
 	contradicted, why := check.ContradictsMarket()
 
@@ -148,6 +158,46 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		}
 	}
 	return ad
+}
+
+// countCheaperElsewhere counts the offers on other venues that a buyer would
+// reach for before ours.
+//
+// The comparison is made in the unit the buyer compares — money leaving their
+// wallet — so an external sticker is restated as the Tonnel ask that costs the
+// same. Matching gross prices across venues would count an offer as cheaper
+// purely because of who charges the referral.
+func countCheaperElsewhere(v pricing.Valuation, ask, fee float64) int {
+	if ask <= 0 {
+		return 0
+	}
+	n := 0
+	for _, p := range v.Cross.Asks {
+		if eq := pricing.TonnelEquivalent(p, fee); eq > 0 && eq < ask {
+			n++
+		}
+	}
+	return n
+}
+
+// marketNote is the one line about the rest of the market that a position's
+// verdict rests on.
+func (ad positionAdvice) marketNote() string {
+	var parts []string
+	if ad.CheaperElsewhere > 0 {
+		parts = append(parts, fmt.Sprintf("дешевле нас на других площадках: %s",
+			plural(ad.CheaperElsewhere, "оффер", "оффера", "офферов")))
+	} else if ad.WalkawayVenue == "площадки" {
+		parts = append(parts, "самый дешёвый оффер сейчас не на Tonnel")
+	}
+	if ad.CrossReference > 0 && ad.CrossDivergence > .10 {
+		parts = append(parts, fmt.Sprintf("площадки на %s, расхождение %.0f%%",
+			num(ad.CrossReference), ad.CrossDivergence*100))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " · ")
 }
 
 func capitalPressure(balance float64, known bool, desiredReserve float64) float64 {
@@ -202,6 +252,21 @@ func (a *App) adviceText(ctx context.Context, giftID int64) string {
 		}
 		if ad.CrossReference > 0 {
 			fmt.Fprintf(&b, "Внешняя глубина асков %s · расхождение %.0f%%\n", num(ad.CrossReference), ad.CrossDivergence*100)
+		}
+		// Which venue the exit is actually measured against, and who stands in
+		// front of us there. A position can be the cheapest lot on Tonnel and the
+		// fourth-cheapest offer a buyer sees.
+		if v.Walkaway > 0 {
+			fmt.Fprintf(&b, "Ближайший чужой оффер %s (%s)\n", num(v.Walkaway), bot.Esc(v.WalkawayVenue))
+		}
+		if ad.CheaperElsewhere > 0 {
+			fmt.Fprintf(&b, "⚠️ Дешевле нашего аска на других площадках: %s\n",
+				plural(ad.CheaperElsewhere, "оффер", "оффера", "офферов"))
+		}
+		if v.Cross.Unreachable > 0 {
+			fmt.Fprintf(&b, "⚠️ %s не ответил%s — сравнивал только по Tonnel\n",
+				plural(v.Cross.Unreachable, "площадка", "площадки", "площадок"),
+				map[bool]string{true: "а", false: "и"}[v.Cross.Unreachable == 1])
 		}
 	}
 	if ad.Reason != "" {
@@ -289,44 +354,45 @@ func (a *App) portfolioText(ctx context.Context) string {
 	}
 	now := time.Now()
 	ads := a.advisePositions(ctx, ps, now)
-	invested, nav, expectedNet, evDay, weightedDays, daysCapital := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-	collections := map[string]float64{}
-	models := map[string]float64{}
-	for i, p := range ps {
-		ad := ads[i]
-		invested += p.BuyPrice
-		mark := p.ListPrice
-		if ad.Val.Valid {
-			mark = ad.Val.FastExit
-			expectedNet += ad.Val.Net
-			evDay += ad.Val.Net / math.Max(ad.Val.ExpectedDays, .25)
-			if !math.IsInf(ad.Val.ExpectedDays, 0) && !math.IsNaN(ad.Val.ExpectedDays) {
-				weightedDays += ad.Val.ExpectedDays * p.BuyPrice
-				daysCapital += p.BuyPrice
+	book := summarise(ads, now)
+	book.Cash, book.CashKnown = a.rm.Balance()
+	// Closed cycles count towards how hard the capital has been working, but not
+	// towards what the book is worth: that money is already in the balance and
+	// adding it again would double it.
+	if closed, err := a.st.PositionTrades(ctx, 500); err == nil {
+		for _, c := range closed {
+			if c.BuyPrice > 0 && c.SellPrice > 0 {
+				book.Realised += c.SellPrice - c.BuyPrice
+				book.TonDays += c.BuyPrice * math.Max(c.SoldAt.Sub(c.BoughtAt).Hours(), 0) / 24
 			}
 		}
-		nav += mark
-		collections[p.Key.Name] += mark
-		models[p.Key.ID()] += mark
 	}
-	if bal, ok := a.rm.Balance(); ok {
-		nav += bal
-	}
-	sort.Slice(ads, func(i, j int) bool { return ads[i].Val.ScoreBreakdown.Total > ads[j].Val.ScoreBreakdown.Total })
+	sortByUrgency(ads)
+
 	var b strings.Builder
-	avgDays, efficiency := 0.0, 0.0
-	if invested > 0 {
-		efficiency = evDay / invested * 100
-	}
-	if daysCapital > 0 {
-		avgDays = weightedDays / daysCapital
-	}
-	// Six metrics on one wrapped line is a paragraph, not a dashboard. They go
-	// two to a line, biggest first, so the eye can stop after the first one.
+	// What the book is worth is what it would fetch, not what it is theoretically
+	// valued at, and the two numbers are kept apart because mixing them is how a
+	// portfolio of six positions costing 22 came to be headlined "оценка 40.5".
+	// The mark is the 72-hour executable exit: the price the whole book could
+	// realistically be out of inside a normal working horizon.
 	fmt.Fprintf(&b, "💼 <b>%s</b>\n", plural(len(ps), "позиция", "позиции", "позиций"))
-	fmt.Fprintf(&b, "Оценка %s · вложено %s\n", num(nav), num(invested))
-	fmt.Fprintf(&b, "Ожидаем %s · выход ~%s\n", num(expectedNet), days(avgDays))
-	fmt.Fprintf(&b, "EV %s/день · %+.2f%% на вложенное\n", num(evDay), efficiency)
+	fmt.Fprintf(&b, "Вложено %s → слить за 72ч %s (%+.1f%%)\n",
+		num(book.Invested), num(book.Mark72h), book.Return()*100)
+	if book.CashKnown {
+		fmt.Fprintf(&b, "Кэш %s · всего %s\n", num(book.Cash), num(book.Mark72h+book.Cash))
+	}
+	// Capital efficiency, not ROI. +15% over twenty days is worse than +5% over
+	// two, and only a number with time in its denominator can say so.
+	if book.TonDays > 0 {
+		fmt.Fprintf(&b, "Отдача %+.2f%%/день на вложенный GRAM · %.0f GRAM·дней в работе\n",
+			book.CapitalEfficiency()*100, book.TonDays)
+	}
+	if book.StuckCapital > 0 {
+		fmt.Fprintf(&b, "⏳ %s зависло дольше 72ч (%s)\n",
+			num(book.StuckCapital), plural(book.Stuck, "позиция", "позиции", "позиций"))
+	}
+	nav := book.Mark72h + book.Cash
+	collections, models := book.Collections, book.Models
 	topCollection, topCollectionValue, topModel, topModelValue := "", 0.0, "", 0.0
 	for k, v := range collections {
 		if v > topCollectionValue {
@@ -361,8 +427,9 @@ func (a *App) portfolioText(ctx context.Context) string {
 		// numbers from two different comparisons, so the arithmetic on screen
 		// did not work and the position looked mis-valued. The ask belongs here
 		// too, but as its own fact.
-		fmt.Fprintf(&b, "   вход %s → цель %s · <b>%+.1f%%</b> · ~%s\n",
-			num(p.BuyPrice), num(ad.Val.Exit), ad.Val.Edge*100, days(ad.Val.ExpectedDays))
+		fmt.Fprintf(&b, "   вход %s → цель %s · <b>%+.1f%%</b>\n",
+			num(p.BuyPrice), num(ad.Val.Exit), ad.Val.Edge*100)
+		fmt.Fprintf(&b, "   %s\n", fillLine(ad.Val))
 		if p.ListPrice > 0 {
 			line := fmt.Sprintf("   стоим %s", num(p.ListPrice))
 			if !pricing.SamePrice(p.ListPrice, ad.Val.Exit) {
@@ -375,11 +442,43 @@ func (a *App) portfolioText(ctx context.Context) string {
 		} else if costIsProvisional(&p) {
 			b.WriteString("   <i>вход угадан по ленте сделок, задай /cost</i>\n")
 		}
-		if ad.CrossReference > 0 && ad.CrossDivergence > .10 {
-			fmt.Fprintf(&b, "   <i>площадки на %s, расхождение %.0f%%</i>\n", num(ad.CrossReference), ad.CrossDivergence*100)
+		if note := ad.marketNote(); note != "" {
+			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(note))
 		}
 	}
 	return b.String()
+}
+
+// sortByUrgency puts the positions that need a decision at the top.
+//
+// The book used to be sorted by score, which is a candidate-ranking number: it
+// is zero for anything whose fast exit sits under its entry, and that is most of
+// a portfolio most of the time. So the sort key was zero for nearly every line
+// and the order was whatever the database happened to return — the position
+// bleeding money could land at the bottom of eight.
+//
+// What the operator needs first is the position that requires an action, and
+// among those the one with the most money on it: a decision about 40 GRAM is
+// worth reading before the same decision about 3.
+func sortByUrgency(ads []positionAdvice) {
+	rank := func(ad positionAdvice) int {
+		switch ad.Action {
+		case actExit:
+			return 0
+		case actRelist:
+			return 1
+		case actReview, actSetCost:
+			return 2
+		default: // actHold — nothing to do, and that is the point
+			return 3
+		}
+	}
+	sort.SliceStable(ads, func(i, j int) bool {
+		if ri, rj := rank(ads[i]), rank(ads[j]); ri != rj {
+			return ri < rj
+		}
+		return ads[i].Position.BuyPrice > ads[j].Position.BuyPrice
+	})
 }
 
 // actionMark puts a light next to a recommendation, so a book of eight

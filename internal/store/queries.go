@@ -1175,6 +1175,47 @@ WHERE name = ? AND kind = ? AND ts >= ? AND gift_id != ? AND price BETWEEN ? AND
 	return n, err
 }
 
+// FreshSupply is how much new cheap stock arrived in a model recently, and what
+// it is priced at.
+//
+// It is the evidence behind the adverse-selection check: a lot 15% under the
+// floor is a gift when it is alone and the start of a slide when four more
+// sellers walked in behind it in the last quarter of an hour.
+type FreshSupply struct {
+	// Arrivals counts listings of this model first seen inside the window,
+	// excluding one gift (the candidate) and anything we are selling ourselves.
+	Arrivals int
+	// AtOrBelow is the subset priced at or under the candidate — the ones that
+	// take our buyer before we ever see them.
+	AtOrBelow int
+	// Cheapest is the lowest of those arrivals, so the caller can say how far the
+	// cheap end has moved rather than only that it did.
+	Cheapest float64
+}
+
+// FreshSupplySince counts recent arrivals in one model's book.
+func (s *Store) FreshSupplySince(ctx context.Context, key tonnel.ModelKey, price float64, since time.Time, excludeGiftID, ownerID int64) (FreshSupply, error) {
+	var fs FreshSupply
+	var cheapest sql.NullFloat64
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN price <= ? THEN 1 ELSE 0 END), 0),
+       MIN(price)
+FROM listings
+WHERE name = ? AND model = ? AND first_seen >= ? AND gift_id != ?
+  AND (? = 0 OR seller IS NULL OR seller != ?)
+  AND gone_at IS NULL AND price > 0`,
+		price, key.Name, key.Model, unix(since), excludeGiftID, ownerID, ownerID).
+		Scan(&fs.Arrivals, &fs.AtOrBelow, &cheapest)
+	if err != nil {
+		return fs, err
+	}
+	if cheapest.Valid {
+		fs.Cheapest = cheapest.Float64
+	}
+	return fs, nil
+}
+
 // SignalStats summarises detector output over a window, for /status.
 type SignalStats struct {
 	Total  int

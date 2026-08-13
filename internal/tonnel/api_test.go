@@ -225,3 +225,46 @@ func TestDefaultReadHostsExcludeTheWebFrontEnd(t *testing.T) {
 		t.Error("there has to be somewhere to rotate to")
 	}
 }
+
+// A balance of zero is not a harmless misread. spendable() takes it against the
+// ticket limit, so every signal above nothing is rejected as unaffordable and
+// the desk goes quiet with nothing in the log to explain why.
+//
+// The old descent looked for a fixed "amount"/"value"/"balance" inside a nested
+// object, which meant the single most likely shape this endpoint returns —
+// {"balance": {"gram": 25.4}} — matched the outer key, descended, found none of
+// those three names, and answered zero.
+func TestBalanceIsFoundWhicheverShapeItArrivesIn(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want float64
+	}{
+		{"flat", map[string]any{"balance": 25.4}, 25.4},
+		{"nested under balance", map[string]any{"balance": map[string]any{"gram": 25.4}}, 25.4},
+		{"nested under data", map[string]any{"data": map[string]any{"gram": 25.4}}, 25.4},
+		{"amount inside the currency", map[string]any{"gram": map[string]any{"amount": 25.4}}, 25.4},
+		{"alternate spelling", map[string]any{"gramBalance": 25.4}, 25.4},
+		{"absent", map[string]any{"usdt": 3}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := pickFloat(c.raw, "balance", "gram", "GRAM", "gramBalance", "ton", "TON", "tonBalance")
+			if got != c.want {
+				t.Errorf("balance = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// An outer key that is already a number must win over anything nested, or a
+// payload carrying both a total and a breakdown reports the wrong one.
+func TestBalancePrefersTheDirectValue(t *testing.T) {
+	raw := map[string]any{
+		"balance": 25.4,
+		"data":    map[string]any{"balance": 999.0},
+	}
+	if got := pickFloat(raw, "balance", "gram"); got != 25.4 {
+		t.Errorf("balance = %v, want the direct 25.4", got)
+	}
+}

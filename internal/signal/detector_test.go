@@ -610,7 +610,7 @@ func TestEdgeBarScalesWithHowFastYouCouldGetOut(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := requiredEdge(base, pricing.Liquidity{Velocity: c.velocity})
+			got := requiredEdge(base, pricing.Liquidity{Velocity: c.velocity}, pricing.RegimeNeutral)
 			if math.Abs(got-c.want) > 1e-9 {
 				t.Errorf("requiredEdge at %.2f/day = %.4f, want %.4f", c.velocity, got, c.want)
 			}
@@ -622,8 +622,8 @@ func TestEdgeBarScalesWithHowFastYouCouldGetOut(t *testing.T) {
 		})
 	}
 	// The ordering is the property that matters: illiquidity is never cheaper.
-	thin := requiredEdge(base, pricing.Liquidity{Velocity: .3})
-	liquid := requiredEdge(base, pricing.Liquidity{Velocity: 3})
+	thin := requiredEdge(base, pricing.Liquidity{Velocity: .3}, pricing.RegimeNeutral)
+	liquid := requiredEdge(base, pricing.Liquidity{Velocity: 3}, pricing.RegimeNeutral)
 	if thin <= liquid {
 		t.Errorf("a model selling twice a week (%.3f) must not be easier to clear than one selling three times a day (%.3f)", thin, liquid)
 	}
@@ -648,5 +648,47 @@ func TestThinEdgeOnALiquidModelIsStillRejected(t *testing.T) {
 	if dec.Signal {
 		t.Errorf("a ~3%% edge was pushed as a signal: edge %.1f%% fails %v",
 			dec.Val.Edge*100, dec.SignalFails)
+	}
+}
+
+// The sweep of the standing book cannot afford a venue read per listing: the
+// marketplaces are paced like a person tapping through a mini app, and a pass
+// over forty models times five asks could not finish one sweep inside its own
+// deadline. Every candidate then came back with the venues unreachable — which
+// caps the score and blocks unattended buying — so the sweep hands in one quote
+// per model and every listing in that book is priced against it.
+func TestEvaluateWithCrossUsesTheSuppliedQuoteAndAsksNoVenue(t *testing.T) {
+	h := newHarness(t, 4.00, 4.60, 4.62, 4.65)
+	h.seedSales(t, 4.4, 30, 30)
+	h.seedStat(t, 4.00, 40)
+
+	fetches := 0
+	h.det.CrossSupport = func(context.Context, pricing.Valuation) pricing.CrossMarket {
+		fetches++
+		return pricing.CrossMarket{Support: 9, Asks: []float64{9, 9.1}, Venues: 1}
+	}
+
+	cm := pricing.CrossMarket{Support: 4.3, Asks: []float64{4.3, 4.35, 4.4}, Venues: 2}
+	dec, err := h.det.EvaluateWithCross(context.Background(), gift(candidateID, 4.00), risk.Limits{}, time.Now(), cm)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if dec == nil || !dec.Val.Valid {
+		t.Fatalf("no valuation: %+v", dec)
+	}
+	if fetches != 0 {
+		t.Errorf("the venues were queried %d times; the caller had already read them", fetches)
+	}
+	if dec.Val.CrossMarketSupport != 4.3 {
+		t.Errorf("cross support = %.2f, want the supplied 4.30", dec.Val.CrossMarketSupport)
+	}
+	// The supplied queue has to bound the exit exactly as a freshly fetched one
+	// would: 4.30 elsewhere costs a buyer less than our own 4.60 next ask.
+	want := 4.30 / (1 + h.cfg.TonnelFee) * (1 - h.cfg.Undercut)
+	if math.Abs(dec.Val.FastExit-want) > 0.005 {
+		t.Errorf("fast exit = %.4f, want %.4f — the external queue must cap it", dec.Val.FastExit, want)
+	}
+	if !dec.Val.ExitFromCross {
+		t.Error("the exit came from another venue's queue and does not say so")
 	}
 }

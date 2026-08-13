@@ -849,8 +849,24 @@ func TestOneDisagreementIsNotChargedThreeTimes(t *testing.T) {
 	if s.Quality < .3 {
 		t.Errorf("quality %.0f%% on ten distinct gifts with an agreeing external queue", s.Quality*100)
 	}
-	if s.Total < 25 {
-		t.Errorf("a confirmed +%.1f%% trade scored %.1f", v.Edge*100, s.Total)
+	// The same trade with the disagreement made real: a tape far under the queue,
+	// on enough prints for the clamp to fire and invent the exit.
+	//
+	// This is a comparison rather than an absolute score because the absolute one
+	// is no longer a property of the evidence alone. Since the fill model started
+	// counting the external queue, a trade sitting under three foreign sellers
+	// scores lower than the same trade standing alone — correctly, and by a
+	// margin that would swamp any fixed threshold written here.
+	brokenLiq := liq
+	brokenLiq.Median, brokenLiq.Median7 = 2.2, 2.2
+	broken := evalPrice(t, 3.6, bookOf(42, 3.6, 5, 5, 5.2), brokenLiq, 5, 7)
+	broken = WithCrossDepth(broken, CrossMarket{Support: 4, Venues: 1, Asks: []float64{3.99, 4, 4, 4.21, 4.33}})
+	if !broken.ExitInvented {
+		t.Fatalf("fixture is wrong: the control case should have had its exit clamped")
+	}
+	if s.Total <= broken.ScoreBreakdown.Total*2 {
+		t.Errorf("a well-evidenced +%.1f%% trade scored %.1f, not clearly above the %.1f of one whose price had to be invented",
+			v.Edge*100, s.Total, broken.ScoreBreakdown.Total)
 	}
 }
 
@@ -884,7 +900,12 @@ func TestScoreRewardsCorroborationAndPunishesBlindness(t *testing.T) {
 	liq.DistinctGifts, liq.Velocity = 20, 1.5
 
 	base := evalPrice(t, 3, bookOf(42, 3, 3.5, 3.55, 3.6), liq, 3.5, 20)
-	confirmed := WithCrossDepth(base, CrossMarket{Support: 3.5, Venues: 2, Asks: []float64{3.5, 3.52, 3.55}})
+	// The confirming queue agrees about the price level without standing on top
+	// of us. That separation is the whole point of the test: since the fill model
+	// began counting foreign sellers, a cross queue placed inside our own
+	// undercut band adds competition as well as corroboration, and the fixture
+	// would then be measuring both at once and attributing the result to one.
+	confirmed := WithCrossDepth(base, CrossMarket{Support: 3.72, Venues: 2, Asks: []float64{3.72, 3.74, 3.77}})
 	blind := WithCrossDepth(base, CrossMarket{Unreachable: 1})
 
 	if confirmed.ScoreBreakdown.Total <= base.ScoreBreakdown.Total {
@@ -956,5 +977,89 @@ func TestScorePenalizesStaleExpensiveFloorAndVolatileGram(t *testing.T) {
 	risky.FX = FXContext{Valid: true, FloorLag: .12, Move15m: .04}
 	if BuildScore(risky, 1).Total >= BuildScore(calm, 1).Total {
 		t.Fatal("stale-expensive floor during GRAM volatility should reduce score")
+	}
+}
+
+// The queue on the other venues is part of the exit, so it has to be part of the
+// score. Once another venue's queue caps the price, depthFactor steps aside —
+// the local book is no longer what the exit rests on — and nothing used to take
+// its place, so the queue we actually have to sell through went unexamined in
+// exactly the cases where it was the one deciding the price.
+func TestCrossQueueCrowdingCostsTheTradeRank(t *testing.T) {
+	book := bookOf(42, 3.00, 3.60, 3.62, 3.65)
+	liq := liqOf(3.4, 30)
+
+	// The same cheapest external offer in both — so the exit, which undercuts it,
+	// is identical — and behind it either open space or four more sellers inside
+	// the same band. The difference is only how easily somebody takes the fill
+	// back off us.
+	lonely := WithCrossDepth(evalPrice(t, 3.00, book, liq, 3.00, 20), CrossMarket{
+		Support: 3.5, Venues: 1, Asks: []float64{3.5, 4.4, 4.5},
+	})
+	crowded := WithCrossDepth(evalPrice(t, 3.00, book, liq, 3.00, 20), CrossMarket{
+		Support: 3.5, Venues: 1, Asks: []float64{3.5, 3.52, 3.55, 3.58, 3.6},
+	})
+
+	if !SamePrice(lonely.FastExit, crowded.FastExit) {
+		t.Fatalf("fixture is wrong: exits differ (%.4f vs %.4f), so the scores are not comparable",
+			lonely.FastExit, crowded.FastExit)
+	}
+	if lonely.CrossCompetitorsNear != 1 {
+		t.Errorf("lonely: %d external offers near the exit, want 1 — only the one we undercut",
+			lonely.CrossCompetitorsNear)
+	}
+	if crowded.CrossCompetitorsNear < 4 {
+		t.Errorf("crowded: %d external offers near the exit, want at least 4", crowded.CrossCompetitorsNear)
+	}
+	if crowded.ScoreBreakdown.Total >= lonely.ScoreBreakdown.Total {
+		t.Errorf("a queue stacked on our exit scores %.1f, at or above an empty one (%.1f)",
+			crowded.ScoreBreakdown.Total, lonely.ScoreBreakdown.Total)
+	}
+}
+
+// External offers are counted in the unit a buyer compares — money leaving their
+// wallet — so a venue's sticker is restated as the Tonnel ask that costs the
+// same. Comparing gross prices would count an offer as cheaper purely because of
+// who charges the referral.
+func TestCrossCompetitionCountsInBuyerTerms(t *testing.T) {
+	// Exactly at the exit in Tonnel terms: an external sticker of exit*(1+fee)
+	// costs a buyer the same as our own ask at exit.
+	const exit = 4.0
+	near, below := crossCompetition(CrossMarket{Asks: []float64{
+		exit * (1 + testFee),        // level with us
+		exit * (1 + testFee) * 1.04, // just above, still in the band
+		exit * (1 + testFee) * 1.20, // well clear
+		exit * (1 + testFee) * 0.90, // genuinely cheaper
+	}}, exit, testFee)
+
+	if near != 2 {
+		t.Errorf("near = %d, want 2", near)
+	}
+	if below != 1 {
+		t.Errorf("below = %d, want 1", below)
+	}
+}
+
+// A position is not a candidate. The size term exists to stop dust outranking a
+// real trade when the desk is choosing what to buy; applied to something already
+// owned it just ranks the book by lot size.
+func TestSizeTermIsOptOutForOwnedPositions(t *testing.T) {
+	book := bookOf(42, 3.00, 3.60, 3.62, 3.65)
+	liq := liqOf(3.4, 30)
+
+	in := Input{
+		GiftID: 42, Key: testKey, Price: 3.00, Book: book, Liq: liq,
+		Floor: 3.00, Supply: 20, Params: Params{Fee: testFee, Undercut: testUndercut},
+	}
+	owned := Evaluate(in)
+	in.TicketRef = 40
+	candidate := Evaluate(in)
+
+	if owned.ScoreBreakdown.SizeFactor != 1 {
+		t.Errorf("size factor = %.2f with no ticket reference, want 1", owned.ScoreBreakdown.SizeFactor)
+	}
+	if candidate.ScoreBreakdown.SizeFactor >= 1 {
+		t.Errorf("size factor = %.2f for a small lot against a 40 ticket, want it held back",
+			candidate.ScoreBreakdown.SizeFactor)
 	}
 }

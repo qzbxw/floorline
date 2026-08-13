@@ -19,10 +19,22 @@ import (
 // data it needs. Shared by /val and the Buy button so both see the same numbers
 // the detector saw.
 func (a *App) priceGift(ctx context.Context, g tonnel.Gift, now time.Time) (pricing.Valuation, error) {
-	return a.priceGiftWithCost(ctx, g, 0, now)
+	return a.priceGiftWithCost(ctx, g, 0, a.rm.Limits().MaxTicket, now)
 }
 
-func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64, now time.Time) (pricing.Valuation, error) {
+// pricePosition values something the desk already owns.
+//
+// The difference from priceGift is the ticket reference, and it is deliberate.
+// The size term exists to stop a 0.15-GRAM profit outranking a 5-GRAM one when
+// the desk is choosing what to buy; applied to a position, it is answering a
+// question nobody asked — the capital is already committed, and a small holding
+// is not a worse holding for being small. Left in, it silently ranked the
+// portfolio by lot size.
+func (a *App) pricePosition(ctx context.Context, g tonnel.Gift, cost float64, now time.Time) (pricing.Valuation, error) {
+	return a.priceGiftWithCost(ctx, g, cost, 0, now)
+}
+
+func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost, ticketRef float64, now time.Time) (pricing.Valuation, error) {
 	key := g.Key()
 	if key.Name == "" || key.Model == "" {
 		return pricing.Valuation{Reason: "у лота нет коллекции или модели"}, nil
@@ -71,7 +83,7 @@ func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost float64
 		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
 		SnapshotAt: snapshotAt, Now: now, FX: fxContext,
 		Params:    pricing.Params{Fee: a.cfg.TonnelFee, Undercut: a.cfg.Undercut},
-		TicketRef: a.rm.Limits().MaxTicket,
+		TicketRef: ticketRef,
 	})
 	// Unconditionally, not only when a venue answered. A venue we could not
 	// read is itself an input — it removes the cap that holds an optimistic

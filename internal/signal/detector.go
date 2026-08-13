@@ -40,6 +40,10 @@ const (
 	// already been shown three lots at this number, then whatever we buy, our
 	// buyer can have the next one at the same price.
 	maxBatchPeers = 3
+	// crowdWindow is how far back the adverse-selection check looks for other
+	// sellers arriving. Long enough to catch a queue forming, short enough that
+	// ordinary turnover in a busy model does not read as one.
+	crowdWindow = 15 * time.Minute
 )
 
 // Decision is the full verdict on one listing.
@@ -51,6 +55,12 @@ type Decision struct {
 	Auto       bool // clears every unattended-purchase gate
 	Suppressed bool // signal-worthy but muted or inside the alert cooldown
 	Score      float64
+
+	// Verdict is the headline, and it is the weakest of the three layers rather
+	// than the verdict of the price gates alone. Layers carries all three so the
+	// card can say which one is holding it down.
+	Verdict Verdict
+	Layers  []Layer
 
 	SignalFails []string
 	AutoFails   []string
@@ -125,16 +135,32 @@ func (d *Detector) params() pricing.Params {
 // can be answered from local data, because the feed produces candidates far
 // faster than the rate limiter permits requests.
 func (d *Detector) Evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time) (*Decision, error) {
-	return d.evaluate(ctx, g, limits, now, true)
+	return d.evaluate(ctx, g, limits, now, true, nil)
 }
 
 // EvaluateFresh repeats every gate without signal deduplication. It is used in
 // the money path after a direct GiftData quote and a forced book refresh.
 func (d *Detector) EvaluateFresh(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time) (*Decision, error) {
-	return d.evaluate(ctx, g, limits, now, false)
+	return d.evaluate(ctx, g, limits, now, false, nil)
 }
 
-func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time, dedupe bool) (*Decision, error) {
+// EvaluateWithCross prices a listing against a cross-market quote the caller
+// already holds, instead of fetching one per listing.
+//
+// The sweep of the standing book needs this. The other venues are paced like a
+// person tapping through a mini app — MRKT banned this account once for looking
+// like anything else — and one pass over forty models times five asks was asking
+// for several hundred rate-limited reads down the exact → backdrop → model
+// ladder. None of it could finish: every candidate came back with the venues
+// "unreachable", which is not a cosmetic loss but the cap that holds an
+// optimistic exit down, a heavy score penalty and a hard block on unattended
+// buying. One read per model, shared by that model's whole book, is what makes
+// the sweep able to price against the other venues at all.
+func (d *Detector) EvaluateWithCross(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time, cm pricing.CrossMarket) (*Decision, error) {
+	return d.evaluate(ctx, g, limits, now, false, &cm)
+}
+
+func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limits, now time.Time, dedupe bool, cross *pricing.CrossMarket) (*Decision, error) {
 	if d.OwnerID != nil && d.OwnerID() != 0 && g.Seller.Int() == d.OwnerID() {
 		return nil, nil
 	}
@@ -231,13 +257,27 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 		Params:     d.params(),
 		TicketRef:  limits.MaxTicket,
 	})
-	if d.CrossSupport != nil {
-		// Applied unconditionally: a venue that could not be read is an input,
-		// not an absence of one. Guarding this on Support > 0 meant an
-		// unreachable venue never reached the valuation, so the score treated
-		// "priced blind" as "priced on Tonnel alone" and the auto-buy gate that
-		// exists to catch it could not fire.
+	// Applied unconditionally: a venue that could not be read is an input, not an
+	// absence of one. Guarding this on Support > 0 meant an unreachable venue
+	// never reached the valuation, so the score treated "priced blind" as "priced
+	// on Tonnel alone" and the auto-buy gate that exists to catch it could not
+	// fire.
+	switch {
+	case cross != nil:
+		val = pricing.WithCrossDepth(val, *cross)
+	case d.CrossSupport != nil:
 		val = pricing.WithCrossDepth(val, d.CrossSupport(ctx, val))
+	}
+
+	// Is anyone else running for the same door? Cheap to ask — it is one indexed
+	// count over the listings we already store — and it is the difference between
+	// a discount and the first step of a slide.
+	if fresh, err := d.st.FreshSupplySince(ctx, key, price, now.Add(-crowdWindow),
+		g.GiftID.Int(), ownerID(d.OwnerID)); err == nil {
+		val.AssessCrowd(pricing.Crowd{
+			Window: crowdWindow, Arrivals: fresh.Arrivals,
+			AtOrBelow: fresh.AtOrBelow, Cheapest: fresh.Cheapest,
+		})
 	}
 
 	dec := &Decision{Gift: g, Val: val}
@@ -265,6 +305,7 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	}
 	dec.Signal = len(dec.SignalFails) == 0
 	dec.Score = Score(val)
+	dec.Verdict, dec.Layers = Grade(val, dec.SignalFails)
 
 	if dec.Signal {
 		muted, err := d.st.IsMuted(ctx, key, now)
@@ -370,9 +411,9 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	// far under water the round trip actually is.
 	if v.Edge <= 0 {
 		fails = append(fails, fmt.Sprintf("реальный вход %.3f выше быстрого выхода %.3f — сделка уже %.1f%% в минусе до риск-буфера", v.Cost, v.FastExit, -v.Edge*100))
-	} else if need := requiredEdge(g.MinEdge, v.Liq); v.ScoreBreakdown.RiskAdjustedEdge < need {
-		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%, %s)",
-			v.ScoreBreakdown.RiskAdjustedEdge*100, need*100, v.Edge*100, liquidityNote(v.Liq)))
+	} else if need := requiredEdge(g.MinEdge, v.Liq, v.Regime); v.ScoreBreakdown.RiskAdjustedEdge < need {
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже %.1f%% (сырой %.1f%%, %s%s)",
+			v.ScoreBreakdown.RiskAdjustedEdge*100, need*100, v.Edge*100, liquidityNote(v.Liq), regimeNote(v.Regime)))
 	}
 	// A percentage cannot tell a trade from a rounding error. Both bars have to
 	// be cleared: 5% of a 3-GRAM lot is seven hundredths of a GRAM, and a card
@@ -380,9 +421,18 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	if g.MinNet > 0 && v.Net < g.MinNet {
 		fails = append(fails, fmt.Sprintf("чистыми всего %.2f GRAM, минимум %.2f — процент есть, денег нет", v.Net, g.MinNet))
 	}
-	if g.MaxExitDays > 0 && v.FastExpectedDays > g.MaxExitDays {
-		fails = append(fails, fmt.Sprintf("продавать %s — это склад, а не флип (лимит %.0fд)",
-			days(v.FastExpectedDays), g.MaxExitDays))
+	// The horizon a flip is allowed to take, measured as a probability rather
+	// than as a mean. "Expected 4.7 days" was a fourteen-day average trade rate
+	// divided by a queue that included every listing of the model, and it was
+	// wrong in both halves; what matters is whether this lot, at this price,
+	// behind the offers actually cheaper than it, is likely to be gone in time.
+	if limit := v.Regime.HoldLimit(g.MaxExitDays); limit > 0 {
+		if median := v.Fill.Median(); median > limit {
+			fails = append(fails, fmt.Sprintf(
+				"шанс продать за %.0fд всего %.0f%% (впереди %s) — это склад, а не флип%s",
+				limit, fillWithin(v.Fill, limit)*100,
+				plural(v.Fill.QueueAhead, "оффер", "оффера", "офферов"), regimeNote(v.Regime)))
+		}
 	}
 	// No trait premium, cheaper offers already standing in front of us: this is
 	// an expensive listing, not a mispriced one.
@@ -419,7 +469,8 @@ const (
 	thinPenalty  = 0.015
 )
 
-// requiredEdge scales the edge bar by how easily the position could be unwound.
+// requiredEdge scales the edge bar by how easily the position could be unwound,
+// and by which way the model's market is going.
 //
 // A flat threshold prices two very different trades identically. Three percent
 // on a model doing 2.5 distinct sales a day is a position you can be out of by
@@ -427,14 +478,41 @@ const (
 // capital tied up for the price of a rounding error, and that is the trade the
 // desk keeps getting stuck in. So the thin end pays for its illiquidity and the
 // liquid end gets a little back.
-func requiredEdge(base float64, l pricing.Liquidity) float64 {
+//
+// The regime is the second axis. Buying into a model whose recent prints are
+// below its own window means the queue we plan to undercut will itself be
+// cheaper by the time we reach it, so the margin has to cover the drift as well
+// as the spread.
+func requiredEdge(base float64, l pricing.Liquidity, r pricing.Regime) float64 {
 	switch {
 	case l.Velocity >= liquidPerDay:
-		return math.Max(base-liquidRelief, 0)
+		base = math.Max(base-liquidRelief, 0)
 	case l.Velocity >= thinPerDay:
-		return base
 	default:
-		return base + thinPenalty
+		base += thinPenalty
+	}
+	return base + r.EdgeSurcharge()
+}
+
+// regimeNote names a falling market wherever a threshold moved because of it, so
+// a bar that changed under the operator does not look arbitrary.
+func regimeNote(r pricing.Regime) string {
+	if r != pricing.RegimeFalling {
+		return ""
+	}
+	return ", рынок модели падает — планка поднята"
+}
+
+// fillWithin reads the survival curve at whichever quoted horizon is closest to
+// a limit, so a message can quote a probability the card also shows.
+func fillWithin(f pricing.FillCurve, limitDays float64) float64 {
+	switch {
+	case limitDays <= 1:
+		return f.In24h
+	case limitDays <= 3:
+		return f.In72h
+	default:
+		return f.In7d
 	}
 }
 
@@ -465,9 +543,22 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	} else if d.CalibrationReady != nil && !d.CalibrationReady() {
 		fails = append(fails, "калибровка скоринга не набрала выборку — можно снять в /autobuy")
 	}
-	if need := requiredEdge(a.MinEdge, v.Liq); v.ScoreBreakdown.RiskAdjustedEdge < need {
-		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже порога автобая %.1f%% (%s)",
-			v.ScoreBreakdown.RiskAdjustedEdge*100, need*100, liquidityNote(v.Liq)))
+	if need := requiredEdge(a.MinEdge, v.Liq, v.Regime); v.ScoreBreakdown.RiskAdjustedEdge < need {
+		fails = append(fails, fmt.Sprintf("эдж с поправкой на риск %.1f%% ниже порога автобая %.1f%% (%s%s)",
+			v.ScoreBreakdown.RiskAdjustedEdge*100, need*100, liquidityNote(v.Liq), regimeNote(v.Regime)))
+	}
+	// Everything above is about the price. The verdict is about all three layers,
+	// and the machine is only allowed to act on the strongest one — a trade the
+	// desk itself would label speculative is not a trade to make while nobody is
+	// watching.
+	if verdict, layers := Grade(v, nil); verdict != VerdictBuy {
+		for _, l := range Blocking(layers) {
+			fails = append(fails, fmt.Sprintf("%s: %s", l.Name, l.Note))
+		}
+	}
+	// A discount is only a gift when nobody else is running for the same door.
+	if v.AdverseSelection {
+		fails = append(fails, v.AdverseReason)
 	}
 	if v.Liq.Velocity < a.MinVelocity {
 		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже порога автобая %.2f", v.Liq.Velocity, a.MinVelocity))

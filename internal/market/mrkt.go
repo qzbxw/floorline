@@ -104,7 +104,7 @@ func (m *MRKT) ModelFloorForAttributes(ctx context.Context, collection, model, b
 		return 0, errNoCredentials
 	}
 	key := matchKey(collection) + "|" + matchKey(model) + "|" + matchKey(backdrop) + "|" + matchKey(symbol)
-	return m.floors.get(key, func() (float64, error) {
+	return m.floors.get(ctx, key, func() (float64, error) {
 		return m.cheapestAsk(ctx, collection, model, backdrop, symbol)
 	})
 }
@@ -117,7 +117,7 @@ func (m *MRKT) ModelAsks(ctx context.Context, collection, model, backdrop, symbo
 		limit = 20
 	}
 	key := matchKey(collection) + "|" + matchKey(model) + "|" + matchKey(backdrop) + "|" + matchKey(symbol)
-	return m.books.get(key, func() ([]float64, error) {
+	return m.books.get(ctx, key, func() ([]float64, error) {
 		return m.askDepth(ctx, collection, model, backdrop, symbol, limit)
 	})
 }

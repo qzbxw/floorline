@@ -191,12 +191,51 @@ func TestCacheRemembersFailures(t *testing.T) {
 		return 0, errors.New("venue is down")
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := c.get("k", load); err == nil {
+		if _, err := c.get(context.Background(), "k", load); err == nil {
 			t.Fatal("expected the cached error")
 		}
 	}
 	if calls != 1 {
 		t.Errorf("loader ran %d times, want 1: failures must be cached too", calls)
+	}
+}
+
+// A venue read that lost a race with our own deadline says nothing about the
+// venue. Remembering it as an answer meant one busy moment blocked unattended
+// buying — and capped the score of every listing — for the whole TTL.
+func TestCacheDoesNotRememberOurOwnDeadline(t *testing.T) {
+	c := newCache[float64](time.Minute)
+	var calls int
+	fail := func() (float64, error) {
+		calls++
+		return 0, context.DeadlineExceeded
+	}
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.get(dead, "k", fail); err == nil {
+		t.Fatal("expected the deadline error to be returned")
+	}
+	if _, err := c.get(context.Background(), "k", func() (float64, error) {
+		calls++
+		return 7, nil
+	}); err != nil {
+		t.Fatalf("the next attempt must reach the venue: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("loader ran %d times, want 2: a cancelled attempt must not be cached", calls)
+	}
+
+	// A rate limiter that gives up reports its own refusal rather than the
+	// context's, and that is the common shape of this failure.
+	rateGiveUp := errors.New("rate: Wait(n=1) would exceed context deadline")
+	dead2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if _, err := c.get(dead2, "limited", func() (float64, error) { return 0, rateGiveUp }); err == nil {
+		t.Fatal("expected the limiter error")
+	}
+	if v, err := c.get(context.Background(), "limited", func() (float64, error) { return 3, nil }); err != nil || v != 3 {
+		t.Errorf("got %v, %v — a limiter give-up must not be cached either", v, err)
 	}
 }
 
@@ -208,22 +247,22 @@ func TestCacheExpires(t *testing.T) {
 		return float64(calls), nil
 	}
 
-	if v, _ := c.get("k", load); v != 1 {
+	if v, _ := c.get(context.Background(), "k", load); v != 1 {
 		t.Fatalf("first value = %v, want 1", v)
 	}
-	if v, _ := c.get("k", load); v != 1 {
+	if v, _ := c.get(context.Background(), "k", load); v != 1 {
 		t.Errorf("second value = %v, want the cached 1", v)
 	}
 	time.Sleep(30 * time.Millisecond)
-	if v, _ := c.get("k", load); v != 2 {
+	if v, _ := c.get(context.Background(), "k", load); v != 2 {
 		t.Errorf("value after expiry = %v, want a fresh 2", v)
 	}
 }
 
 func TestCacheKeysAreIndependent(t *testing.T) {
 	c := newCache[float64](time.Minute)
-	a, _ := c.get("a", func() (float64, error) { return 1, nil })
-	b, _ := c.get("b", func() (float64, error) { return 2, nil })
+	a, _ := c.get(context.Background(), "a", func() (float64, error) { return 1, nil })
+	b, _ := c.get(context.Background(), "b", func() (float64, error) { return 2, nil })
 	if a != 1 || b != 2 {
 		t.Errorf("got a=%v b=%v, want 1 and 2", a, b)
 	}
@@ -410,5 +449,46 @@ func TestVenueWithoutALoginIsUnconfiguredNotUnreachable(t *testing.T) {
 	// failed to answer.
 	if c := NewComparison(unconfigured); c.Enabled() {
 		t.Error("an unconfigured venue must not make the comparison live")
+	}
+}
+
+// The worst number this bot has ever printed came from averaging two asks.
+// Pool Float · Giant Panda, a 3.8 gift: MRKT showed 12.2 and 306, the reference
+// came out at their midpoint of 159.1, and the card reported "+4067% to entry"
+// while that number carried a fifth of the weight in price discovery.
+func TestTwoAsksThatDisagreeAreNotAPrice(t *testing.T) {
+	fantasy := Quote{Asks: []float64{12.2, 306}, Floor: 12.2}
+	if ref := fantasy.Reference(); ref != 0 {
+		t.Errorf("reference = %.2f, want 0 — one listing and one fantasy is not a market", ref)
+	}
+	if a := fantasy.Anchor(); a != 12.2 {
+		t.Errorf("anchor = %.2f, want the cheapest real offer 12.20", a)
+	}
+
+	// Two asks that do agree are a thin market, and speak with the cheaper one.
+	thin := Quote{Asks: []float64{4.20, 4.35}}
+	if ref := thin.Reference(); ref != 4.20 {
+		t.Errorf("reference = %.2f, want the conservative 4.20", ref)
+	}
+}
+
+// A lone ask is a price somebody typed, not a valuation anchor. Portals showing
+// a single "11" against a model trading at 3.1 must contribute nothing.
+func TestOneAskIsNeverAValuationAnchor(t *testing.T) {
+	lone := Quote{Asks: []float64{11}, Floor: 11}
+	if ref := lone.Reference(); ref != 0 {
+		t.Errorf("reference = %.2f, want 0", ref)
+	}
+	if lone.Anchor() != 11 {
+		t.Error("the floor is still a fact about execution and must survive")
+	}
+}
+
+// Robustness has to work in both directions at once: a bait listing far below
+// the market must not drag the reference down either.
+func TestReferenceIgnoresABaitFloorAndAFantasyAsk(t *testing.T) {
+	q := Quote{Asks: []float64{0.9, 20, 21, 400}}
+	if ref := q.Reference(); ref != 20 {
+		t.Errorf("reference = %.2f, want 20 — the median of the three cheapest", ref)
 	}
 }

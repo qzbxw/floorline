@@ -29,7 +29,42 @@ import (
 // wrong, then the evidence. The first line is a link to the gift itself, which
 // Telegram unfurls into a picture — on this market the picture is half the
 // asset, and the desk was being asked to judge a Black Mamba from a price.
+// It is now four lines and a title. The previous version was already a cut-down
+// of something longer, and it was still a wall: history, cross-market, traits,
+// FX, queue and regime all had a line, and the two facts that decide the trade
+// got the same glance as the twenty that do not. Everything removed is one tap
+// away in /val, which is the view for arguing with the engine rather than acting
+// on it.
 func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string) string {
+	v := dec.Val
+	g := dec.Gift
+	var b strings.Builder
+
+	if url := bot.NFTPreviewURL(v.Key.Name, g.GiftNum.Int()); url != "" {
+		fmt.Fprintf(&b, "<a href=\"%s\">🖼</a> ", url)
+	}
+	fmt.Fprintf(&b, "<b>%s</b> · <i>%s</i>\n",
+		bot.Esc(giftTitle(v.Key.Name, g.GiftNum.Int())), bot.Esc(v.Key.Model))
+
+	b.WriteString(headlineBlock(dec))
+	if risk := riskLine(v); risk != "" {
+		b.WriteString(risk + "\n")
+	}
+	// One line, and only when something is actually holding the trade back. A
+	// warning that appears on every card is not a warning.
+	if note != "" {
+		fmt.Fprintf(&b, "⛔️ %s\n", bot.Esc(note))
+	}
+	fmt.Fprintf(&b, "<code>/val %d</code>", g.GiftID.Int())
+	if dec.Age > 0 {
+		fmt.Fprintf(&b, " · <i>висит %s</i>", dur(dec.Age))
+	}
+	return b.String()
+}
+
+// renderCardFull is the long form, kept for /val and for the "подробнее" button:
+// every number the engine has, in the order it was derived.
+func (a *App) renderCardFull(ctx context.Context, dec *signal.Decision, note string) string {
 	v := dec.Val
 	g := dec.Gift
 	var b strings.Builder
@@ -40,7 +75,10 @@ func (a *App) renderCard(ctx context.Context, dec *signal.Decision, note string)
 	fmt.Fprintf(&b, "⚡️ <b>%s</b>\n<i>%s</i>\n\n",
 		bot.Esc(giftTitle(v.Key.Name, g.GiftNum.Int())), bot.Esc(v.Key.Model))
 
-	b.WriteString(headlineBlock(v))
+	b.WriteString(headlineBlock(dec))
+	if line := exitLadderLine(v); line != "" {
+		b.WriteString(line + "\n")
+	}
 	b.WriteString("\n" + a.reasonBlock(ctx, v))
 	if risks := riskLines(v); len(risks) > 0 {
 		b.WriteString("\n")
@@ -75,25 +113,29 @@ func giftTitle(collection string, giftNum int64) string {
 // patient. Only one of them is ever the decision, and printing the other three
 // beside it invited reading the most flattering as the plan. The fast exit is
 // the number this trade is judged on, so it is the only one here.
-func headlineBlock(v pricing.Valuation) string {
-	var b strings.Builder
-	arrow := "🟢"
-	switch {
-	case v.Edge <= 0:
-		arrow = "🔴"
-	case v.ScoreBreakdown.Total < 10:
-		arrow = "🟡"
+// The verdict leads, and it is the weakest of the three layers rather than the
+// verdict of the price gates alone. "✅ BUY · скор 3/100 · данные 3%" was not a
+// layout problem: BUY is read as "the model is confident", so a BUY resting on
+// three percent confidence was the interface asserting something the engine did
+// not believe. Now a trade whose evidence is thin says SPEC and says why.
+func headlineBlock(dec *signal.Decision) string {
+	v := dec.Val
+	verdict := dec.Verdict
+	if verdict == "" {
+		verdict, _ = signal.Grade(v, dec.SignalFails)
 	}
-	fmt.Fprintf(&b, "%s <b>%s → %s</b> · <b>%s</b> · %s\n",
-		arrow, num(v.Cost), num(v.FastExit), pct(v.Edge), days(v.FastExpectedDays))
-	// Two numbers that are constantly confused for each other. One says how good
-	// the trade is, the other how much the data behind it can be believed, and
-	// they move independently: a well-measured mediocre trade scores low on the
-	// first and high on the second. Printing them as "скор 27 · доверие 76%"
-	// invited reading the pair as one hedged opinion, so the words now say which
-	// is which and the verdict attaches only to the trade.
-	fmt.Fprintf(&b, "чистыми %s · сделка <b>%.0f/100</b> — %s · данные %.0f%%\n",
-		num(v.Net), v.ScoreBreakdown.Total, scoreVerdict(v.ScoreBreakdown.Total), v.ScoreBreakdown.Quality*100)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s <b>%s</b> %.0f/100 · данные %.0f%%\n",
+		verdict.Mark(), verdict, v.ScoreBreakdown.Total, v.ScoreBreakdown.Quality*100)
+	fmt.Fprintf(&b, "%s → %s · <b>%s</b> · чистыми %s\n",
+		num(v.Cost), num(v.FastExit), pct(v.Edge), num(v.Net))
+	fmt.Fprintf(&b, "%s\n", fillLine(v))
+	// Whichever layer is holding the verdict down, in its own words. This is the
+	// line that used to be missing entirely: the card showed a downgraded verdict
+	// and left the operator to guess which of a dozen numbers caused it.
+	if blocking := signal.Blocking(dec.Layers); len(blocking) > 0 {
+		fmt.Fprintf(&b, "└ %s: %s\n", blocking[0].Name, bot.Esc(blocking[0].Note))
+	}
 	return b.String()
 }
 
@@ -110,10 +152,41 @@ func (a *App) reasonBlock(ctx context.Context, v pricing.Valuation) string {
 	return "📐 <b>Почему столько:</b> " + bot.Esc(why) + "\n"
 }
 
+// riskLine is the single worst thing about this trade, for the short card.
+//
+// One line, chosen by severity, because the compact card has room for exactly
+// one and the operator should get the one that matters. The rest are in /val.
+func riskLine(v pricing.Valuation) string {
+	risks := riskLines(v)
+	if len(risks) == 0 {
+		return ""
+	}
+	line := "⚠️ " + risks[0]
+	if extra := len(risks) - 1; extra > 0 {
+		line += fmt.Sprintf(" · <i>ещё %d в /val</i>", extra)
+	}
+	return line
+}
+
 // riskLines are the things that would make this trade go wrong, and nothing
 // else. A warning that fires on every card is not a warning.
+// The order is severity, not the order the numbers were computed in, because
+// the compact card shows only the first one. "The market is already cheaper than
+// you paid" is the most decisive thing that can be true about a trade — it says
+// the position is upside-down before any modelling — so it leads, ahead of the
+// warnings about how well we can measure it.
 func riskLines(v pricing.Valuation) []string {
 	var out []string
+	if v.AdverseSelection {
+		out = append(out, v.AdverseReason)
+	}
+	if v.AsksBelowEntry > 0 {
+		out = append(out, fmt.Sprintf("дешевле твоего входа стоит %s — рынок ниже нас",
+			plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков")))
+	}
+	if v.CrossImplausible {
+		out = append(out, "чужие площадки показывают цену, которой не бывает — в оценку они не пошли")
+	}
 	if v.AppearanceUnpriced {
 		out = append(out, "считали по обычным экземплярам — по этим трейтам сравнить не с чем, реальная цена может быть выше")
 	}
@@ -126,12 +199,17 @@ func riskLines(v pricing.Valuation) []string {
 		out = append(out, fmt.Sprintf("дырявый стакан: %s → %s, живых цен подряд %d",
 			num(v.CompetingAsk), num(v.DepthPrice3), v.LiveDepthCount))
 	}
-	if v.AsksBelowEntry > 0 {
-		out = append(out, fmt.Sprintf("дешевле твоего входа стоит %s — рынок ниже нас",
-			plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков")))
-	} else if v.CompetitorsNear > 0 {
-		out = append(out, fmt.Sprintf("%s в 5%% над выходом — подрежут",
-			plural(v.CompetitorsNear, "продавец", "продавца", "продавцов")))
+	if near := v.CompetitorsNear + v.CrossCompetitorsNear; v.AsksBelowEntry == 0 && near > 0 {
+		// Counted across venues, because being undercut does not require the
+		// other seller to be on Tonnel. The split is spelled out: sellers we can
+		// see moving in our own book are a different problem from sellers on a
+		// marketplace we cannot reprice against.
+		line := fmt.Sprintf("%s в 5%% над выходом — подрежут",
+			plural(near, "продавец", "продавца", "продавцов"))
+		if v.CrossCompetitorsNear > 0 {
+			line += fmt.Sprintf(" (из них %d на других площадках)", v.CrossCompetitorsNear)
+		}
+		out = append(out, line)
 	}
 	if v.Cross.Unreachable > 0 {
 		out = append(out, plural(v.Cross.Unreachable, "площадка не ответила", "площадки не ответили", "площадок не ответили")+" — сравнивать не с чем")
@@ -153,6 +231,49 @@ func riskLines(v pricing.Valuation) []string {
 // crowdedDaysOfSupply is where the standing queue stops being a market and
 // starts being a warehouse: three weeks of flow already listed.
 const crowdedDaysOfSupply = 21
+
+// fillLine states the chance of being out, per horizon.
+//
+// It replaces a single expected-days figure printed to one decimal — "~1.6д",
+// "~4.7д" — whose precision was fiction. That number was a fourteen-day average
+// trade rate divided by a queue that counted the model's whole standing supply,
+// so it was wrong in both halves and confident in neither. Three probabilities
+// are less tidy and much harder to misread: nobody plans around "38%" the way
+// they plan around "1.6 days".
+func fillLine(v pricing.Valuation) string {
+	f := v.Fill
+	if f.BuyersPerDay <= 0 {
+		return "продажа: модель не торгуется — оценить нечем"
+	}
+	line := fmt.Sprintf("продать: 24ч %.0f%% · 72ч %.0f%% · 7д %.0f%%",
+		f.In24h*100, f.In72h*100, f.In7d*100)
+	switch {
+	case f.Cheaper > 0:
+		line += fmt.Sprintf(" · впереди %s", plural(f.Cheaper, "оффер", "оффера", "офферов"))
+	case f.Undercutters > 0:
+		// Worth naming separately: we are first right now, and these are the
+		// people who take that place back.
+		line += fmt.Sprintf(" · рядом %s", plural(f.Undercutters, "продавец", "продавца", "продавцов"))
+	}
+	return line
+}
+
+// exitLadderLine is the executable price per horizon: the most we can ask and
+// still expect to be gone in time. It is the counterpart to fair value and the
+// number a purchase is actually judged against.
+func exitLadderLine(v pricing.Valuation) string {
+	if v.ExitIn72h <= 0 && v.ExitIn7d <= 0 {
+		return ""
+	}
+	part := func(label string, price float64) string {
+		if price <= 0 {
+			return label + " —"
+		}
+		return label + " " + num(price)
+	}
+	return fmt.Sprintf("выход по срокам: %s · %s · %s",
+		part("24ч", v.ExitIn24h), part("72ч", v.ExitIn72h), part("7д", v.ExitIn7d))
+}
 
 // evidenceBlock is the market in four lines: the local queue, the other venues,
 // the tape, and the look. One line each, because the operator is deciding

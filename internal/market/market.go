@@ -36,6 +36,24 @@ const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // nanoGRAM is the denomination both Portals and MRKT quote integer prices in.
 const nanoGRAM = 1_000_000_000
 
+// crossGapLimit is how far one external ask may stand above the previous one and
+// still belong to the same pool of liquidity.
+//
+// It is looser than the local one because these venues are thinner and their
+// queues are genuinely steppier. It is not loose enough to matter for the case
+// it exists for: a queue reading 12.2 / 306 is one listing and one fantasy.
+const crossGapLimit = 0.40
+
+// minReferenceDepth is how many contiguous asks a venue needs before its prices
+// are allowed to mean anything about what a model is worth.
+//
+// One ask is not a market, it is a price somebody typed. The old reference was
+// the median of the first three *whatever they were*, so a queue of 12.2 and 306
+// produced a "reference" of 159.1 — the average of a real listing and a
+// fantasy — and that number then carried a fifth of the weight in price
+// discovery and printed on the card as "+4067% to entry".
+const minReferenceDepth = 2
+
 // Quote is one venue's live sell queue for a model.
 type Quote struct {
 	Venue string
@@ -50,23 +68,60 @@ type Quote struct {
 // Net is what the floor would actually pay out on that venue.
 func (q Quote) Net() float64 { return q.Floor * (1 - q.Fee) }
 
-// Reference is deliberately robust to one bait floor: with enough depth it is
-// the median of the three cheapest real asks. This is a market sanity check,
-// not a promise that a cross-venue transfer can execute instantly.
+// Depth is how many of the cheapest asks the reference is allowed to look at.
+func (q Quote) Depth() int {
+	if len(q.Asks) > 3 {
+		return 3
+	}
+	return len(q.Asks)
+}
+
+// Reference is what this venue says the model is worth, or zero when it has not
+// said anything a price can be built on.
+//
+// Three asks are enough to be robust in both directions at once, which is the
+// whole difficulty: one abandoned listing far *above* the market must not drag
+// the number up, and one bait listing far *below* it must not drag the number
+// down. The median of the three cheapest does both.
+//
+// Two asks cannot do that, and pretending otherwise is what produced the worst
+// number this bot has ever printed. Averaging them turned a queue of 12.2 and
+// 306 into a "reference" of 159.1 — the midpoint of a real listing and a
+// fantasy — which then carried a fifth of the weight in price discovery and
+// appeared on the card as "+4067% to entry". So two asks only speak when they
+// agree with each other, and then they speak with the cheaper one.
+//
+// One ask says nothing at all. It is not a market, it is a price somebody typed.
+// The floor is still shown on the card; it is simply not evidence of a value.
 func (q Quote) Reference() float64 {
+	x := q.sorted()
+	switch {
+	case len(x) < minReferenceDepth:
+		return 0
+	case len(x) == 2:
+		if x[0] <= 0 || x[1] > x[0]*(1+crossGapLimit) {
+			return 0 // they are not describing the same market
+		}
+		return x[0]
+	default:
+		return x[1] // median of the three cheapest
+	}
+}
+
+// Anchor is the cheapest thing actually on offer here. Unlike Reference it does
+// not need depth, because "somebody will sell you one at this price" is a fact
+// about execution even when it is a lonely one.
+func (q Quote) Anchor() float64 {
 	if len(q.Asks) == 0 {
 		return q.Floor
 	}
-	n := len(q.Asks)
-	if n > 3 {
-		n = 3
-	}
-	x := append([]float64(nil), q.Asks[:n]...)
+	return q.sorted()[0]
+}
+
+func (q Quote) sorted() []float64 {
+	x := append([]float64(nil), q.Asks...)
 	sort.Float64s(x)
-	if n%2 == 1 {
-		return x[n/2]
-	}
-	return (x[n/2-1] + x[n/2]) / 2
+	return x
 }
 
 func (q Quote) NetReference() float64 { return q.Reference() * (1 - q.Fee) }
@@ -365,7 +420,15 @@ func newCache[T any](ttl time.Duration) *cache[T] {
 
 // get returns a cached value or loads it, collapsing concurrent lookups of the
 // same key into one request.
-func (c *cache[T]) get(key string, load func() (T, error)) (T, error) {
+//
+// A failure caused by the caller's own deadline is deliberately not stored. Our
+// budget running out says nothing about the venue, and remembering it as an
+// answer was expensive in a way that did not look like a cache problem: one card
+// rendered while the desk was busy left "this venue did not answer" in place for
+// the whole TTL, and that is not a cosmetic gap — it is the cap that holds an
+// optimistic exit down, a heavy score penalty, and a hard block on unattended
+// buying, applied to every listing priced in the next five minutes.
+func (c *cache[T]) get(ctx context.Context, key string, load func() (T, error)) (T, error) {
 	c.mu.Lock()
 	e, ok := c.entries[key]
 	if !ok {
@@ -379,7 +442,15 @@ func (c *cache[T]) get(key string, load func() (T, error)) (T, error) {
 	if !e.at.IsZero() && time.Since(e.at) < c.ttl {
 		return e.value, e.err
 	}
-	e.value, e.err = load()
+	value, err := load()
+	// ctx is consulted as well as the error itself because a rate limiter that
+	// gives up reports its own refusal ("would exceed context deadline"), not the
+	// context's — and that is the most common way a venue read ends when several
+	// cards are priced at once.
+	if err != nil && (ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return value, err
+	}
+	e.value, e.err = value, err
 	e.at = time.Now()
 	return e.value, e.err
 }

@@ -154,7 +154,13 @@ func BuildScore(v Valuation, portfolioFit float64) ScoreBreakdown {
 		NetProfit: v.Net, ExpectedDays: v.ExpectedDays, Confidence: v.Confidence,
 		PortfolioFit: portfolioFit, FXFactor: 1, DepthFactor: 1, CrossFactor: 1, LiquidityFactor: 1,
 	}
-	b.SafetyBuffer = .005 + math.Min(.03, v.Liq.MADRatio*.15/math.Sqrt(math.Max(float64(v.Liq.Sales), 1))) + math.Min(.01, float64(v.CompetitorsNear)*.001)
+	// The last term is crowding: every seller standing at our price is someone
+	// who can take the fill by moving a hundredth, and each one we have to step
+	// under costs the trade a little of its edge. They are counted across venues
+	// for the same reason the exit is priced across venues — the buyer does not
+	// care which screen the cheaper offer is on.
+	crowd := float64(v.CompetitorsNear + v.CrossCompetitorsNear)
+	b.SafetyBuffer = .005 + math.Min(.03, v.Liq.MADRatio*.15/math.Sqrt(math.Max(float64(v.Liq.Sales), 1))) + math.Min(.01, crowd*.001)
 	b.FillProbability = 1 / (1 + math.Max(v.ExpectedDays, 0)/3)
 
 	if v.FX.Valid {
@@ -224,7 +230,7 @@ func sizeFactor(v Valuation) float64 {
 func evidenceQuality(v Valuation, b ScoreBreakdown, portfolioFit float64) float64 {
 	dims := []float64{
 		clamp(v.Confidence, .01, 1),      // how much history there is
-		clamp(b.DepthFactor, .01, 1.18),  // whether there is a queue to sell into
+		clamp(b.DepthFactor, .01, 1),     // whether there is a queue to sell into
 		clamp(b.CrossFactor, .01, 1.05),  // whether other venues corroborate
 		clamp(b.LiquidityFactor, .01, 1), // whether the model actually trades
 	}
@@ -289,6 +295,33 @@ func depthFactor(v Valuation, b *ScoreBreakdown) float64 {
 	return f
 }
 
+// crossCrowding is how much of our "cheapest offer on screen" advantage is real.
+//
+// The fast exit is fast for exactly one reason: it undercuts every offer a buyer
+// could take instead. How much that is worth depends on what stands immediately
+// behind it. One external offer a few percent above us is a queue we are in
+// front of; five stacked inside the same band is a price level, and the first
+// seller to notice takes the position straight back — on a venue we cannot even
+// reprice on.
+//
+// This is the half of the picture the score has been missing. Once another
+// venue's queue caps the exit, depthFactor steps aside (the local hole is no
+// longer load-bearing, and penalising it would be scoring a number the exit does
+// not rest on) and nothing took its place: the queue we actually have to sell
+// through went unexamined precisely when it was the one deciding the price.
+func crossCrowding(v Valuation) float64 {
+	switch {
+	case v.CrossCompetitorsNear >= 4:
+		return .7
+	case v.CrossCompetitorsNear >= 2:
+		return .85
+	case v.CrossCompetitorsNear == 1:
+		return .95
+	default:
+		return 1
+	}
+}
+
 // crossFactor is how much the rest of the market corroborates the trade.
 //
 // Cross-market depth is what bounds the exit, so its absence is not neutral. A
@@ -318,6 +351,15 @@ func crossFactor(v Valuation) float64 {
 	// proportion to how far apart the venues are.
 	if v.CrossDivergence > 0 {
 		f *= clamp(1-v.CrossDivergence, .4, 1)
+	}
+	f *= crossCrowding(v)
+	// An offer on another venue that is *already* cheaper than the exit we are
+	// quoting is not corroboration, it is a contradiction: the walkaway that
+	// bounds the fast exit was supposed to be the cheapest of them. It survives
+	// only when something else — the history clamp, the entry guard — set the
+	// price instead, and then "we can sell quickly" is no longer established.
+	if v.CrossAsksBelowExit > 0 {
+		f *= .6
 	}
 	return f
 }

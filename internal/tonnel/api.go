@@ -403,20 +403,33 @@ func (c *Client) Balance(ctx context.Context) (*Balance, error) {
 }
 
 // pickFloat digs a numeric value out of an untyped map, trying several key
-// spellings and descending one level into nested objects.
+// spellings and descending into nested objects.
+//
+// The descent carries the caller's own key list with it, and that is the fix
+// rather than a detail. It used to look for a fixed "amount"/"value"/"balance"
+// inside a nested object, so the single most likely shape this endpoint can
+// return — {"balance": {"gram": 25.4}} — matched the outer "balance" key,
+// descended, found none of those three names, and reported a balance of zero. A
+// zero balance is not a harmless misread: spendable() multiplies it against the
+// ticket limit, so every signal above nothing is rejected as unaffordable and
+// the desk goes quiet with no error anywhere to explain why.
 func pickFloat(m map[string]any, keys ...string) float64 {
+	// Direct hits first, at this level, before descending anywhere: an outer
+	// "balance" that is itself a number must win over a nested one.
 	for _, k := range keys {
-		v, ok := m[k]
+		if v, ok := m[k]; ok {
+			if f, ok := toFloat(v); ok {
+				return f
+			}
+		}
+	}
+	for _, k := range append(keys, "balance", "balances", "data", "result", "amount", "value") {
+		nested, ok := m[k].(map[string]any)
 		if !ok {
 			continue
 		}
-		if f, ok := toFloat(v); ok {
+		if f := pickFloat(nested, append(keys, "amount", "value")...); f != 0 {
 			return f
-		}
-		if nested, ok := v.(map[string]any); ok {
-			if f := pickFloat(nested, "amount", "value", "balance"); f != 0 {
-				return f
-			}
 		}
 	}
 	return 0
