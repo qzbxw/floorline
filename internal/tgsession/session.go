@@ -204,9 +204,18 @@ func (c *Client) dialer() dcs.DialFunc {
 // a separate command the operator runs once, rather than something the desk
 // attempts on its own at three in the morning.
 func (c *Client) Login(ctx context.Context, ask auth.UserAuthenticator) error {
-	return c.client().Run(ctx, func(ctx context.Context) error {
+	// One client, used for both the connection and the authorisation.
+	//
+	// This read `c.client().Run(ctx, func(...) { c.client().Auth()... })`, and
+	// client() builds a *new* client every call — so the flow authenticated a
+	// second, unconnected client while the connected one sat idle. Nothing ever
+	// asked Telegram for a code, and the command then printed "Готово. Сессия
+	// лежит в …" over a session that had never been authorised. Every attempt
+	// to log in had been failing that way, silently, and reporting success.
+	tg := c.client()
+	return tg.Run(ctx, func(ctx context.Context) error {
 		flow := auth.NewFlow(ask, auth.SendCodeOptions{})
-		if err := c.client().Auth().IfNecessary(ctx, flow); err != nil {
+		if err := tg.Auth().IfNecessary(ctx, flow); err != nil {
 			return fmt.Errorf("tgsession: login: %w", err)
 		}
 		// Recorded only here, where authorisation was actually observed.
@@ -235,8 +244,15 @@ func (c *Client) Start(ctx context.Context) error {
 
 	started := make(chan error, 1)
 	go func() {
-		err := c.client().Run(runCtx, func(ctx context.Context) error {
-			status, err := c.client().Auth().Status(ctx)
+		// One client for the whole session, as in Login and for the same
+		// reason: client() builds a new one each call, so asking a second
+		// instance for its auth status — and handing a third one's API to every
+		// caller — meant nothing here was ever attached to the connection that
+		// Run had actually opened. That is what "connection is not up" was, on
+		// every mini-app payload the marketplaces asked for.
+		tg := c.client()
+		err := tg.Run(runCtx, func(ctx context.Context) error {
+			status, err := tg.Auth().Status(ctx)
 			if err != nil {
 				started <- err
 				return err
@@ -247,7 +263,7 @@ func (c *Client) Start(ctx context.Context) error {
 				return err
 			}
 			c.mu.Lock()
-			c.api = c.client().API()
+			c.api = tg.API()
 			c.lastSeen = time.Now()
 			c.mu.Unlock()
 			close(c.ready)
