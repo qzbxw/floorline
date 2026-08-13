@@ -150,3 +150,78 @@ func asAPIError(err error, target **APIError) bool {
 	}
 	return ok
 }
+
+// Tonnel throttles with an HTML page carrying a meta-refresh, and 200 bytes of
+// that markup was being quoted into Telegram — inside position cards, inside
+// portfolio advice, inside every block notification. The one fact worth keeping
+// is where it wants us to go.
+func TestHTMLThrottlePageIsSummarisedNotQuoted(t *testing.T) {
+	page := []byte(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Refresh" content="3; url='https://rs-market.tonnel.network'" />
+    <title>Redirecting...</title>
+</head>
+<body>go away</body></html>`)
+
+	got := extractMessage(page)
+	if strings.Contains(got, "<") {
+		t.Errorf("markup leaked into the message: %q", got)
+	}
+	if !strings.Contains(got, "rs-market.tonnel.network") {
+		t.Errorf("message = %q, want the redirect target kept", got)
+	}
+	if len(got) > 80 {
+		t.Errorf("message is %d chars; it is meant to fit a chat line: %q", len(got), got)
+	}
+}
+
+// A refusal from one front end is not a refusal from Tonnel. The alternate host
+// sat in the constants unused while every read failed for hours.
+func TestReadHostRotatesAndWrapsAround(t *testing.T) {
+	c, err := New(Options{AuthData: "x", ReadHosts: []string{"a.example", "b.example"}})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if got := c.ReadHost(); got != "a.example" {
+		t.Errorf("first host = %q", got)
+	}
+	if got := c.rotateReadHost(); got != "b.example" {
+		t.Errorf("after one rotation = %q", got)
+	}
+	if got := c.rotateReadHost(); got != "a.example" {
+		t.Errorf("rotation must wrap, got %q", got)
+	}
+	// Only the label is redirected; a host named outright is left alone.
+	if got := c.resolveHost(HostWrite); got != HostWrite {
+		t.Errorf("write host was rewritten to %q", got)
+	}
+	if got := c.resolveHost(HostRead); got != c.ReadHost() {
+		t.Errorf("read label resolved to %q, want the current candidate", got)
+	}
+}
+
+// A single candidate must not divide by zero or spin.
+func TestSingleReadHostIsStable(t *testing.T) {
+	c, err := New(Options{AuthData: "x", ReadHosts: []string{"only.example"}})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if got := c.rotateReadHost(); got != "only.example" {
+		t.Errorf("rotation with one host = %q", got)
+	}
+}
+
+// The marketplace web front end answers 405 to the API paths, so it is not a
+// drop-in replacement and must not be in the rotation by default.
+func TestDefaultReadHostsExcludeTheWebFrontEnd(t *testing.T) {
+	for _, h := range DefaultReadHosts() {
+		if h == HostReadRS {
+			t.Errorf("%s answers 405 to POST /api/pageGifts; rotating into it fails requests for no reason", h)
+		}
+	}
+	if len(DefaultReadHosts()) < 2 {
+		t.Error("there has to be somewhere to rotate to")
+	}
+}

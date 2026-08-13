@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,10 +22,18 @@ import (
 )
 
 // Hosts. Reads and writes live on different domains.
+//
+// HostRead is a *label* rather than a fixed address: callers pass it and the
+// client resolves it to whichever candidate is currently answering. Tonnel has
+// moved this endpoint before and did it again on 13 Aug, when every read began
+// returning HTTP 200-shaped 429s carrying a redirect to rs-market — with the
+// alternate host sitting in this file, unused, the whole time.
 const (
 	HostRead    = "gifts2.tonnel.network"
 	HostReadAlt = "gifts3.tonnel.network"
-	HostWrite   = "gifts.coffin.meme"
+	// HostReadRS is the host Tonnel's own throttle page redirects to.
+	HostReadRS = "rs-market.tonnel.network"
+	HostWrite  = "gifts.coffin.meme"
 
 	// DefaultOrigin is the front end a real browser sends these requests from.
 	// Tonnel moved from market.tonnel.network to marketplace.tonnel.network;
@@ -50,6 +59,9 @@ type Options struct {
 	Proxy     string
 	// Origin overrides the front-end origin sent with every request.
 	Origin string
+	// ReadHosts overrides the read front ends HostRead rotates through. Empty
+	// means DefaultReadHosts.
+	ReadHosts []string
 
 	// OnBlocked fires when the anti-bot layer starts refusing requests, so the
 	// caller can quiesce pollers and disarm auto-buy.
@@ -69,6 +81,12 @@ type Client struct {
 	userID atomic.Int64
 
 	origin string
+
+	// readHosts are the candidates HostRead resolves to, and readIdx is the one
+	// currently answering. Rotation happens on a block, so an endpoint that has
+	// moved costs one failed request rather than an outage.
+	readHosts []string
+	readIdx   atomic.Int32
 
 	blockedStreak atomic.Int32
 	lastOK        atomic.Int64 // unix nanos of the last successful call
@@ -110,16 +128,55 @@ func New(o Options) (*Client, error) {
 	}
 
 	c := &Client{
-		http:     hc,
-		origin:   strings.TrimSuffix(o.Origin, "/"),
-		readLim:  rate.NewLimiter(rate.Limit(o.ReadRPS), o.ReadBurst),
-		writeLim: rate.NewLimiter(rate.Limit(1), 2),
+		http:      hc,
+		origin:    strings.TrimSuffix(o.Origin, "/"),
+		readHosts: o.ReadHosts,
+		readLim:   rate.NewLimiter(rate.Limit(o.ReadRPS), o.ReadBurst),
+		writeLim:  rate.NewLimiter(rate.Limit(1), 2),
 
 		onBlocked:     o.OnBlocked,
 		onAuthExpired: o.OnAuthExpired,
 	}
+	if len(c.readHosts) == 0 {
+		c.readHosts = DefaultReadHosts()
+	}
 	c.SetAuth(o.AuthData)
 	return c, nil
+}
+
+// DefaultReadHosts lists the read front ends in the order they are tried.
+//
+// HostReadRS is deliberately not among them. Tonnel's throttle page redirects
+// there, which looks like a migration notice, but probing it answers 405 to
+// POST /api/pageGifts: it is the marketplace web front end, not the API. Since
+// 405 is a business rejection rather than a block, keeping it in the rotation
+// would fail every third request for no reason. It stays exported so
+// TONNEL_READ_HOSTS can reach it the day that changes.
+func DefaultReadHosts() []string { return []string{HostRead, HostReadAlt} }
+
+// ReadHost is the candidate currently in use.
+func (c *Client) ReadHost() string {
+	return c.readHosts[int(c.readIdx.Load())%len(c.readHosts)]
+}
+
+// rotateReadHost moves to the next candidate and reports it.
+//
+// Only a block rotates: a business rejection means the host answered us
+// perfectly well and simply said no, and moving on that would spread a bad
+// request across every front end Tonnel has.
+func (c *Client) rotateReadHost() string {
+	if len(c.readHosts) < 2 {
+		return c.ReadHost()
+	}
+	return c.readHosts[int(c.readIdx.Add(1))%len(c.readHosts)]
+}
+
+// resolveHost turns the HostRead label into the address to call.
+func (c *Client) resolveHost(host string) string {
+	if host == HostRead {
+		return c.ReadHost()
+	}
+	return host
 }
 
 // SetAuth swaps the authData at runtime (the /auth command) and re-derives the
@@ -249,6 +306,12 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 			}
 			if ae.IsBlocked() {
 				n := c.blockedStreak.Add(1)
+				// A refusal from one front end is not a refusal from Tonnel.
+				// Move to the next candidate before backing off, so a moved
+				// endpoint recovers on the retry we were making anyway.
+				if !o.write {
+					c.rotateReadHost()
+				}
 				if n >= 3 && c.onBlocked != nil {
 					c.onBlocked(lastErr)
 				}
@@ -272,7 +335,9 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 }
 
 func (c *Client) do(ctx context.Context, o callOpts, payload []byte) error {
-	endpoint := "https://" + o.host + o.path
+	// Resolved per attempt, not once per call: a retry after a block has to go
+	// to the candidate the rotation just picked.
+	endpoint := "https://" + c.resolveHost(o.host) + o.path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("build request %s: %w", o.path, err)
@@ -381,8 +446,31 @@ func extractMessage(body []byte) string {
 		}
 		return ""
 	}
-	if bytes.Contains(bytes.ToLower(t), []byte("cloudflare")) {
+	lower := bytes.ToLower(t)
+	if bytes.Contains(lower, []byte("cloudflare")) {
 		return "cloudflare challenge"
 	}
+	// An HTML body is a front end talking to a browser, not an API answering
+	// us. Two hundred characters of it ended up quoted in Telegram — inside
+	// position cards, inside portfolio advice, inside every block notification —
+	// where it buried the one fact that mattered. Summarise it instead, keeping
+	// the redirect target, which is how a moved endpoint announces itself.
+	if bytes.HasPrefix(lower, []byte("<!doctype html")) || bytes.HasPrefix(lower, []byte("<html")) {
+		if to := redirectTarget(t); to != "" {
+			return "страница-редирект на " + to
+		}
+		return "страница вместо ответа API"
+	}
 	return truncate(strings.TrimSpace(string(t)), 200)
+}
+
+// redirectTarget pulls the destination out of a meta-refresh page, which is how
+// Tonnel's throttle page points at whichever host it wants us on.
+var metaRefresh = regexp.MustCompile(`(?i)url=['"]?(https?://[^'"\s>]+)`)
+
+func redirectTarget(body []byte) string {
+	if m := metaRefresh.FindSubmatch(body); m != nil {
+		return strings.TrimSuffix(string(m[1]), "/")
+	}
+	return ""
 }

@@ -68,6 +68,10 @@ type App struct {
 	// alertCooldown throttles the non-trade alerts (undercut, stale, sweep)
 	// which have no natural dedupe key in the database.
 	alertCooldown map[string]time.Time
+	// blocked is whether the anti-bot layer is currently refusing us, and
+	// blockEpisodes counts consecutive blocks so the pause can escalate.
+	blocked       bool
+	blockEpisodes int
 }
 
 // collectionRotation walks the collection list a few at a time, because trade
@@ -112,6 +116,8 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	a.api, err = tonnel.New(tonnel.Options{
 		AuthData:      auth,
 		Origin:        cfg.TonnelOrigin,
+		ReadHosts:     cfg.TonnelReadHosts,
+		Proxy:         cfg.TonnelProxy,
 		Timeout:       cfg.HTTPTimeout,
 		ReadRPS:       cfg.ReadRPS,
 		ReadBurst:     cfg.ReadBurst,
@@ -323,6 +329,11 @@ func (a *App) loop(ctx context.Context, name string, interval time.Duration, fn 
 		}
 		a.mu.Unlock()
 
+		// A poller completing is the only evidence that the block has lifted,
+		// so recovery is noticed here rather than guessed from a timer.
+		if err == nil {
+			a.noteRecovered()
+		}
 		if err != nil && ctx.Err() == nil {
 			log.Warn().Err(err).Str("poller", name).Msg("poll failed")
 		}
@@ -399,13 +410,59 @@ func (a *App) throttle(key string, every time.Duration) bool {
 	return true
 }
 
+// blockBackoff is how long unattended buying stays paused, escalating with each
+// consecutive episode.
+//
+// Five flat minutes was not a cooling-off period, it was a metronome: the pause
+// expired long before Tonnel relented, the pollers went straight back in, and
+// the desk announced the same block every fifteen minutes all night.
+var blockBackoff = []time.Duration{5 * time.Minute, 15 * time.Minute, 45 * time.Minute, 2 * time.Hour}
+
+// onBlocked quiesces the desk when the anti-bot layer starts refusing.
+//
+// It reports the *transition*, not the condition. The old version re-announced
+// an ongoing block on a timer, which is noise precisely when the operator can
+// do nothing about it; recovery — the thing actually worth knowing — was never
+// announced at all.
 func (a *App) onBlocked(err error) {
-	a.rm.Pause(5*time.Minute, "блок антибота")
-	if a.throttle("blocked", 15*time.Minute) {
-		a.notify("⚠️ <b>Tonnel режет запросы</b> (Cloudflare или рейт-лимит).\n" +
-			bot.Esc(err.Error()) +
-			"\n\nПоллеры сбавляют темп. Автобай на паузе 5 минут.")
+	a.mu.Lock()
+	first := !a.blocked
+	a.blocked = true
+	if first {
+		a.blockEpisodes++
 	}
+	idx := a.blockEpisodes - 1
+	if idx >= len(blockBackoff) {
+		idx = len(blockBackoff) - 1
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	pause := blockBackoff[idx]
+	a.mu.Unlock()
+
+	a.rm.Pause(pause, "блок антибота")
+	if !first {
+		return
+	}
+	a.notify(fmt.Sprintf(
+		"⚠️ <b>Tonnel отказывает</b>\n%s\n\nПробую другие хосты, поллеры сбавляют темп. Автобай на паузе %s.\nСкажу, когда отпустит.",
+		bot.Esc(err.Error()), dur(pause)))
+}
+
+// noteRecovered clears the blocked state after a successful call and says so
+// once. The desk going quiet and the desk being stuck look identical from the
+// chat, so the end of a block is worth exactly one message.
+func (a *App) noteRecovered() {
+	a.mu.Lock()
+	if !a.blocked {
+		a.mu.Unlock()
+		return
+	}
+	a.blocked = false
+	a.blockEpisodes = 0
+	a.mu.Unlock()
+	a.notify(fmt.Sprintf("✅ <b>Tonnel снова отвечает</b> — читаю с %s", bot.Esc(a.api.ReadHost())))
 }
 
 func (a *App) onAuthExpired(err error) {

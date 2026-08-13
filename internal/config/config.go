@@ -58,6 +58,15 @@ type Config struct {
 	// TonnelOrigin is the front-end origin sent with every Tonnel request.
 	// Empty means the client's default.
 	TonnelOrigin string
+	// TonnelReadHosts overrides the read front ends, comma separated. The
+	// client rotates through them on a block, so this is the escape hatch when
+	// Tonnel moves the endpoint again and the built-in list has not caught up.
+	TonnelReadHosts []string
+	// TonnelProxy routes Tonnel traffic through another egress. When the
+	// refusals are per-IP rather than per-request — which is what a 429 on
+	// every endpoint, from a stopped service, one request in, means — no amount
+	// of backing off helps and a different address is the only fix.
+	TonnelProxy string
 
 	// Cross-market comparison credentials. Each venue is independent: with
 	// none of them set, cards simply omit the comparison line.
@@ -157,13 +166,15 @@ func LoadDotEnv(path string) error {
 // Load builds a Config from the environment, applying the documented defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		BotToken:     os.Getenv("TELEGRAM_BOT_TOKEN"),
-		OwnerID:      envInt64("TELEGRAM_OWNER_ID", 0),
-		AuthData:     os.Getenv("TONNEL_AUTH_DATA"),
-		TonnelOrigin: os.Getenv("TONNEL_ORIGIN"),
-		PortalsAuth:  os.Getenv("PORTALS_AUTH_DATA"),
-		MrktInit:     os.Getenv("MRKT_INIT_DATA"),
-		MrktToken:    os.Getenv("MRKT_TOKEN"),
+		BotToken:        os.Getenv("TELEGRAM_BOT_TOKEN"),
+		OwnerID:         envInt64("TELEGRAM_OWNER_ID", 0),
+		AuthData:        os.Getenv("TONNEL_AUTH_DATA"),
+		TonnelOrigin:    os.Getenv("TONNEL_ORIGIN"),
+		TonnelReadHosts: envList("TONNEL_READ_HOSTS"),
+		TonnelProxy:     os.Getenv("TONNEL_PROXY"),
+		PortalsAuth:     os.Getenv("PORTALS_AUTH_DATA"),
+		MrktInit:        os.Getenv("MRKT_INIT_DATA"),
+		MrktToken:       os.Getenv("MRKT_TOKEN"),
 
 		TelegramAppID:   envInt("TELEGRAM_APP_ID", 0),
 		TelegramAppHash: os.Getenv("TELEGRAM_APP_HASH"),
@@ -287,6 +298,21 @@ func envStr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envList reads a comma-separated setting, dropping blanks.
+func envList(k string) []string {
+	raw := strings.TrimSpace(os.Getenv(k))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func envFloat(k string, def float64) float64 {
