@@ -23,6 +23,7 @@ import (
 	"floorline/internal/app"
 	"floorline/internal/config"
 	"floorline/internal/logx"
+	"floorline/internal/store"
 )
 
 func main() {
@@ -61,7 +62,7 @@ func main() {
 
 func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	switch cmd {
-	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history", "val", "login", "scan":
+	case "run", "smoke", "backfill", "dump", "portfolio", "gram", "history", "val", "login", "scan", "health":
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -71,6 +72,23 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 	// that happens before any of that works.
 	if cmd == "login" {
 		return app.Login(ctx, cfg, os.Stdin, os.Stdout)
+	}
+
+	// The container health probe. It deliberately touches only what the process
+	// cannot run without and nothing that leaves the machine: a marketplace
+	// throttling us is not the container being unhealthy, and restarting on it
+	// would turn a slow morning into a crash loop.
+	if cmd == "health" {
+		st, err := store.Open(cfg.DBPath)
+		if err != nil {
+			return fmt.Errorf("database unavailable: %w", err)
+		}
+		defer st.Close()
+		if _, err := st.CountSales(ctx); err != nil {
+			return fmt.Errorf("database unreadable: %w", err)
+		}
+		fmt.Println("ok")
+		return nil
 	}
 
 	if err := cfg.RequireAuth(); err != nil {
@@ -222,6 +240,7 @@ Commands:
   scan [коллекция]  sweep the standing book for mispriced lots
   login      sign in to Telegram once, so the other marketplaces can be
              reached through their mini apps instead of as a bare API
+  health     check the database opens and reads; the container probe
   dump <x>   print one endpoint's raw JSON (feed, sales, sales-all, balance, mygifts)
 
 Flags:

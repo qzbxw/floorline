@@ -487,6 +487,7 @@ func (b *Bot) registerCallbacks() {
 			return c.Respond(&tele.CallbackResponse{Text: "ошибка кнопки", ShowAlert: true})
 		}
 		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
+		_ = b.editWith(c, Text("⏳ Читаю рынок…"))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -498,6 +499,17 @@ func (b *Bot) registerCallbacks() {
 
 	tb.Handle(&tele.Btn{Unique: cbRefresh}, func(c tele.Context) error {
 		_ = c.Respond(&tele.CallbackResponse{Text: "загружаю…"})
+		// Say something on screen before going to the network.
+		//
+		// The callback answer only stops the button spinning inside Telegram;
+		// the message itself sat unchanged until every book fetch and
+		// cross-market lookup behind the view had finished, which against a
+		// throttled marketplace is tens of seconds of a screen that looks
+		// broken. A placeholder costs one edit and turns "did that even
+		// register" into "it is working".
+		placeholder := loadingText(strings.TrimSpace(c.Data()))
+		_ = b.editWith(c, Text(placeholder))
+
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
@@ -614,6 +626,30 @@ func (b *Bot) registerCallbacks() {
 	})
 }
 
+// loadingText names what is being fetched, so the wait is legible rather than
+// merely visible. A spinner that says nothing is indistinguishable from a bot
+// that has hung.
+func loadingText(view string) string {
+	switch view {
+	case "pos", "portfolio":
+		return "⏳ Переоцениваю позиции…"
+	case "scan":
+		return "⏳ Сканирую рынок… это до полуминуты"
+	case "trade", "trade_reset":
+		return "⏳ Собираю сессию…"
+	case "pnl":
+		return "⏳ Считаю PnL…"
+	case "status":
+		return "⏳ Опрашиваю поллеры…"
+	case "gram":
+		return "⏳ Тяну курс GRAM…"
+	case "balance":
+		return "⏳ Читаю баланс…"
+	default:
+		return "⏳ Загружаю…"
+	}
+}
+
 // reply adapts a Reply-producing function into a telebot message handler.
 func (b *Bot) reply(fn func(context.Context, tele.Context) Reply) tele.HandlerFunc {
 	return func(c tele.Context) error {
@@ -642,7 +678,13 @@ func (b *Bot) callback(fn func(context.Context, int64, tele.Context) Reply, edit
 		}
 		// Acknowledge immediately so the button stops spinning while a purchase
 		// is in flight.
-		_ = c.Respond(&tele.CallbackResponse{Text: "working…"})
+		_ = c.Respond(&tele.CallbackResponse{Text: "работаю…"})
+		// A purchase replaces the card, and the replacement can be seconds away
+		// on a slow marketplace. Leaving the original card on screen with a live
+		// Buy button during that window is how a second tap happens.
+		if edit {
+			_ = b.editWith(c, Text("⏳ Отправляю в Tonnel…"))
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()

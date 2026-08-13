@@ -172,3 +172,69 @@ func TestAncientTradeIsNotMistakenForOurPurchase(t *testing.T) {
 		t.Errorf("position = {buy %.3f, source %q}, want an admitted unknown", p.BuyPrice, p.CostSource)
 	}
 }
+
+// Production, 13 Aug: "Продано — Snoop Dogg · Shower Cap. Вход 4.894 → выход
+// 4.87. Нет −0.024 (−0.5%), держали 2с."
+//
+// The gift was bought at 4.87 (4.894 with the referral) and listed at 5.47. The
+// "sale" was our own purchase read back off the tape: the marketplace stamps a
+// trade when it books it, a second or two after we recorded sending the order,
+// so "the newest trade after bought_at" matched it perfectly. The position was
+// closed at a small loss while it was still on the market.
+func TestOurOwnPurchaseIsNotBookedAsTheSale(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	p := store.Position{
+		GiftID: 21, BuyPrice: 4.894, BoughtAt: now,
+		ListPrice: 5.47, ListedAt: now, Status: store.StatusListed,
+	}
+
+	// The tape's record of our own purchase: the ask, booked two seconds late.
+	if !ourAcquisition(p, store.Trade{Price: 4.87, TS: now.Add(2 * time.Second)}, .005) {
+		t.Error("our own purchase was not recognised")
+	}
+	// The real exit, at the price we listed at.
+	if ourAcquisition(p, store.Trade{Price: 5.47, TS: now.Add(3 * time.Minute)}, .005) {
+		t.Error("a sale at our ask was mistaken for the purchase")
+	}
+	// Same price much later is a different trade — the gift came back and went
+	// again — and must not be filtered out.
+	if ourAcquisition(p, store.Trade{Price: 4.87, TS: now.Add(2 * time.Hour)}, .005) {
+		t.Error("an unrelated later trade was filtered as the purchase")
+	}
+	// A position with no known entry cannot make this judgement, and must not
+	// pretend to: filtering on a guess would hide real sales.
+	blank := store.Position{GiftID: 22}
+	if ourAcquisition(blank, store.Trade{Price: 4.87, TS: now}, .005) {
+		t.Error("filtered a trade for a position with no recorded entry")
+	}
+}
+
+// The end-to-end shape of the same bug: reconcile sees the gift gone, the tape
+// holds only our purchase, and the position must go to `missing` rather than be
+// booked as a sale.
+func TestPositionWithOnlyItsPurchaseOnTapeGoesMissingNotSold(t *testing.T) {
+	ctx := context.Background()
+	a, st := lifecycleApp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	key := tonnel.ModelKey{Name: "Snoop Dogg", Model: "Shower Cap"}
+
+	if err := st.UpsertPosition(ctx, store.Position{
+		GiftID: 21, GiftNum: 21, Key: key, BuyPrice: 4.894, BoughtAt: now,
+		CostSource: "floorline", CostConfidence: 1,
+		ListPrice: 5.47, ListedAt: now, Status: store.StatusListed, Source: "auto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedSale(t, st, 21, key, 4.87, now.Add(2*time.Second))
+
+	p, _ := st.GetPosition(ctx, 21)
+	a.closePosition(ctx, *p, now.Add(time.Minute))
+
+	got, _ := st.GetPosition(ctx, 21)
+	if got.Status == store.StatusSold {
+		t.Fatalf("position closed at %.3f from its own purchase", got.SellPrice)
+	}
+	if got.Status != store.StatusMissing {
+		t.Errorf("status = %q, want missing while the sale is unconfirmed", got.Status)
+	}
+}

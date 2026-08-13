@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"floorline/internal/bot"
@@ -37,6 +39,45 @@ const (
 	actSetCost = "ЗАДАТЬ ВХОД"
 )
 
+// positionBudget is how long any one position may take to price.
+//
+// Every position costs a book fetch and a cross-market lookup, and those are
+// network calls against a marketplace that is sometimes slow and sometimes
+// throttled. Run one after another under a single request deadline, six
+// positions could not finish inside it — so the last ones came back as "не
+// прочитал историю сделок: context deadline exceeded" and the whole view took
+// the better part of a minute to appear.
+const positionBudget = 12 * time.Second
+
+// advisePositions prices a whole book at once.
+//
+// Concurrently, because the calls are independent and the alternative is a
+// latency that grows with the size of the portfolio; and with a budget each,
+// because one unreachable model must cost its own line rather than every line
+// below it. A position that runs out of time comes back as an honest "не
+// успел", which is a different statement from "this cannot be valued".
+func (a *App) advisePositions(ctx context.Context, ps []store.Position, now time.Time) []positionAdvice {
+	out := make([]positionAdvice, len(ps))
+	var wg sync.WaitGroup
+	// Enough to make the view feel instant, few enough not to burst through the
+	// client's rate limiter — which would turn parallelism into throttling.
+	sem := make(chan struct{}, 4)
+	for i, p := range ps {
+		wg.Add(1)
+		go func(i int, p store.Position) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			pctx, cancel := context.WithTimeout(ctx, positionBudget)
+			defer cancel()
+			out[i] = a.advisePosition(pctx, p, now)
+		}(i, p)
+	}
+	wg.Wait()
+	return out
+}
+
 func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Time) positionAdvice {
 	ad := positionAdvice{Position: p, Action: actReview}
 	if p.BuyPrice <= 0 {
@@ -48,9 +89,14 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 	v, err := a.priceGiftWithCost(ctx, g, p.BuyPrice, now)
 	ad.Val = v
 	if err != nil || !v.Valid {
-		if err != nil {
+		switch {
+		case err != nil && errors.Is(err, context.DeadlineExceeded), err != nil && errors.Is(err, context.Canceled):
+			// "context deadline exceeded" tells the operator nothing about
+			// their position; it tells them about our plumbing. Say which it is.
+			ad.Reason = "не успел опросить рынок — Tonnel отвечает медленно, попробуй обновить"
+		case err != nil:
 			ad.Reason = err.Error()
-		} else {
+		default:
 			ad.Reason = v.Reason
 		}
 		return ad
@@ -242,13 +288,12 @@ func (a *App) portfolioText(ctx context.Context) string {
 		return "Портфель пуст. Инвентарь подтянется на следующем опросе."
 	}
 	now := time.Now()
-	ads := make([]positionAdvice, 0, len(ps))
+	ads := a.advisePositions(ctx, ps, now)
 	invested, nav, expectedNet, evDay, weightedDays, daysCapital := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 	collections := map[string]float64{}
 	models := map[string]float64{}
-	for _, p := range ps {
-		ad := a.advisePosition(ctx, p, now)
-		ads = append(ads, ad)
+	for i, p := range ps {
+		ad := ads[i]
 		invested += p.BuyPrice
 		mark := p.ListPrice
 		if ad.Val.Valid {
@@ -309,8 +354,27 @@ func (a *App) portfolioText(ctx context.Context) string {
 			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(ad.Reason))
 			continue
 		}
-		fmt.Fprintf(&b, "   %s → %s · <b>%+.1f%%</b> · ~%s\n",
-			num(p.ListPrice), num(ad.Val.Exit), ad.Val.Edge*100, days(ad.Val.ExpectedDays))
+		// Entry → target, and the percentage between exactly those two.
+		//
+		// This line used to read "4.43 → 4.95 · +17.3%", where 4.43 was the ask,
+		// 4.95 the target and the percentage was measured from the entry — three
+		// numbers from two different comparisons, so the arithmetic on screen
+		// did not work and the position looked mis-valued. The ask belongs here
+		// too, but as its own fact.
+		fmt.Fprintf(&b, "   вход %s → цель %s · <b>%+.1f%%</b> · ~%s\n",
+			num(p.BuyPrice), num(ad.Val.Exit), ad.Val.Edge*100, days(ad.Val.ExpectedDays))
+		if p.ListPrice > 0 {
+			line := fmt.Sprintf("   стоим %s", num(p.ListPrice))
+			if !pricing.SamePrice(p.ListPrice, ad.Val.Exit) {
+				line += fmt.Sprintf(" · переставить на %s", num(ad.Val.Exit))
+			}
+			if costIsProvisional(&p) {
+				line += " · <i>вход угадан, задай /cost</i>"
+			}
+			b.WriteString(line + "\n")
+		} else if costIsProvisional(&p) {
+			b.WriteString("   <i>вход угадан по ленте сделок, задай /cost</i>\n")
+		}
 		if ad.CrossReference > 0 && ad.CrossDivergence > .10 {
 			fmt.Fprintf(&b, "   <i>площадки на %s, расхождение %.0f%%</i>\n", num(ad.CrossReference), ad.CrossDivergence*100)
 		}

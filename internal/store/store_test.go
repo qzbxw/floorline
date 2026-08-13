@@ -289,13 +289,20 @@ func TestSaleLookupNeverReusesAcquisition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	price, _, ok, err := st.SaleForGiftAfter(ctx, 88, now.Add(-30*time.Minute))
-	if err != nil || !ok || price != 12 {
-		t.Fatalf("sale=(%v,%v,%v)", price, ok, err)
+	// Newest first, and several of them: telling our own purchase apart from a
+	// sale needs more than one candidate, because the marketplace stamps our
+	// purchase a moment *after* we recorded making it.
+	trades, err := st.SalesForGiftAfter(ctx, 88, now.Add(-30*time.Minute), 5)
+	if err != nil || len(trades) != 1 || trades[0].Price != 12 {
+		t.Fatalf("trades=%+v err=%v", trades, err)
 	}
-	_, _, ok, err = st.SaleForGiftAfter(ctx, 88, now.Add(time.Minute))
-	if err != nil || ok {
-		t.Fatalf("future lookup ok=%v err=%v", ok, err)
+	trades, err = st.SalesForGiftAfter(ctx, 88, now.Add(-2*time.Hour), 5)
+	if err != nil || len(trades) != 2 || trades[0].Price != 12 || trades[1].Price != 10 {
+		t.Fatalf("trades=%+v err=%v", trades, err)
+	}
+	trades, err = st.SalesForGiftAfter(ctx, 88, now.Add(time.Minute), 5)
+	if err != nil || len(trades) != 0 {
+		t.Fatalf("future lookup trades=%+v err=%v", trades, err)
 	}
 }
 

@@ -1,0 +1,57 @@
+services:
+  floorline:
+    build:
+      context: .
+      target: runtime
+      args:
+        VERSION: ${VERSION:-dev}
+      # Reuse the previous image's layers when rebuilding on the server, where
+      # there is no BuildKit cache to inherit from.
+      cache_from:
+        - floorline:latest
+    image: floorline:latest
+    container_name: floorline
+    restart: unless-stopped
+
+    # The Tonnel session, the bot token and every threshold. Kept out of the
+    # image so a rebuild never bakes a credential into a layer.
+    env_file: .env
+
+    volumes:
+      # The book and the Telegram session. This is the only state that matters;
+      # everything else in the container is disposable.
+      - floorline-data:/data
+
+    # The database is the single point of loss, and SQLite is happiest with a
+    # process that gets a moment to close it. Give the desk time to finish an
+    # in-flight purchase and flush rather than killing it mid-write.
+    stop_grace_period: 30s
+
+    # A trading desk that has quietly died looks exactly like a quiet market, so
+    # let Docker notice and restart it.
+    healthcheck:
+      test: ["CMD", "/floorline", "-env", "/dev/null", "health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # Nothing here needs to be root, write outside /data, or gain privileges.
+    read_only: true
+    # SQLite reaches for a scratch file on some operations, and a read-only root
+    # would fail that in a way that only shows up under load.
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  floorline-data:

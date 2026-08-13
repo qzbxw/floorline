@@ -706,11 +706,20 @@ func (a *App) reconcileOwned(ctx context.Context, g tonnel.Gift, listed bool, no
 // closePosition records a position that has left our inventory, preferring the
 // real sale price from the trade history over the price we listed at.
 func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time) {
-	after := p.BoughtAt
-	price, soldAt, found, err := a.st.SaleForGiftAfter(ctx, p.GiftID, after)
+	trades, err := a.st.SalesForGiftAfter(ctx, p.GiftID, p.BoughtAt, 5)
 	if err != nil {
 		log.Warn().Err(err).Int64("gift", p.GiftID).Msg("confirming position sale failed")
 		return
+	}
+	var price float64
+	var soldAt time.Time
+	var found bool
+	for _, t := range trades {
+		if ourAcquisition(p, t, a.cfg.TonnelFee) {
+			continue
+		}
+		price, soldAt, found = t.Price, t.TS, true
+		break
 	}
 	if !found {
 		if p.Status != store.StatusMissing {
@@ -739,14 +748,48 @@ func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time
 	a.notify(msg)
 }
 
+const (
+	// clockSkew is how far the marketplace's timestamps may sit from ours. Our
+	// own purchase is recorded the instant we send the order; the tape stamps it
+	// when the exchange books it, which is reliably a little later.
+	clockSkew = 5 * time.Minute
+	// entryBand is how close a trade has to be to what we paid before it is
+	// suspected of *being* what we paid. Our purchase prints at the ask, half a
+	// percent under the debit; a genuine sale prints at our own list price,
+	// which min_markup keeps several percent above it. The two do not overlap.
+	entryBand = 0.02
+)
+
+// ourAcquisition reports whether a trade from the tape is the purchase that
+// opened this position rather than the sale that closed it.
+//
+// Both conditions are required. Time alone cannot separate them, because the
+// clocks differ. Price alone cannot either, because a bad trade can exit near
+// its entry. Together they are unambiguous: nothing sells at what we paid,
+// within minutes of when we paid it, except the purchase itself.
+func ourAcquisition(p store.Position, t store.Trade, fee float64) bool {
+	if p.BoughtAt.IsZero() || p.BuyPrice <= 0 {
+		return false
+	}
+	if t.TS.Sub(p.BoughtAt) > clockSkew {
+		return false
+	}
+	ask := p.BuyPrice / (1 + math.Max(fee, 0))
+	return math.Abs(t.Price/ask-1) <= entryBand
+}
+
 func (a *App) snapshotPositionMarks(ctx context.Context, positions []store.Position, now time.Time) {
 	q, _, _ := a.st.LatestGramQuote(ctx)
-	for _, p := range positions {
+	// Priced together, for the same reason the portfolio view is: one slow model
+	// must not eat the whole poller's budget and leave the rest of the book
+	// unmarked.
+	ads := a.advisePositions(ctx, positions, now)
+	for i, p := range positions {
 		events, _ := a.st.PositionEvents(ctx, p.GiftID, 1)
 		if len(events) == 0 {
 			_ = a.st.RecordPositionEvent(ctx, p.GiftID, "tracking_started", p.BuyPrice, p.ListPrice, "existing position adopted by lifecycle tracker", now)
 		}
-		ad := a.advisePosition(ctx, p, now)
+		ad := ads[i]
 		m := store.PositionMark{TS: now, EntryPrice: p.BuyPrice, AskPrice: p.ListPrice, RecommendedExit: ad.Val.Exit, ExternalRef: ad.CrossReference, GramUSD: q.USD, Edge: ad.Val.Edge, ExpectedDays: ad.Val.ExpectedDays, Score: ad.Val.ScoreBreakdown.Total, Action: ad.Action}
 		if stat, _ := a.st.ModelStat(ctx, p.Key); stat != nil {
 			m.ModelFloor = stat.Floor

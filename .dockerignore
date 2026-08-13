@@ -1,0 +1,23 @@
+# The build needs the module files and the Go source. Everything else either
+# bloats the context or must never reach an image layer.
+
+# Credentials and the book. .env holds the Tonnel session and the bot token;
+# the database holds every position and trade.
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+tgsession.json
+
+# Build output — the image builds its own.
+floorline
+floorline.*
+/out
+
+.git
+.gitignore
+*.md
+!README.md
+deploy/

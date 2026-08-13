@@ -864,19 +864,43 @@ func (s *Store) SetRecoveredCostBasis(ctx context.Context, giftID int64, price f
 	return err
 }
 
-// SaleForGiftAfter returns the newest execution after acquisition/listing. It
-// cannot accidentally reuse the acquisition trade as sale proceeds.
-func (s *Store) SaleForGiftAfter(ctx context.Context, giftID int64, after time.Time) (float64, time.Time, bool, error) {
-	var price float64
-	var ts int64
-	err := s.db.QueryRowContext(ctx, `SELECT price,ts FROM sales WHERE gift_id=? AND price>0 AND ts>? ORDER BY ts DESC LIMIT 1`, giftID, unix(after)).Scan(&price, &ts)
-	if err == sql.ErrNoRows {
-		return 0, time.Time{}, false, nil
+// Trade is one execution from the tape.
+type Trade struct {
+	Price float64
+	TS    time.Time
+}
+
+// SalesForGiftAfter returns the newest executions after a cutoff, newest first.
+//
+// It deliberately returns several rather than one. The caller has to tell our
+// own acquisition apart from a genuine sale, and a bare "newest after
+// bought_at" cannot: the timestamps come from the marketplace's clock, not
+// ours, so our own purchase lands a second or two *after* the moment we
+// recorded buying it and matches the filter perfectly. That is how a Snoop Dogg
+// bought at 4.894 and listed at 5.47 was booked as sold for 4.87 — the price we
+// had just paid — two seconds after acquisition.
+func (s *Store) SalesForGiftAfter(ctx context.Context, giftID int64, after time.Time, limit int) ([]Trade, error) {
+	if limit <= 0 {
+		limit = 5
 	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT price,ts FROM sales WHERE gift_id=? AND price>0 AND ts>? ORDER BY ts DESC LIMIT ?`,
+		giftID, unix(after), limit)
 	if err != nil {
-		return 0, time.Time{}, false, err
+		return nil, err
 	}
-	return price, fromUnix(ts), true, nil
+	defer rows.Close()
+	var out []Trade
+	for rows.Next() {
+		var t Trade
+		var ts int64
+		if err := rows.Scan(&t.Price, &ts); err != nil {
+			return nil, err
+		}
+		t.TS = fromUnix(ts)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // PositionExposure returns invested cost and counts for concentration checks.

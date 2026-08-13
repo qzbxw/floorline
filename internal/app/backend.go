@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -330,10 +331,27 @@ func (a *App) histText(ctx context.Context, collection, model string) string {
 }
 
 // Val prices one listing in full, including the gates it fails.
+// slowMarketHint turns a plumbing failure into something the operator can act
+// on.
+//
+// "Не смог достать этот лот: context deadline exceeded" names a Go primitive
+// and nothing else — not what failed, not whether to retry, not whether the
+// gift exists. Two of those three answers are usually available.
+func slowMarketHint(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "Tonnel не ответил вовремя. Он сейчас режет запросы — попробуй ещё раз через минуту."
+	case tonnel.RateLimited(err):
+		return "Tonnel режет запросы. Подожди и повтори."
+	default:
+		return bot.Esc(err.Error())
+	}
+}
+
 func (a *App) valText(ctx context.Context, giftID int64) string {
 	g, err := a.api.GiftData(ctx, giftID)
 	if err != nil {
-		return "Не смог достать этот лот: " + bot.Esc(err.Error())
+		return "Не смог достать этот лот.\n" + slowMarketHint(err)
 	}
 	if g.GiftID.Int() == 0 {
 		g.GiftID = tonnel.FlexInt(giftID)
@@ -342,7 +360,7 @@ func (a *App) valText(ctx context.Context, giftID int64) string {
 	now := time.Now()
 	v, err := a.priceGift(ctx, *g, now)
 	if err != nil {
-		return "Не смог оценить лот: " + bot.Esc(err.Error())
+		return "Не смог оценить лот.\n" + slowMarketHint(err)
 	}
 
 	dec, err := a.det.Evaluate(ctx, *g, a.rm.Limits(), now)
@@ -355,44 +373,6 @@ func (a *App) valText(ctx context.Context, giftID int64) string {
 		fails, autoFails = a.det.GatesFor(v, a.rm.Limits())
 	}
 	return a.renderValuation(ctx, *g, v, fails, autoFails)
-}
-
-// Positions lists open inventory with live marks.
-func (a *App) positionsText(ctx context.Context) string {
-	positions, err := a.st.TrackedPositions(ctx)
-	if err != nil {
-		return "Не смог прочитать позиции: " + bot.Esc(err.Error())
-	}
-	if len(positions) == 0 {
-		return "Открытых позиций нет."
-	}
-
-	now := time.Now()
-	var b strings.Builder
-	fmt.Fprintf(&b, "<b>Позиций на контроле: %d</b>\n", len(positions))
-	for _, p := range positions {
-		if p.Status == store.StatusMissing {
-			fmt.Fprintf(&b, "\n<b>%s</b>\n⚠️ пропал с %s, продажа не зафиксирована · вход %s\n<code>/history %d</code>\n", bot.Esc(p.Key.String()), dt(p.MissingSince), num(p.BuyPrice), p.GiftID)
-			continue
-		}
-		ad := a.advisePosition(ctx, p, now)
-		fmt.Fprintf(&b, "\n<b>%s</b>\n", bot.Esc(p.Key.String()))
-		fmt.Fprintf(&b, "вход %s · держим %s · %s\n", num(p.BuyPrice), dur(now.Sub(p.BoughtAt)), p.Status)
-		if p.ListPrice > 0 {
-			fmt.Fprintf(&b, "аск %s\n", num(p.ListPrice))
-		}
-		if ad.Val.Valid {
-			fmt.Fprintf(&b, "рекомендую %s · %s · реальный нет %s (%+.1f%%)\n", num(ad.Val.Exit), ad.Action, num(ad.Val.Net), ad.Val.Edge*100)
-			if ad.CrossReference > 0 {
-				fmt.Fprintf(&b, "внешняя глубина асков %s\n", num(ad.CrossReference))
-			}
-		}
-		if p.Note != "" {
-			fmt.Fprintf(&b, "<i>%s</i>\n", bot.Esc(p.Note))
-		}
-		fmt.Fprintf(&b, "<code>/relist %d</code>\n", p.GiftID)
-	}
-	return b.String()
 }
 
 // PnL reports realised and unrealised profit, net of fees.
