@@ -27,7 +27,9 @@ import (
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
+	"golang.org/x/net/proxy"
 )
 
 // initDataTTL is how long a payload is reused before it is fetched again.
@@ -52,6 +54,9 @@ var (
 // Config is what the client needs to exist. AppID and AppHash come from
 // my.telegram.org; without them there is no MTProto connection at all.
 type Config struct {
+	// Proxy routes MTProto through a SOCKS5 endpoint. Empty means direct.
+	Proxy string
+
 	AppID       int
 	AppHash     string
 	Phone       string
@@ -151,10 +156,46 @@ func (c *Client) Status() Status {
 }
 
 // client builds the underlying telegram client with a file-backed session.
+//
+// MTProto is its own protocol on port 443, not HTTPS, and networks that leave
+// the port open can still refuse it: this server holds a TCP connection to a
+// data centre and then times out mid-handshake, which is what deep packet
+// inspection looks like from the inside. A SOCKS5 dialer moves the whole
+// conversation somewhere that is not being inspected.
 func (c *Client) client() *telegram.Client {
-	return telegram.NewClient(c.cfg.AppID, c.cfg.AppHash, telegram.Options{
+	opts := telegram.Options{
 		SessionStorage: &telegram.FileSessionStorage{Path: c.cfg.SessionFile},
-	})
+	}
+	if d := c.dialer(); d != nil {
+		opts.Resolver = dcs.Plain(dcs.PlainOptions{Dial: d})
+	}
+	return telegram.NewClient(c.cfg.AppID, c.cfg.AppHash, opts)
+}
+
+// dialer builds the SOCKS5 dial function, or nil to go direct.
+func (c *Client) dialer() dcs.DialFunc {
+	raw := strings.TrimSpace(c.cfg.Proxy)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil
+	}
+	var auth *proxy.Auth
+	if u.User != nil {
+		pass, _ := u.User.Password()
+		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
+	}
+	d, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+	if err != nil {
+		return nil
+	}
+	ctxDialer, ok := d.(proxy.ContextDialer)
+	if !ok {
+		return nil
+	}
+	return ctxDialer.DialContext
 }
 
 // Login performs the interactive phone-and-code flow and stores the session.

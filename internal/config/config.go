@@ -82,6 +82,12 @@ type Config struct {
 	TelegramAppHash string
 	TelegramPhone   string
 	SessionPath     string
+	// TelegramProxy routes MTProto through SOCKS5. It is deliberately separate
+	// from TonnelProxy and does not inherit it: the two are refused by
+	// different networks. On this desk the marketplace proxy cannot reach
+	// Telegram's data centres at all, while the server reaches them directly —
+	// so falling back would have replaced a working path with a dead one.
+	TelegramProxy string
 
 	DBPath   string
 	LogLevel string
@@ -180,6 +186,7 @@ func Load() (*Config, error) {
 		TelegramAppHash: os.Getenv("TELEGRAM_APP_HASH"),
 		TelegramPhone:   os.Getenv("TELEGRAM_PHONE"),
 		SessionPath:     envStr("TELEGRAM_SESSION", "./tgsession.json"),
+		TelegramProxy:   os.Getenv("TELEGRAM_PROXY"),
 
 		DBPath:   envStr("DB_PATH", "./floorline.db"),
 		LogLevel: envStr("LOG_LEVEL", "info"),

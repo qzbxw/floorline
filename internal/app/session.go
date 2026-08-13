@@ -57,6 +57,10 @@ func Login(ctx context.Context, cfg *config.Config, in io.Reader, out io.Writer)
 // sessionConfig maps the environment onto the session client's settings.
 func sessionConfig(cfg *config.Config) tgsession.Config {
 	return tgsession.Config{
+		// The same egress the marketplace uses. MTProto is refused on this
+		// server's own address — the port is open and the handshake times out —
+		// so the session needs the proxy as much as the trading does.
+		Proxy:       cfg.TelegramProxy,
 		AppID:       cfg.TelegramAppID,
 		AppHash:     cfg.TelegramAppHash,
 		Phone:       cfg.TelegramPhone,
