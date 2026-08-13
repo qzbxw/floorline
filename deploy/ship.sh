@@ -42,10 +42,26 @@ DOCKER_BUILDKIT=1 docker build \
 LOCAL_ID=$(docker image inspect "$IMAGE" --format '{{.Id}}')
 say "Built $LOCAL_ID"
 
-say "Pinning the running image as $ROLLBACK"
-# `|| true`: the very first deployment has nothing to roll back to, and that is
-# not a reason to refuse to deploy.
-ssh_do "docker tag $IMAGE $ROLLBACK" 2>/dev/null || echo "   (no previous image — first deploy)"
+say "Pinning the rollback target"
+# What gets pinned is the image the container is *actually running*, read off the
+# container itself, rather than whatever the `latest` tag currently points at.
+#
+# Those are not the same thing and the difference is the whole value of the pin.
+# `latest` moves the moment anything is loaded or built on the host, so tagging
+# it can just as easily pin the image being replaced as the one already replaced
+# — and the first run of this script did exactly that: the tag step failed, the
+# `|| true` swallowed it, and the rollback tag was left pointing two versions
+# back at an image from eight hours earlier. A rollback that silently lands on
+# the wrong build is worse than no rollback, because it will be trusted.
+RUNNING=$(ssh_do "docker inspect -f '{{.Image}}' floorline" 2>/dev/null || true)
+if [ -n "$RUNNING" ]; then
+  # No `|| true` here. If there is something to roll back to and we cannot pin
+  # it, the deploy stops: proceeding would remove the only way back.
+  ssh_do "docker tag $RUNNING $ROLLBACK"
+  echo "   rollback pinned to the running image $RUNNING"
+else
+  echo "   nothing is running — first deploy, no rollback target"
+fi
 
 say "Shipping to $HOST"
 docker save "$IMAGE" | gzip -1 | ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST" 'docker load'
@@ -79,8 +95,12 @@ done
 
 # A desk that will not come up is worse than an old desk that works, and the
 # rollback has to happen without waiting for someone to read this output.
-say "It did not come up — rolling back to $ROLLBACK"
+say "It did not come up — rolling back"
 ssh_do "docker logs floorline --since 5m 2>&1 | tail -40" || true
+if [ -z "$RUNNING" ]; then
+  echo "nothing to roll back to: this was the first deploy. The container is left as it is." >&2
+  exit 1
+fi
 ssh_do "docker tag $ROLLBACK $IMAGE && cd $DIR && docker compose up -d"
-echo "rolled back; the new image is still on the host, untagged" >&2
+echo "rolled back to $RUNNING; the new image is still on the host, untagged" >&2
 exit 1
