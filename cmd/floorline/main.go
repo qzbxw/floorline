@@ -162,6 +162,10 @@ func run(ctx context.Context, cmd string, cfg *config.Config, days int) error {
 		fmt.Println(a.PortfolioReport(ctx))
 		return nil
 	case "smoke":
+		// The cross-market venues are read through the Telegram mini apps, so
+		// the probe has to bring the account online the way `run` does or it
+		// measures a configuration nobody uses.
+		a.StartSession(ctx)
 		fmt.Println("Probing Tonnel endpoints…")
 		fmt.Println()
 		if err := a.Smoke(ctx, os.Stdout); err != nil {

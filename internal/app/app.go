@@ -226,6 +226,14 @@ func (a *App) API() *tonnel.Client { return a.api }
 // Store exposes the database (used by the backfill command).
 func (a *App) Store() *store.Store { return a.st }
 
+// StartSession brings the Telegram account online for a one-off command.
+//
+// `run` does this as part of starting up, but the diagnostics did not — so
+// `smoke` reported "mrkt: could not open the mini app: connection is not up"
+// against a session that works perfectly in production. A diagnostic that
+// contradicts the running system is worse than no diagnostic.
+func (a *App) StartSession(ctx context.Context) { a.startSession(ctx) }
+
 // SyncInventory performs one full paginated reconciliation. It is exported for
 // the read-mostly CLI portfolio report as well as used by the poller.
 func (a *App) SyncInventory(ctx context.Context) error { return a.pollInventory(ctx) }
