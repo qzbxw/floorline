@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -250,6 +251,35 @@ func (a *App) streamLine() string {
 		}
 		return line
 	}
+}
+
+// routesBlock lists the egresses and their standing with the anti-bot layer.
+//
+// It is one line per route because the interesting question during a block is
+// never "are we blocked" — the desk already said so — but "which addresses
+// still work", and that is what decides whether the answer is to wait or to
+// add another proxy.
+func (a *App) routesBlock() string {
+	routes := a.api.Routes()
+	if len(routes) <= 1 {
+		return "" // one route is not a rotation worth reporting on
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n<b>Маршруты</b> — %d из %d доступны\n", a.api.RoutesAvailable(), len(routes))
+	for _, r := range routes {
+		mark, note := "✅", "готов"
+		switch {
+		case r.Cooling > 0:
+			mark, note = "❄️", "остывает "+dur(r.Cooling)
+			if r.LastErr != "" {
+				note += " · " + truncate(r.LastErr, 60)
+			}
+		case !r.LastOK.IsZero():
+			note = "последний ответ " + ago(r.LastOK)
+		}
+		fmt.Fprintf(&b, "%s %s — %s\n", mark, bot.Esc(r.Name), bot.Esc(note))
+	}
+	return b.String()
 }
 
 // streamHealthy reports whether the push feed can be trusted right now. The

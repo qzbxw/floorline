@@ -144,7 +144,14 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 		}},
 	}
 
-	fmt.Fprintf(w, "  origin  %s\n\n", a.api.Origin())
+	fmt.Fprintf(w, "  origin  %s\n", a.api.Origin())
+	// Which routes exist, before anything is tried through them. When the reads
+	// below fail, the first question is always whether it is Tonnel or this
+	// address, and a rotation makes that answerable rather than a guess.
+	for _, r := range a.api.Routes() {
+		fmt.Fprintf(w, "  route   %s\n", r.Name)
+	}
+	fmt.Fprintln(w)
 
 	var failed, blocked, authFailed int
 	for _, c := range checks {
@@ -208,6 +215,15 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 	case blocked > 0:
 		fmt.Fprintln(w, "Anti-bot layer is refusing requests (403/429). The TLS transport or the")
 		fmt.Fprintln(w, "request rate is the problem — lower READ_RPS, or try again from another IP.")
+		for _, r := range a.api.Routes() {
+			state := "available"
+			if r.Cooling > 0 {
+				state = fmt.Sprintf("refused, resting %s", r.Cooling.Round(time.Second))
+			}
+			fmt.Fprintf(w, "  route %-24s %s\n", r.Name, state)
+		}
+		fmt.Fprintln(w, "A route listed as refused is that address being challenged, not Tonnel being")
+		fmt.Fprintln(w, "down. Add another with TONNEL_PROXIES if every one of them is refused.")
 	case authFailed > 0:
 		fmt.Fprintln(w, "The transport works — requests reached Tonnel and were answered. Only the")
 		fmt.Fprintln(w, "session was rejected. Copy Telegram.WebApp.initData from the Tonnel mini app")

@@ -164,6 +164,7 @@ func (a *App) statusText(ctx context.Context) string {
 	if n := a.api.BlockedStreak(); n > 0 {
 		fmt.Fprintf(&b, "⚠️ %d отказов антибота подряд\n", n)
 	}
+	b.WriteString(a.routesBlock())
 	a.mu.RLock()
 	cool := a.coolUntil
 	a.mu.RUnlock()

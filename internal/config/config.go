@@ -77,6 +77,12 @@ type Config struct {
 	// every endpoint, from a stopped service, one request in, means — no amount
 	// of backing off helps and a different address is the only fix.
 	TonnelProxy string
+	// TonnelProxies is the same thing, plural. Every entry becomes a route with
+	// its own cookie jar and its own standing with the anti-bot layer; reads
+	// rotate across whichever are healthy, a refused one rests, and the
+	// machine's own address is always in the rotation as well. One address
+	// carrying the whole request rate is the shape that gets challenged.
+	TonnelProxies []string
 
 	// Cross-market comparison credentials. Each venue is independent: with
 	// none of them set, cards simply omit the comparison line.
@@ -188,6 +194,7 @@ func Load() (*Config, error) {
 		TonnelOrigin:    os.Getenv("TONNEL_ORIGIN"),
 		TonnelReadHosts: envList("TONNEL_READ_HOSTS"),
 		TonnelProxy:     os.Getenv("TONNEL_PROXY"),
+		TonnelProxies:   envList("TONNEL_PROXIES"),
 		EventsEnabled:   envBool("EVENTS_ENABLED", true),
 		EventHost:       envStr("EVENTS_HOST", tonnel.EventHost),
 		PortalsAuth:     os.Getenv("PORTALS_AUTH_DATA"),

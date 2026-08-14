@@ -153,6 +153,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		Origin:        cfg.TonnelOrigin,
 		ReadHosts:     cfg.TonnelReadHosts,
 		Proxy:         cfg.TonnelProxy,
+		Proxies:       cfg.TonnelProxies,
 		Timeout:       cfg.HTTPTimeout,
 		ReadRPS:       cfg.ReadRPS,
 		ReadBurst:     cfg.ReadBurst,
@@ -603,9 +604,16 @@ func (a *App) onBlocked(err error) {
 	if a.streamHealthy() {
 		feed = "Лента событий Tonnel идёт дальше: новые лоты и сделки вижу, недоступен только стакан для оценки."
 	}
+	// Which addresses are refused decides what the operator can do about it, so
+	// it is in the message rather than one /status away. With a single route
+	// there is nothing to say — the block is simply the block.
+	routes := ""
+	if n := a.api.RouteCount(); n > 1 {
+		routes = fmt.Sprintf("Отказали все %d маршрута(ов), включая прокси.\n", n)
+	}
 	a.notify(fmt.Sprintf(
-		"⚠️ <b>Tonnel отказывает</b>\n%s\n\n%s\nПерестаю дёргать приватные эндпоинты на %s — раз в %s проверяю одним запросом, отпустило ли. Автобай на паузе.\nСкажу, когда отпустит.",
-		bot.Esc(err.Error()), feed, dur(pause), dur(coolProbeEvery)))
+		"⚠️ <b>Tonnel отказывает</b>\n%s\n\n%s%s\nПерестаю дёргать приватные эндпоинты на %s — раз в %s проверяю одним запросом, отпустило ли. Автобай на паузе.\nСкажу, когда отпустит.",
+		bot.Esc(err.Error()), routes, feed, dur(pause), dur(coolProbeEvery)))
 }
 
 // noteRecovered clears the blocked state and says so once.

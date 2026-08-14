@@ -16,8 +16,6 @@ import (
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
-	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 	"golang.org/x/time/rate"
 )
 
@@ -56,15 +54,22 @@ type Options struct {
 	Timeout   time.Duration
 	ReadRPS   float64
 	ReadBurst int
-	Proxy     string
+	// Proxy and Proxies are merged into one rotation, alongside the machine's
+	// own address. Several routes are better than one for the same reason
+	// several front ends are: a refusal names an address, so having another is
+	// the difference between rerouting and waiting.
+	Proxy   string
+	Proxies []string
 	// Origin overrides the front-end origin sent with every request.
 	Origin string
 	// ReadHosts overrides the read front ends HostRead rotates through. Empty
 	// means DefaultReadHosts.
 	ReadHosts []string
 
-	// OnBlocked fires when the anti-bot layer starts refusing requests, so the
-	// caller can quiesce pollers and disarm auto-buy.
+	// OnBlocked fires when the anti-bot layer has refused *every* route, so the
+	// caller can quiesce pollers and disarm auto-buy. A refusal on one route
+	// while another still answers is handled by rerouting and is not reported:
+	// nothing is wrong that the desk needs to know about.
 	OnBlocked func(err error)
 	// OnAuthExpired fires when the backend rejects the stored authData.
 	OnAuthExpired func(err error)
@@ -72,7 +77,9 @@ type Options struct {
 
 // Client talks to the private Tonnel endpoints.
 type Client struct {
-	http tls_client.HttpClient
+	// pool holds every route to Tonnel. Reads rotate across it, writes stick to
+	// whichever route last answered, and a refused route rests.
+	pool *egressPool
 
 	readLim  *rate.Limiter
 	writeLim *rate.Limiter
@@ -112,23 +119,13 @@ func New(o Options) (*Client, error) {
 		o.Origin = DefaultOrigin
 	}
 
-	opts := []tls_client.HttpClientOption{
-		tls_client.WithTimeout(int(o.Timeout.Seconds())),
-		tls_client.WithClientProfile(profiles.Chrome_131),
-		tls_client.WithCookieJar(tls_client.NewCookieJar()),
-		tls_client.WithCatchPanics(),
-	}
-	if o.Proxy != "" {
-		opts = append(opts, tls_client.WithProxyUrl(o.Proxy))
-	}
-
-	hc, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+	pool, err := newEgressPool(append(append([]string{}, o.Proxies...), o.Proxy), o.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("build tls client: %w", err)
 	}
 
 	c := &Client{
-		http:      hc,
+		pool:      pool,
 		origin:    strings.TrimSuffix(o.Origin, "/"),
 		readHosts: o.ReadHosts,
 		readLim:   rate.NewLimiter(rate.Limit(o.ReadRPS), o.ReadBurst),
@@ -206,6 +203,17 @@ func (c *Client) UserID() int64 { return c.userID.Load() }
 // BlockedStreak returns how many anti-bot rejections happened in a row.
 func (c *Client) BlockedStreak() int { return int(c.blockedStreak.Load()) }
 
+// Routes reports every egress and its current standing, worst first.
+func (c *Client) Routes() []EgressStatus { return c.pool.statuses(time.Now()) }
+
+// RoutesAvailable is how many routes could carry a request right now. Zero
+// means Tonnel is refusing every address we have, which is the only situation
+// the desk needs to hear about.
+func (c *Client) RoutesAvailable() int { return c.pool.available(time.Now()) }
+
+// RouteCount is how many routes exist at all.
+func (c *Client) RouteCount() int { return c.pool.size() }
+
 // LastSuccess returns when the last call succeeded.
 func (c *Client) LastSuccess() time.Time {
 	n := c.lastOK.Load()
@@ -263,8 +271,15 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 		return fmt.Errorf("marshal %s: %w", o.path, err)
 	}
 
-	var lastErr error
+	// One attempt per route, at least, so a rotation is actually given the
+	// chance to find the route that works. With a single route this is the
+	// old behaviour exactly.
 	attempts := o.retries + 1
+	if n := c.pool.size(); attempts < n {
+		attempts = n
+	}
+
+	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff with jitter. Anti-bot rejections wait longer
@@ -289,8 +304,18 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 			return err
 		}
 
-		lastErr = c.do(ctx, o, payload)
+		// Reads spread across every healthy route; writes stay on whichever one
+		// last answered. Discovering that an address has gone bad is cheap on a
+		// page of listings and expensive on a purchase.
+		now := time.Now()
+		route, _ := c.pool.pick(now)
+		if o.write {
+			route, _ = c.pool.sticky(now)
+		}
+
+		lastErr = c.do(ctx, o, payload, route)
 		if lastErr == nil {
+			route.reward(time.Now())
 			c.blockedStreak.Store(0)
 			c.lastOK.Store(time.Now().UnixNano())
 			return nil
@@ -306,14 +331,21 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 			}
 			if ae.IsBlocked() {
 				n := c.blockedStreak.Add(1)
-				// A refusal from one front end is not a refusal from Tonnel.
-				// Move to the next candidate before backing off, so a moved
-				// endpoint recovers on the retry we were making anyway.
-				if !o.write {
-					c.rotateReadHost()
-				}
-				if n >= 3 && c.onBlocked != nil {
-					c.onBlocked(lastErr)
+				// A refusal names an address. Rest this route and let the next
+				// attempt go out from another one — that alone resolves most
+				// blocks, and the caller never has to hear about it.
+				route.penalise(time.Now(), lastErr)
+
+				// Only once every route has been refused is this Tonnel saying
+				// no to *us* rather than to one address. Then, and only then,
+				// try another front end and tell the desk.
+				if c.pool.available(time.Now()) == 0 {
+					if !o.write {
+						c.rotateReadHost()
+					}
+					if n >= 3 && c.onBlocked != nil {
+						c.onBlocked(lastErr)
+					}
 				}
 				continue
 			}
@@ -334,7 +366,7 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 	return lastErr
 }
 
-func (c *Client) do(ctx context.Context, o callOpts, payload []byte) error {
+func (c *Client) do(ctx context.Context, o callOpts, payload []byte, route *Egress) error {
 	// Resolved per attempt, not once per call: a retry after a block has to go
 	// to the candidate the rotation just picked.
 	endpoint := "https://" + c.resolveHost(o.host) + o.path
@@ -363,9 +395,9 @@ func (c *Client) do(ctx context.Context, o callOpts, payload []byte) error {
 		},
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := route.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: %w", o.path, err)
+		return fmt.Errorf("%s via %s: %w", o.path, route.Name(), err)
 	}
 	defer resp.Body.Close()
 
