@@ -194,7 +194,7 @@ func Load() (*Config, error) {
 		TonnelOrigin:    os.Getenv("TONNEL_ORIGIN"),
 		TonnelReadHosts: envList("TONNEL_READ_HOSTS"),
 		TonnelProxy:     os.Getenv("TONNEL_PROXY"),
-		TonnelProxies:   envList("TONNEL_PROXIES"),
+		TonnelProxies:   envProxyList("TONNEL_PROXIES"),
 		EventsEnabled:   envBool("EVENTS_ENABLED", true),
 		EventHost:       envStr("EVENTS_HOST", tonnel.EventHost),
 		PortalsAuth:     os.Getenv("PORTALS_AUTH_DATA"),
@@ -324,6 +324,25 @@ func envStr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envProxyList reads a proxy list separated by semicolons or whitespace.
+//
+// Not commas, which is the obvious choice and the wrong one: a residential
+// login carries its country filter inline — 2a0a…__cr.de,nl,pl,fr — so a comma
+// is data here. Splitting on it produces two halves of one credential, neither
+// of which is a URL.
+func envProxyList(k string) []string {
+	raw := os.Getenv(k)
+	var out []string
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ';' || r == '\n' || r == '\t' || r == ' '
+	}) {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // envList reads a comma-separated setting, dropping blanks.

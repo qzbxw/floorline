@@ -24,11 +24,19 @@ import (
 // last worked, because a purchase is not the place to discover that an address
 // has gone bad.
 
-// egressCooldown is how long a route rests after being refused, escalating with
-// consecutive refusals and reset by a single success. The first step is short
-// on purpose: one 403 is often just this address's turn to be challenged, and a
-// route that is actually fine should come back quickly.
+// egressCooldown is how long a route rests once it has been rested, escalating
+// with repeat offences and reset by a single success.
 var egressCooldown = []time.Duration{45 * time.Second, 3 * time.Minute, 10 * time.Minute, 30 * time.Minute}
+
+// restAfter is how many refusals in a row it takes to rest a route.
+//
+// Not one, because a residential gateway hands out a different exit address on
+// every connection: a 403 there names an address we were never going to use
+// again, and resting the gateway over it would take away the only route that
+// works. Correlated failure is what identifies a genuinely burnt route, and a
+// fixed address that is burnt fails every single time — so it still rests
+// almost immediately, at the cost of two extra requests.
+const restAfter = 3
 
 // DirectEgress is the name of the route that uses the machine's own address.
 const DirectEgress = "прямой"
@@ -37,25 +45,35 @@ const DirectEgress = "прямой"
 type Egress struct {
 	name string
 	http tls_client.HttpClient
+	// metered marks a route that costs money by the byte. Residential proxies
+	// are sold by traffic — the plan behind this desk is five gigabytes — and
+	// filterStats alone would eat it in a day. So metered routes are the
+	// fallback, never the default: reads use them only while the free route is
+	// being refused, which is exactly when they are worth paying for.
+	metered bool
 
-	mu        sync.Mutex
-	coolUntil time.Time
-	strikes   int
-	lastOK    time.Time
-	lastErr   string
-	calls     int64
-	blocks    int64
+	mu          sync.Mutex
+	coolUntil   time.Time
+	consecutive int // refusals since the last success, drives resting
+	rests       int // times rested, drives the cooldown ladder
+	lastOK      time.Time
+	lastErr     string
+	calls       int64
+	blocks      int64
+	bytes       int64
 }
 
 // EgressStatus is a route's health, for /status and the smoke command.
 type EgressStatus struct {
 	Name    string
+	Metered bool
 	Cooling time.Duration // remaining rest, zero when available
 	Strikes int
 	LastOK  time.Time
 	LastErr string
 	Calls   int64
 	Blocks  int64
+	Bytes   int64
 }
 
 // Name identifies the route in logs and messages. For a proxy it is host:port —
@@ -69,19 +87,26 @@ func (e *Egress) available(now time.Time) bool {
 	return !now.Before(e.coolUntil)
 }
 
-// penalise rests a refused route and reports for how long.
-func (e *Egress) penalise(now time.Time, err error) time.Duration {
+// refuse records a refusal and rests the route once they stop looking like bad
+// luck. It reports the rest imposed, or zero if the route is still in play.
+func (e *Egress) refuse(now time.Time, err error) time.Duration {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.blocks++
+	e.consecutive++
 	if err != nil {
 		e.lastErr = err.Error()
 	}
-	idx := e.strikes
+	if e.consecutive < restAfter {
+		return 0
+	}
+	e.consecutive = 0
+
+	idx := e.rests
 	if idx >= len(egressCooldown) {
 		idx = len(egressCooldown) - 1
 	}
-	e.strikes++
+	e.rests++
 	d := egressCooldown[idx]
 	if until := now.Add(d); until.After(e.coolUntil) {
 		e.coolUntil = until
@@ -93,19 +118,27 @@ func (e *Egress) penalise(now time.Time, err error) time.Duration {
 func (e *Egress) reward(now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.strikes = 0
+	e.consecutive = 0
+	e.rests = 0
 	e.coolUntil = time.Time{}
 	e.lastOK = now
 	e.lastErr = ""
 	e.calls++
 }
 
+// meter records traffic, whatever the request came back with.
+func (e *Egress) meter(bytes int64) {
+	e.mu.Lock()
+	e.bytes += bytes
+	e.mu.Unlock()
+}
+
 func (e *Egress) status(now time.Time) EgressStatus {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	st := EgressStatus{
-		Name: e.name, Strikes: e.strikes, LastOK: e.lastOK,
-		LastErr: e.lastErr, Calls: e.calls, Blocks: e.blocks,
+		Name: e.name, Metered: e.metered, Strikes: e.consecutive, LastOK: e.lastOK,
+		LastErr: e.lastErr, Calls: e.calls, Blocks: e.blocks, Bytes: e.bytes,
 	}
 	if now.Before(e.coolUntil) {
 		st.Cooling = e.coolUntil.Sub(now)
@@ -135,10 +168,14 @@ func newEgressPool(proxies []string, timeout time.Duration) (*egressPool, error)
 			continue
 		}
 		seen[raw] = true
+		if err := validProxyURL(raw); err != nil {
+			return nil, fmt.Errorf("proxy %s: %w", proxyLabel(raw), err)
+		}
 		e, err := newEgress(proxyLabel(raw), raw, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("proxy %s: %w", proxyLabel(raw), err)
 		}
+		e.metered = true // every proxy is assumed to be sold by the byte
 		p.all = append(p.all, e)
 	}
 	direct, err := newEgress(DirectEgress, "", timeout)
@@ -147,6 +184,36 @@ func newEgressPool(proxies []string, timeout time.Duration) (*egressPool, error)
 	}
 	p.all = append(p.all, direct)
 	return p, nil
+}
+
+// validProxyURL rejects a malformed entry loudly at startup rather than letting
+// it fail as a network error on every request for the rest of the process.
+//
+// The list separator matters here and is the likely mistake: a residential
+// login carries its country filter inline — 2a0a…__cr.de,nl,pl,fr — so commas
+// are data, and a comma-joined list arrives as one entry with a host full of
+// scheme separators. Saying so beats a day of "proxy unreachable".
+func validProxyURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fmt.Errorf("scheme %q is not one of http, https, socks5", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("no host")
+	}
+	// A proxy URL is scheme, credentials and a host, and nothing else. A comma
+	// in the *host* or anything at all in the path means two entries ran into
+	// one — the credentials may legitimately contain commas, and do, but the
+	// host may not.
+	if strings.Contains(u.Host, ",") || u.Path != "" || u.Opaque != "" {
+		return fmt.Errorf("looks like several proxies in one entry — separate them with ';', not ','")
+	}
+	return nil
 }
 
 func newEgress(name, proxy string, timeout time.Duration) (*Egress, error) {
@@ -182,35 +249,68 @@ func proxyLabel(raw string) string {
 	return raw
 }
 
-// pick returns the route for the next request, round-robin across the ones that
-// are available. The second result is false when every route is resting; the
-// first is then the one whose rest ends soonest, so a caller that must try
-// something has the best available option rather than nothing.
+// pick returns the route for the next request: the free ones first, round-robin
+// among whichever of them are available, and a metered one only once no free
+// route will have us.
+//
+// The preference is strict rather than a blend. Spreading requests evenly would
+// be the better anti-bot shape, but a residential plan is sold by the byte and
+// filterStats alone would drink five gigabytes in a day. Paying for traffic to
+// avoid a challenge that is not currently happening is the wrong trade; paying
+// for it to keep trading through one that is, is the right one.
+//
+// The second result is false when every route is resting; the first is then the
+// one whose rest ends soonest, so a caller that must try something has the best
+// available option rather than nothing.
 func (p *egressPool) pick(now time.Time) (*Egress, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.all) == 0 {
 		return nil, false
 	}
-	for range p.all {
-		e := p.all[p.idx%len(p.all)]
-		p.idx++
-		if e.available(now) {
-			return e, true
-		}
+	if e, ok := p.pickTier(now, false); ok {
+		return e, true
+	}
+	if e, ok := p.pickTier(now, true); ok {
+		return e, true
 	}
 	return p.soonest(), false
 }
 
-// sticky returns the route that most recently answered, for the write path.
+// pickTier round-robins within one tier. Callers hold p.mu.
+func (p *egressPool) pickTier(now time.Time, metered bool) (*Egress, bool) {
+	for range p.all {
+		e := p.all[p.idx%len(p.all)]
+		p.idx++
+		if e.metered == metered && e.available(now) {
+			return e, true
+		}
+	}
+	return nil, false
+}
+
+// sticky returns the route a write should go out on: the free tier if anything
+// there is available, and within a tier the one that most recently answered.
 func (p *egressPool) sticky(now time.Time) (*Egress, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if e, ok := p.stickyTier(now, false); ok {
+		return e, true
+	}
+	if e, ok := p.stickyTier(now, true); ok {
+		return e, true
+	}
+	return p.soonest(), false
+}
+
+// stickyTier is the most recently successful available route of one tier.
+// Callers hold p.mu.
+func (p *egressPool) stickyTier(now time.Time, metered bool) (*Egress, bool) {
 	var best *Egress
 	var bestOK time.Time
 	for _, e := range p.all {
-		if !e.available(now) {
+		if e.metered != metered || !e.available(now) {
 			continue
 		}
 		e.mu.Lock()
@@ -220,10 +320,7 @@ func (p *egressPool) sticky(now time.Time) (*Egress, bool) {
 			best, bestOK = e, ok
 		}
 	}
-	if best != nil {
-		return best, true
-	}
-	return p.soonest(), false
+	return best, best != nil
 }
 
 // soonest is the route that will be available first. Callers hold p.mu.

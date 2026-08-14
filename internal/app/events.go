@@ -277,9 +277,29 @@ func (a *App) routesBlock() string {
 		case !r.LastOK.IsZero():
 			note = "последний ответ " + ago(r.LastOK)
 		}
+		// Traffic is only interesting where it costs money, and there it is the
+		// number that decides whether the desk can keep using this route at all:
+		// a residential plan is a few gigabytes and filterStats is not small.
+		if r.Metered {
+			note += fmt.Sprintf(" · платный, потрачено %s", bytesHuman(r.Bytes))
+		}
 		fmt.Fprintf(&b, "%s %s — %s\n", mark, bot.Esc(r.Name), bot.Esc(note))
 	}
 	return b.String()
+}
+
+// bytesHuman renders a traffic figure against a plan sold in gigabytes.
+func bytesHuman(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f ГБ", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f МБ", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0f КБ", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d Б", n)
+	}
 }
 
 // streamHealthy reports whether the push feed can be trusted right now. The

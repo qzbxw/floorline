@@ -149,7 +149,11 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 	// below fail, the first question is always whether it is Tonnel or this
 	// address, and a rotation makes that answerable rather than a guess.
 	for _, r := range a.api.Routes() {
-		fmt.Fprintf(w, "  route   %s\n", r.Name)
+		kind := "free"
+		if r.Metered {
+			kind = "metered — used only while the free route is refused"
+		}
+		fmt.Fprintf(w, "  route   %-24s %s\n", r.Name, kind)
 	}
 	fmt.Fprintln(w)
 

@@ -98,6 +98,11 @@ type Client struct {
 	blockedStreak atomic.Int32
 	lastOK        atomic.Int64 // unix nanos of the last successful call
 
+	// retryBase is the first backoff step. It is a field only so the retry and
+	// rerouting behaviour can be tested without the test taking a minute of
+	// real waiting; zero means the production values below.
+	retryBase time.Duration
+
 	onBlocked     func(error)
 	onAuthExpired func(error)
 }
@@ -291,6 +296,9 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 				// milliseconds is how a throttle becomes a ban.
 				base = 3 * time.Second
 			}
+			if c.retryBase > 0 {
+				base = c.retryBase
+			}
 			d := time.Duration(float64(base) * math.Pow(2, float64(attempt-1)))
 			d += time.Duration(rand.Int63n(int64(d/2 + 1)))
 			select {
@@ -331,10 +339,11 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 			}
 			if ae.IsBlocked() {
 				n := c.blockedStreak.Add(1)
-				// A refusal names an address. Rest this route and let the next
-				// attempt go out from another one — that alone resolves most
-				// blocks, and the caller never has to hear about it.
-				route.penalise(time.Now(), lastErr)
+				// A refusal names an address. Let the next attempt go out from
+				// another one — that alone resolves most blocks, and the caller
+				// never has to hear about it. The route rests only once its
+				// refusals stop looking like one unlucky exit address.
+				route.refuse(time.Now(), lastErr)
 
 				// Only once every route has been refused is this Tonnel saying
 				// no to *us* rather than to one address. Then, and only then,
@@ -405,6 +414,9 @@ func (c *Client) do(ctx context.Context, o callOpts, payload []byte, route *Egre
 	if err != nil {
 		return fmt.Errorf("%s: read body: %w", o.path, err)
 	}
+	// Counted whatever the answer was: a refusal costs bytes too, and on a plan
+	// sold by the gigabyte the desk has to be able to see where they went.
+	route.meter(int64(len(body)))
 
 	if resp.StatusCode != http.StatusOK {
 		return &APIError{Op: o.path, Route: route.Name(), Status: resp.StatusCode, Message: extractMessage(body), Body: string(body)}

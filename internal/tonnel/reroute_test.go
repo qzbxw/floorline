@@ -99,6 +99,7 @@ func routedClient(t *testing.T, blocked func(error), statuses ...int) (*Client, 
 		readLim:   rate.NewLimiter(rate.Inf, 1),
 		writeLim:  rate.NewLimiter(rate.Inf, 1),
 		onBlocked: blocked,
+		retryBase: time.Millisecond,
 	}
 	c.SetAuth("")
 	return c, log
@@ -122,34 +123,51 @@ func TestARefusedRouteIsReplacedWithoutAlarming(t *testing.T) {
 	if alarms != 0 {
 		t.Fatalf("the desk was alarmed %d times over a block it routed around", alarms)
 	}
-	if c.pool.available(time.Now()) != 1 {
-		t.Fatal("the refused route was not rested")
-	}
 }
 
-// Only when every address is refused is this Tonnel saying no to us.
+// Only when every address is refused, repeatedly, is this Tonnel saying no to
+// us rather than to one unlucky exit. Then the desk hears about it and the
+// whole pool stands down.
 func TestEveryRouteRefusedRaisesTheAlarm(t *testing.T) {
 	var alarms int
 	c, log := routedClient(t, func(error) { alarms++ }, http.StatusForbidden, http.StatusForbidden, http.StatusForbidden)
 
-	var out []Gift
-	err := c.call(context.Background(), callOpts{host: HostRead, path: "/api/pageGifts", body: map[string]any{}, out: &out, retries: 2})
-	if err == nil {
-		t.Fatal("call succeeded with every route refused")
+	var lastErr error
+	for i := 0; i < restAfter; i++ {
+		var out []Gift
+		lastErr = c.call(context.Background(), callOpts{host: HostRead, path: "/api/pageGifts", body: map[string]any{}, out: &out, retries: 2})
+		if lastErr == nil {
+			t.Fatal("call succeeded with every route refused")
+		}
 	}
-	if n := len(log.seen()); n < 3 {
-		t.Fatalf("only %d attempts for 3 routes: %v", n, log.seen())
+	if n := len(log.seen()); n < 3*restAfter {
+		t.Fatalf("only %d attempts across %d routes: %v", n, 3, log.seen())
 	}
 	if alarms == 0 {
 		t.Fatal("nothing was reported after every route was refused")
 	}
 	// The refusal has to name the address it came from. A rotation that cannot
 	// be read in the log cannot be debugged at all.
-	if !strings.Contains(err.Error(), " via ") {
-		t.Fatalf("error does not say which route was refused: %v", err)
+	if !strings.Contains(lastErr.Error(), " via ") {
+		t.Fatalf("error does not say which route was refused: %v", lastErr)
 	}
 	if c.pool.available(time.Now()) != 0 {
 		t.Fatal("a route is still considered available")
+	}
+}
+
+// A single refusal must not stand a route down: a residential gateway changes
+// exit address every connection, so one 403 there is about an address we will
+// never see again.
+func TestOneRefusalKeepsTheRouteInPlay(t *testing.T) {
+	c, _ := routedClient(t, nil, http.StatusForbidden, http.StatusOK)
+
+	var out []Gift
+	if err := c.call(context.Background(), callOpts{host: HostRead, path: "/api/pageGifts", body: map[string]any{}, out: &out, retries: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if c.pool.available(time.Now()) != 2 {
+		t.Fatal("a route stood down after one refusal")
 	}
 }
 

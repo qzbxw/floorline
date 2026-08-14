@@ -160,3 +160,39 @@ func clearConfigEnv(t *testing.T) {
 		os.Unsetenv(k)
 	}
 }
+
+// The separator is the trap here. A residential proxy login carries its country
+// filter inline — 2a0a…__cr.de,nl,pl,fr — so splitting the list on commas cuts
+// a credential in half and produces two entries that are not URLs.
+func TestProxyListSplitsOnSemicolonsNotCommas(t *testing.T) {
+	const one = "socks5://2a0a124b79027e339479__cr.de,nl,pl,fr:5bd8f2cd07639eea@gw.dataimpulse.com:823"
+	const two = "socks5://user:pass@other.example.com:1080"
+
+	t.Setenv("TONNEL_PROXIES", one+";"+two)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.TonnelProxies) != 2 {
+		t.Fatalf("parsed %d proxies from a semicolon-separated pair: %q", len(c.TonnelProxies), c.TonnelProxies)
+	}
+	if c.TonnelProxies[0] != one {
+		t.Fatalf("the country filter was cut out of the credential: %q", c.TonnelProxies[0])
+	}
+
+	// Whitespace and newlines work too, which is how a long list stays readable
+	// in a .env file.
+	t.Setenv("TONNEL_PROXIES", "  "+one+"\n"+two+"  ")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.TonnelProxies) != 2 || c.TonnelProxies[0] != one {
+		t.Fatalf("whitespace-separated list parsed as %q", c.TonnelProxies)
+	}
+
+	t.Setenv("TONNEL_PROXIES", "")
+	if c, err = Load(); err != nil || len(c.TonnelProxies) != 0 {
+		t.Fatalf("empty setting produced %q (%v)", c.TonnelProxies, err)
+	}
+}
