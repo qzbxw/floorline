@@ -157,11 +157,18 @@ func (a *App) statusText(ctx context.Context) string {
 	} else {
 		b.WriteString("⚠️ Курс GRAM/USDT недоступен\n")
 	}
+	b.WriteString(bot.Esc(a.streamLine()) + "\n")
 	if last := a.api.LastSuccess(); !last.IsZero() {
 		fmt.Fprintf(&b, "Последний удачный запрос к API %s\n", ago(last))
 	}
 	if n := a.api.BlockedStreak(); n > 0 {
 		fmt.Fprintf(&b, "⚠️ %d отказов антибота подряд\n", n)
+	}
+	a.mu.RLock()
+	cool := a.coolUntil
+	a.mu.RUnlock()
+	if left := time.Until(cool); left > 0 {
+		fmt.Fprintf(&b, "❄️ Остужаю Tonnel ещё %s — приватные эндпоинты не дёргаю, пробую раз в %s\n", dur(left), dur(coolProbeEvery))
 	}
 	if venues := a.cross.Venues(); len(venues) > 0 {
 		fmt.Fprintf(&b, "Кроссмаркет: %s\n", strings.Join(venues, ", "))

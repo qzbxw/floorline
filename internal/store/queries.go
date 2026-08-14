@@ -155,6 +155,19 @@ func (s *Store) MarkGoneForModel(ctx context.Context, key tonnel.ModelKey, prese
 	return err
 }
 
+// MarkListingGone records that a single listing has left the market.
+//
+// The book sweep can only infer this by noticing a gift missing from a page it
+// happened to read; the event stream says it outright, the moment it happens.
+// It matters beyond tidiness: the crowd and fresh-supply queries count standing
+// asks, and an ask that was cancelled or sold an hour ago is not competition.
+func (s *Store) MarkListingGone(ctx context.Context, giftID int64, now time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE listings SET gone_at = ? WHERE gift_id = ? AND gone_at IS NULL`,
+		unix(now), giftID)
+	return err
+}
+
 // ListingFirstSeen returns when a listing was first observed, or zero.
 func (s *Store) ListingFirstSeen(ctx context.Context, giftID int64) (time.Time, error) {
 	var n int64
@@ -166,6 +179,20 @@ func (s *Store) ListingFirstSeen(ctx context.Context, giftID int64) (time.Time, 
 }
 
 // ---- sales --------------------------------------------------------------
+
+// nearDuplicateWindow and nearDuplicateBand are how close two rows have to be
+// before they are believed to be one trade seen twice.
+//
+// The same sale now reaches us down two paths — the live event stream and the
+// saleHistory rotation — and the two stamp it from different clocks. The
+// primary key is (gift_id, ts), so a two-second disagreement writes the trade
+// twice, and every median, velocity and turnover number downstream is computed
+// off the row count. A genuine second sale of the same gift, at the same price,
+// inside two minutes does not happen on this market; a duplicate does, all day.
+const (
+	nearDuplicateWindow = 120 * time.Second
+	nearDuplicateBand   = 0.005
+)
 
 // InsertSales stores executed trades, ignoring ones already recorded, and
 // reports how many rows were genuinely new. The pollers use that count to know
@@ -184,11 +211,31 @@ VALUES (?,?,?,?,?,?,?,?,?,?)`)
 		}
 		defer stmt.Close()
 
+		dupe, err := t.PrepareContext(ctx, `
+SELECT 1 FROM sales
+WHERE gift_id = ? AND ts BETWEEN ? AND ? AND ABS(price - ?) <= ?
+LIMIT 1`)
+		if err != nil {
+			return err
+		}
+		defer dupe.Close()
+
 		for i := range sales {
 			sale := &sales[i]
 			when := sale.When()
 			if when.IsZero() || sale.Name() == "" || sale.Price.Float() <= 0 {
 				continue
+			}
+			price := sale.Price.Float()
+			var seen int
+			err := dupe.QueryRowContext(ctx, sale.GiftID.Int(),
+				when.Add(-nearDuplicateWindow).Unix(), when.Add(nearDuplicateWindow).Unix(),
+				price, price*nearDuplicateBand).Scan(&seen)
+			if err == nil {
+				continue // already on the tape, under another clock's timestamp
+			}
+			if err != sql.ErrNoRows {
+				return fmt.Errorf("dedupe sale %d: %w", sale.GiftID.Int(), err)
 			}
 			res, err := stmt.ExecContext(ctx,
 				sale.GiftID.Int(), when.Unix(), sale.GiftNum.Int(), sale.Name(),

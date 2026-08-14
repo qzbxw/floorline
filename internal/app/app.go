@@ -29,6 +29,14 @@ type App struct {
 	cfg *config.Config
 	st  *store.Store
 	api *tonnel.Client
+	// stream is the marketplace event feed: new asks, reprices, cancellations
+	// and settled trades, pushed rather than polled. It is what the desk now
+	// watches the market with; api is what it asks the questions the feed does
+	// not answer — the order book, the snapshot, inventory, and the writes.
+	stream *tonnel.Stream
+	// evalQ carries listings from the feed to the evaluators. The socket must
+	// not wait on a valuation, so the two are separated by this queue.
+	evalQ chan tonnel.Gift
 
 	books *pricing.BookCache
 	det   *signal.Detector
@@ -54,6 +62,13 @@ type App struct {
 
 	startedAt time.Time
 
+	// notifier and lastAPIOK are seams. The Telegram client cannot be built
+	// without a live token and the API client cannot be made to have succeeded,
+	// so the block-and-recovery logic — which is about what gets said and when —
+	// would otherwise be untestable. Both are nil in production.
+	notifier  func(string)
+	lastAPIOK func() time.Time
+
 	mu          sync.RWMutex
 	pollers     map[string]*pollerState
 	coverage    time.Duration
@@ -77,6 +92,21 @@ type App struct {
 	// blockEpisodes counts consecutive blocks so the pause can escalate.
 	blocked       bool
 	blockEpisodes int
+	// blockedAt is when the current episode began and lastBlockAt when it was
+	// last refreshed. Recovery is measured against both: the first says which
+	// successes count, the second holds the all-clear until the refusals have
+	// actually stopped.
+	blockedAt      time.Time
+	lastBlockAt    time.Time
+	blockAnnounced bool
+	// coolUntil is when the private endpoints may be polled at full rate again,
+	// and lastProbe when the single call that tests the water last went out.
+	coolUntil time.Time
+	lastProbe time.Time
+	// streamDownAt is when the event feed dropped, and streamDownSaid whether
+	// the operator has been told about this outage.
+	streamDownAt   time.Time
+	streamDownSaid bool
 }
 
 // collectionRotation walks the collection list a few at a time, because trade
@@ -132,6 +162,11 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	if err != nil {
 		st.Close()
 		return nil, err
+	}
+
+	if cfg.EventsEnabled {
+		a.evalQ = make(chan tonnel.Gift, evalQueueSize)
+		a.stream = a.newStream()
 	}
 
 	a.books = pricing.NewBookCache(a.api, cfg.BookCacheTTL, 30)
@@ -281,6 +316,11 @@ func (a *App) Run(ctx context.Context) error {
 		log.Warn().Err(err).Msg("initial market snapshot failed")
 	}
 
+	// The event feed comes up before the pollers: the fallback poll checks
+	// whether it is healthy, and a stream that is still connecting must not be
+	// mistaken for one that is down.
+	a.startEvents(ctx)
+
 	start("stats", a.cfg.StatsInterval, a.pollStats)
 	start("sales", a.cfg.SalesInterval, a.pollSales)
 	start("feed", a.cfg.FeedInterval, a.pollFeed)
@@ -322,6 +362,10 @@ func (a *App) loop(ctx context.Context, name string, interval time.Duration, fn 
 		case <-t.C:
 		}
 
+		if !a.mayPoll(name) {
+			continue
+		}
+
 		runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		err := fn(runCtx)
 		cancel()
@@ -351,6 +395,71 @@ func (a *App) loop(ctx context.Context, name string, interval time.Duration, fn 
 			log.Warn().Err(err).Str("poller", name).Msg("poll failed")
 		}
 	}
+}
+
+// tonnelPollers are the loops that spend requests on the private endpoints.
+// Everything else — the GRAM quote, maintenance — is unaffected by a block and
+// must keep running through one.
+var tonnelPollers = map[string]bool{
+	"feed": true, "stats": true, "sales": true, "inventory": true, "scan": true,
+}
+
+// coolProbePoller is the single call allowed through while cooling. filterStats
+// is one request, it covers every model of every collection, and it is
+// therefore both the cheapest way to ask whether the block has lifted and the
+// most useful answer to get.
+const coolProbePoller = "stats"
+
+// coolProbeEvery is how often that probe goes out. Slow enough to be a knock at
+// the door rather than a second attempt to break it down.
+const coolProbeEvery = 2 * time.Minute
+
+// mayPoll decides whether a poller may run this tick.
+//
+// This is the missing half of the block response, and its absence is what the
+// 14 Aug logs are: the desk announced "поллеры сбавляют темп" and then did no
+// such thing. Every loop kept its ticker — the feed asking pageGifts every two
+// seconds, inventory, sales, stats — all of them refused, all of them retried
+// with backoff inside the client, none of them slowed down. A Cloudflare block
+// is a rate decision about our address; answering it with the same request rate
+// is how a five-minute challenge becomes an hour of them.
+//
+// So while cooling, the endpoints that were refused are left alone entirely,
+// and exactly one probe every couple of minutes tests whether we are welcome
+// again. The event stream is what makes this affordable: the market is still
+// visible throughout.
+func (a *App) mayPoll(name string) bool {
+	if !tonnelPollers[name] {
+		return true
+	}
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if now.After(a.coolUntil) {
+		return true
+	}
+	if name != coolProbePoller || now.Sub(a.lastProbe) < coolProbeEvery {
+		return false
+	}
+	a.lastProbe = now
+	return true
+}
+
+// apiLastOK is when Tonnel last answered anything.
+func (a *App) apiLastOK() time.Time {
+	if a.lastAPIOK != nil {
+		return a.lastAPIOK()
+	}
+	return a.api.LastSuccess()
+}
+
+// cooling reports whether the desk is currently backing off the private
+// endpoints. Valuation reads the order book, so it has to respect this too.
+func (a *App) cooling() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return time.Now().Before(a.coolUntil)
 }
 
 // Coverage reports how much trade history is stored, capped at the lookback
@@ -403,6 +512,10 @@ func (a *App) refreshCoverage(ctx context.Context) error {
 
 // notify pushes a message to Telegram, if the bot is configured.
 func (a *App) notify(text string) {
+	if a.notifier != nil {
+		a.notifier(text)
+		return
+	}
 	if a.tg == nil {
 		log.Info().Msg(text)
 		return
@@ -431,17 +544,31 @@ func (a *App) throttle(key string, every time.Duration) bool {
 // the desk announced the same block every fifteen minutes all night.
 var blockBackoff = []time.Duration{5 * time.Minute, 15 * time.Minute, 45 * time.Minute, 2 * time.Hour}
 
+const (
+	// blockRecoveryHold is how long the refusals must have stopped before the
+	// all-clear is believed. A block is a rolling condition, not an event: one
+	// endpoint answers while another is still challenged, and calling that
+	// recovery starts the whole announcement over on the next refusal.
+	blockRecoveryHold = 3 * time.Minute
+	// blockNoticeEvery caps how often a block may be announced at all. On 14 Aug
+	// this pair of messages arrived every thirty seconds for hours.
+	blockNoticeEvery = 20 * time.Minute
+)
+
 // onBlocked quiesces the desk when the anti-bot layer starts refusing.
 //
-// It reports the *transition*, not the condition. The old version re-announced
-// an ongoing block on a timer, which is noise precisely when the operator can
-// do nothing about it; recovery — the thing actually worth knowing — was never
-// announced at all.
+// It reports the *transition*, not the condition, and it is deliberately hard
+// to make it report anything at all. The pause and the host rotation are the
+// useful half of this function; the message is only worth sending when the
+// operator does not already know.
 func (a *App) onBlocked(err error) {
 	a.mu.Lock()
+	now := time.Now()
 	first := !a.blocked
 	a.blocked = true
+	a.lastBlockAt = now
 	if first {
+		a.blockedAt = now
 		a.blockEpisodes++
 	}
 	idx := a.blockEpisodes - 1
@@ -452,29 +579,63 @@ func (a *App) onBlocked(err error) {
 		idx = 0
 	}
 	pause := blockBackoff[idx]
+	// The pollers cool for as long as unattended buying does. Both are the same
+	// judgement — that the desk should stop asking for a while — and having only
+	// the second one implemented is why the first was never true.
+	if until := now.Add(pause); until.After(a.coolUntil) {
+		a.coolUntil = until
+	}
 	a.mu.Unlock()
 
 	a.rm.Pause(pause, "блок антибота")
-	if !first {
+	if !first || !a.throttle("block-notice", blockNoticeEvery) {
 		return
 	}
+	a.mu.Lock()
+	a.blockAnnounced = true
+	a.mu.Unlock()
+
+	// What the block actually costs depends on the feed. With the event stream
+	// up, new asks and settled trades keep arriving and only the order book —
+	// and therefore valuation, and therefore buying — is affected. Saying which
+	// one it is saves the operator from guessing.
+	feed := "Лента событий тоже молчит — рынок сейчас не виден вообще."
+	if a.streamHealthy() {
+		feed = "Лента событий Tonnel идёт дальше: новые лоты и сделки вижу, недоступен только стакан для оценки."
+	}
 	a.notify(fmt.Sprintf(
-		"⚠️ <b>Tonnel отказывает</b>\n%s\n\nПробую другие хосты, поллеры сбавляют темп. Автобай на паузе %s.\nСкажу, когда отпустит.",
-		bot.Esc(err.Error()), dur(pause)))
+		"⚠️ <b>Tonnel отказывает</b>\n%s\n\n%s\nПерестаю дёргать приватные эндпоинты на %s — раз в %s проверяю одним запросом, отпустило ли. Автобай на паузе.\nСкажу, когда отпустит.",
+		bot.Esc(err.Error()), feed, dur(pause), dur(coolProbeEvery)))
 }
 
-// noteRecovered clears the blocked state after a successful call and says so
-// once. The desk going quiet and the desk being stuck look identical from the
-// chat, so the end of a block is worth exactly one message.
+// noteRecovered clears the blocked state and says so once.
+//
+// Two conditions, and the missing first one is what made the chat unreadable:
+// Tonnel itself has to have answered since the block began, and the refusals
+// have to have stopped for long enough to mean it. Any poller finishing used to
+// count as recovery — including the GRAM quote, which reads a public exchange
+// and had never touched Tonnel in its life. It ticks every thirty seconds, so
+// each block was declared over within half a minute of being announced, and the
+// next refusal announced it again.
 func (a *App) noteRecovered() {
 	a.mu.Lock()
 	if !a.blocked {
 		a.mu.Unlock()
 		return
 	}
-	a.blocked = false
+	if a.apiLastOK().Before(a.blockedAt) || time.Since(a.lastBlockAt) < blockRecoveryHold {
+		a.mu.Unlock()
+		return
+	}
+	announced := a.blockAnnounced
+	a.blocked, a.blockAnnounced = false, false
 	a.blockEpisodes = 0
+	a.coolUntil = time.Time{} // the probe got through; full rate is welcome again
 	a.mu.Unlock()
+
+	if !announced {
+		return // never announced, nothing to take back
+	}
 	a.notify(fmt.Sprintf("✅ <b>Tonnel снова отвечает</b> — читаю с %s", bot.Esc(a.api.ReadHost())))
 }
 

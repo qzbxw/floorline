@@ -48,6 +48,13 @@ func (a *App) Smoke(ctx context.Context, w io.Writer) error {
 			return "wtf signature round-trips", nil
 		}},
 
+		// First, because it is now how the desk sees the market. If this works
+		// and everything below is challenged, the desk still trades — degraded,
+		// but seeing every new ask and every settled sale.
+		{"event stream (marketplace/ws)", func(ctx context.Context) (string, error) {
+			return a.probeStream(ctx, 20*time.Second)
+		}},
+
 		{"feed (pageGifts)", func(ctx context.Context) (string, error) {
 			gifts, err := a.api.Feed(ctx, 5)
 			if err != nil {

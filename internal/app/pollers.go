@@ -19,9 +19,14 @@ import (
 
 // pollFeed reads the newest listings and evaluates whatever is new or cheaper.
 //
-// This is the hot path. Everything expensive — the order-book lookup — happens
-// inside the detector and only for candidates that survive the local filters.
+// It is now the fallback rather than the hot path. New asks arrive on the
+// marketplace event stream the moment they are posted; this exists for the
+// minutes when that stream is down, and asking pageGifts every two seconds
+// while it is up is exactly the traffic that got the desk challenged.
 func (a *App) pollFeed(ctx context.Context) error {
+	if a.streamHealthy() {
+		return nil
+	}
 	gifts, err := a.api.Feed(ctx, 30)
 	if err != nil {
 		return fmt.Errorf("read feed: %w", err)
@@ -40,7 +45,28 @@ func (a *App) pollFeed(ctx context.Context) error {
 	if len(candidates) == 0 {
 		return nil
 	}
+	a.evaluateListings(ctx, gifts, candidates, now)
+	return nil
+}
 
+// evaluateListings prices a batch of listings and acts on whatever clears the
+// gates. Both sources of new asks — the event stream and the fallback poll —
+// end here, so a listing is treated identically however it reached us.
+func (a *App) evaluateListings(ctx context.Context, gifts []tonnel.Gift, candidates []int64, now time.Time) {
+	if len(candidates) == 0 {
+		return
+	}
+	// Valuation reads the order book, and the order book is exactly what a block
+	// refuses. Pricing anyway would spend the whole cooling period issuing the
+	// requests the cooling exists to stop — one per streamed listing, on a feed
+	// that keeps arriving throughout. The listings are stored either way, so the
+	// sweep prices them once the desk is welcome again.
+	if a.cooling() {
+		if a.throttle("cooling-skip", 10*time.Minute) {
+			log.Info().Int("listings", len(candidates)).Msg("cooling off Tonnel, listings stored but not priced")
+		}
+		return
+	}
 	byID := make(map[int64]tonnel.Gift, len(gifts))
 	for i := range gifts {
 		byID[gifts[i].GiftID.Int()] = gifts[i]
@@ -89,7 +115,6 @@ func (a *App) pollFeed(ctx context.Context) error {
 			log.Error().Err(err).Int64("gift", dec.Gift.GiftID.Int()).Msg("handling decision failed")
 		}
 	}
-	return nil
 }
 
 // spendable is the largest single purchase the desk could make right now: the
@@ -391,7 +416,18 @@ func (a *App) detectFloorDrops(ctx context.Context, now time.Time) {
 //
 // Staleness is not a concern here: a fourteen-day velocity does not move in the
 // minutes it takes one cycle to come back around.
+//
+// While the event stream is up, every settled trade on the market arrives here
+// within a second of settling, and this rotation is reduced to a slow audit of
+// it — the read budget is worth more to the order book. It returns to full rate
+// the moment the stream stops being trustworthy, and SalesWindow comfortably
+// covers one full rotation at that rate, so nothing is lost in the handover.
 func (a *App) pollSales(ctx context.Context) error {
+	if a.streamHealthy() && !a.throttle("sales-rotation", salesAuditInterval) {
+		a.detectSweeps(ctx, time.Now())
+		return nil
+	}
+
 	batch := a.nextCollections(a.cfg.SalesBatch)
 	if len(batch) == 0 {
 		return nil // the market snapshot has not landed yet
@@ -421,6 +457,11 @@ func (a *App) pollSales(ctx context.Context) error {
 	a.detectSweeps(ctx, time.Now())
 	return nil
 }
+
+// salesAuditInterval is how often the trade-history rotation still runs while
+// the event stream is carrying the tape. It is a cross-check against the push
+// feed, not the source of it.
+const salesAuditInterval = 2 * time.Minute
 
 // nextCollections returns the next slice of the rotation, refreshing the list
 // from the market snapshot when it is empty or exhausted.

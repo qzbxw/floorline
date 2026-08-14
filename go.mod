@@ -5,6 +5,7 @@ go 1.26.2
 require (
 	github.com/bogdanfinn/fhttp v0.6.8
 	github.com/bogdanfinn/tls-client v1.15.1
+	github.com/coder/websocket v1.8.13
 	github.com/gotd/td v0.129.0
 	github.com/rs/zerolog v1.35.1
 	golang.org/x/net v0.58.0
@@ -21,7 +22,6 @@ require (
 	github.com/bogdanfinn/utls v1.7.7-barnius // indirect
 	github.com/bogdanfinn/websocket v1.5.5-barnius // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/coder/websocket v1.8.13 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect

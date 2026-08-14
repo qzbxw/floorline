@@ -117,6 +117,48 @@ func TestInsertSalesIsIdempotent(t *testing.T) {
 	}
 }
 
+// The same trade now arrives twice: pushed by the event stream the second it
+// settles, and again from the saleHistory rotation minutes later. The two stamp
+// it from different clocks, and the primary key is (gift_id, ts), so without
+// this the tape counts one sale as two — and velocity, turnover and every
+// median are computed off that count.
+func TestInsertSalesCollapsesTheSameTradeSeenTwice(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	streamed := tonnel.Sale{
+		GiftID: 1, GiftNum: 5, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)",
+		Price: 1000, Type: "SALE", Timestamp: tonnel.FlexTime{Time: now},
+	}
+	polled := streamed
+	polled.Timestamp = tonnel.FlexTime{Time: now.Add(3 * time.Second)} // the other clock
+	polled.Type = "INTERNAL_SALE"
+
+	if n, err := st.InsertSales(ctx, []tonnel.Sale{streamed}); err != nil || n != 1 {
+		t.Fatalf("first insert: %d %v", n, err)
+	}
+	if n, err := st.InsertSales(ctx, []tonnel.Sale{polled}); err != nil || n != 0 {
+		t.Fatalf("the same trade under a three-second-later timestamp inserted %d rows, want 0 (%v)", n, err)
+	}
+
+	// A genuinely different trade of the same gift, hours later, still counts.
+	later := streamed
+	later.Timestamp = tonnel.FlexTime{Time: now.Add(6 * time.Hour)}
+	later.Price = 1200
+	if n, err := st.InsertSales(ctx, []tonnel.Sale{later}); err != nil || n != 1 {
+		t.Fatalf("a later resale was swallowed as a duplicate: %d %v", n, err)
+	}
+
+	// And so does a different price at the same moment — two lots changing
+	// hands in the same second is a busy market, not double vision.
+	other := streamed
+	other.GiftID = 2
+	if n, err := st.InsertSales(ctx, []tonnel.Sale{other}); err != nil || n != 1 {
+		t.Fatalf("a different gift was treated as a duplicate: %d %v", n, err)
+	}
+}
+
 func TestInsertSalesSkipsUnusableRows(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

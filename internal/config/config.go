@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"floorline/internal/tonnel"
 )
 
 // SignalGates decides what gets pushed to Telegram as an actionable card.
@@ -62,6 +64,14 @@ type Config struct {
 	// client rotates through them on a block, so this is the escape hatch when
 	// Tonnel moves the endpoint again and the built-in list has not caught up.
 	TonnelReadHosts []string
+	// EventsEnabled turns on the marketplace event stream — Tonnel's public,
+	// documented push feed of listings and sales. It is the desk's primary view
+	// of the market; turning it off falls back to polling pageGifts, which is
+	// what the anti-bot layer refuses.
+	EventsEnabled bool
+	// EventHost serves the event socket and its replay endpoint.
+	EventHost string
+
 	// TonnelProxy routes Tonnel traffic through another egress. When the
 	// refusals are per-IP rather than per-request — which is what a 429 on
 	// every endpoint, from a stopped service, one request in, means — no amount
@@ -178,6 +188,8 @@ func Load() (*Config, error) {
 		TonnelOrigin:    os.Getenv("TONNEL_ORIGIN"),
 		TonnelReadHosts: envList("TONNEL_READ_HOSTS"),
 		TonnelProxy:     os.Getenv("TONNEL_PROXY"),
+		EventsEnabled:   envBool("EVENTS_ENABLED", true),
+		EventHost:       envStr("EVENTS_HOST", tonnel.EventHost),
 		PortalsAuth:     os.Getenv("PORTALS_AUTH_DATA"),
 		MrktInit:        os.Getenv("MRKT_INIT_DATA"),
 		MrktToken:       os.Getenv("MRKT_TOKEN"),
