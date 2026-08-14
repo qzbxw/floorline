@@ -93,7 +93,11 @@ type Valuation struct {
 
 	CompetingAsk    float64
 	HasCompetingAsk bool
-	LiveDepth       float64
+	// Ladder is the head of the merged queue every venue contributes to,
+	// ascending, restated as Tonnel-equivalent buyer cost. It is what the fill
+	// probabilities and the executable exits were computed from.
+	Ladder    []float64
+	LiveDepth float64
 	// LiveDepthCount is the run of cheapest asks that form one pool of
 	// liquidity, i.e. how many of them are reachable without stepping over a
 	// hole in the book. It is not the raw ask count — see ExternalAsks.
@@ -495,6 +499,13 @@ func settle(v *Valuation, in Input) {
 		local = in.Book.ExternalAsks(in.GiftID, in.OwnerID)
 	}
 	ladder := mergedLadder(local, v.Cross.Asks, in.Params.Fee)
+	// Kept on the valuation, shortened, because it is the evidence behind every
+	// number derived from it. A verdict computed from a queue nobody can see is
+	// one the operator has to take on trust, and the queue is three prices.
+	v.Ladder = ladder
+	if len(v.Ladder) > ladderShown {
+		v.Ladder = v.Ladder[:ladderShown]
+	}
 	buyers := in.Liq.Velocity
 	v.Fill = fillCurve(ladder, v.FastExit, buyers)
 	v.Patient = fillCurve(ladder, v.PatientAsk, buyers)

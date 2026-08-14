@@ -179,3 +179,65 @@ func TestCoolingStoresListingsWithoutPricingThem(t *testing.T) {
 		t.Fatalf("listing was not stored: %v %v", seen, err)
 	}
 }
+
+// While the free address is refused every request is being paid for by the
+// byte, and the snapshot alone is 80 KB. The pollers keep their own floor on
+// how often they may spend money — without it a 5 GB residential plan lasts
+// about a month, and only if nothing else ever happens.
+func TestFrugalModeSlowsTheExpensivePollers(t *testing.T) {
+	a := coolingApp(t)
+	paid := true
+	a.metered = func() bool { return paid }
+
+	now := time.Now()
+	a.mu.Lock()
+	for name := range frugalEvery {
+		a.pollers[name] = &pollerState{LastRun: now.Add(-30 * time.Second)}
+	}
+	a.mu.Unlock()
+
+	for name, every := range frugalEvery {
+		if a.mayPoll(name) {
+			t.Fatalf("%s polled 30s after its last run while paying (floor %s)", name, every)
+		}
+	}
+
+	// The floor is a floor, not a stop: once it has passed, the poll runs.
+	a.mu.Lock()
+	for name := range frugalEvery {
+		a.pollers[name].LastRun = now.Add(-time.Hour)
+	}
+	a.mu.Unlock()
+	for name := range frugalEvery {
+		if !a.mayPoll(name) {
+			t.Fatalf("%s never came back around", name)
+		}
+	}
+
+	// And on the free route nothing is throttled at all: freshness is only
+	// traded away while it costs money.
+	paid = false
+	a.mu.Lock()
+	for name := range frugalEvery {
+		a.pollers[name].LastRun = now
+	}
+	a.mu.Unlock()
+	for name := range frugalEvery {
+		if !a.mayPoll(name) {
+			t.Fatalf("%s was throttled while the traffic was free", name)
+		}
+	}
+}
+
+// The snapshot is the expensive one, and the ceiling on how stale it may get is
+// not a matter of taste: unattended buying refuses data older than
+// AUTOBUY_MAX_DATA_AGE, so a frugal interval above that would quietly disarm the
+// desk instead of saving it money.
+func TestTheFrugalSnapshotStaysInsideTheAutobuyDataAge(t *testing.T) {
+	var cfg config.Config
+	cfg.Auto.MaxDataAge = 5 * time.Minute // the shipped default
+	if frugalEvery["stats"] >= cfg.Auto.MaxDataAge {
+		t.Fatalf("frugal snapshot every %s against a %s data-age gate: autobuy would never fire",
+			frugalEvery["stats"], cfg.Auto.MaxDataAge)
+	}
+}

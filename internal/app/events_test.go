@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,5 +176,79 @@ func TestAFullQueueDropsRatherThanBlocks(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the event handler blocked on a full evaluation queue")
+	}
+}
+
+// A gift that sold while the desk was down used to come back as "пропал из
+// инвентаря, продажа не подтверждена": the inventory poll saw it gone and the
+// trade tape, refreshed one collection at a time, had not caught up. The feed
+// reports every settled trade including ours, and replay covers the outage, so
+// the position closes as soon as the desk is back.
+func TestASaleOfOurOwnGiftClosesThePosition(t *testing.T) {
+	ctx := context.Background()
+	a := streamApp(t)
+	a.cfg.TonnelFee = .005
+	var sent []string
+	a.notifier = func(s string) { sent = append(sent, s) }
+
+	bought := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
+	err := a.st.UpsertPosition(ctx, store.Position{
+		GiftID: 77, GiftNum: 12,
+		Key:      tonnel.ModelKey{Name: "Lol Pop", Model: "Blood Sucker"},
+		BuyPrice: 2.9, BoughtAt: bought,
+		ListPrice: 3.2, ListedAt: bought,
+		Status: store.StatusListed, Source: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sale := `{"eventId":"s","version":1,"type":"sale.completed","occurredAt":"2026-08-13T11:39:00.000Z","data":{"gift":{"gift_id":77,"gift_num":12,"gift_name":"Lol Pop","model":"Blood Sucker (1%)","backdrop":"Black (1.5%)","symbol":"Bat (0.5%)"},"price":3.2,"asset":"TON","source":"LISTING"}}`
+	if err := a.handleEvent(ctx, listingEvent(t, sale)); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := a.st.GetPosition(ctx, 77)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != store.StatusSold {
+		t.Fatalf("position is %q, want sold", p.Status)
+	}
+	if p.SellPrice != 3.2 {
+		t.Fatalf("sold at %v", p.SellPrice)
+	}
+	if len(sent) != 1 || !strings.Contains(sent[0], "Продано") {
+		t.Fatalf("the sale was not reported: %v", sent)
+	}
+}
+
+// The trade that opens a position looks exactly like the one that closes it and
+// arrives on the same feed. Booking our own purchase as a sale would report a
+// phantom round trip and hand the gift back to the market in our own books.
+func TestOurOwnPurchaseIsNotBookedAsASale(t *testing.T) {
+	ctx := context.Background()
+	a := streamApp(t)
+	a.cfg.TonnelFee = .005
+
+	boughtAt := time.Date(2026, 8, 13, 11, 38, 30, 0, time.UTC)
+	err := a.st.UpsertPosition(ctx, store.Position{
+		GiftID: 77, GiftNum: 12,
+		Key:      tonnel.ModelKey{Name: "Lol Pop", Model: "Blood Sucker"},
+		BuyPrice: 3.216, BoughtAt: boughtAt, // 3.2 ask plus the referral
+		Status: store.StatusOpen, Source: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same trade, from the feed, seconds after we placed the order.
+	sale := `{"eventId":"s","version":1,"type":"sale.completed","occurredAt":"2026-08-13T11:39:00.000Z","data":{"gift":{"gift_id":77,"gift_num":12,"gift_name":"Lol Pop","model":"Blood Sucker (1%)","backdrop":"Black (1.5%)","symbol":"Bat (0.5%)"},"price":3.2,"asset":"TON","source":"LISTING"}}`
+	if err := a.handleEvent(ctx, listingEvent(t, sale)); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := a.st.GetPosition(ctx, 77)
+	if p.Status != store.StatusOpen {
+		t.Fatalf("our own purchase closed the position as %q", p.Status)
 	}
 }

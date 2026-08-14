@@ -175,9 +175,40 @@ type BookCache struct {
 	fetcher BookFetcher
 	ttl     time.Duration
 	limit   int
+	// Frugal, when set and true, stretches the cache and shortens the book.
+	//
+	// Book reads are the desk's second-largest expense after the market
+	// snapshot, and they are paid for by the byte whenever the free address is
+	// refused. A book four times staler is a real cost — but it is a smaller
+	// one than running out of plan, and it is only paid while the desk is on
+	// the metered route. Leaving it nil keeps the configured values always.
+	Frugal func() bool
 
 	mu      sync.Mutex
 	entries map[string]*cacheEntry
+}
+
+// frugalTTLFactor and frugalLimit are what "stretch and shorten" mean. Thirty
+// asks cost 3.8 KB and twelve cost 2.4 KB, while the gates that read depth need
+// far fewer than thirty: LiveDepthCount wants two, and the deepest consumer is
+// the fill ladder, which stops mattering past the first handful.
+const (
+	frugalTTLFactor = 4
+	frugalLimit     = 12
+)
+
+func (c *BookCache) effectiveTTL() time.Duration {
+	if c.Frugal != nil && c.Frugal() {
+		return c.ttl * frugalTTLFactor
+	}
+	return c.ttl
+}
+
+func (c *BookCache) effectiveLimit() int {
+	if c.Frugal != nil && c.Frugal() && c.limit > frugalLimit {
+		return frugalLimit
+	}
+	return c.limit
 }
 
 type cacheEntry struct {
@@ -212,14 +243,15 @@ func (c *BookCache) Get(ctx context.Context, key tonnel.ModelKey) (*Book, error)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.book != nil && time.Since(e.at) < c.ttl {
+	ttl := c.effectiveTTL()
+	if e.book != nil && time.Since(e.at) < ttl {
 		return e.book, nil
 	}
-	if e.err != nil && time.Since(e.at) < c.ttl {
+	if e.err != nil && time.Since(e.at) < ttl {
 		return nil, e.err // do not retry a failing model faster than the TTL
 	}
 
-	gifts, err := c.fetcher.ModelBook(ctx, key, c.limit)
+	gifts, err := c.fetcher.ModelBook(ctx, key, c.effectiveLimit())
 	e.at = time.Now()
 	if err != nil {
 		e.err, e.book = err, nil

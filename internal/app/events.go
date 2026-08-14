@@ -139,7 +139,40 @@ func (a *App) onSaleEvent(ctx context.Context, ev tonnel.Event) error {
 		return fmt.Errorf("store sale %d: %w", sale.GiftID.Int(), err)
 	}
 	// A sold gift is no longer an ask standing in front of anything.
-	return a.st.MarkListingGone(ctx, sale.GiftID.Int(), time.Now())
+	if err := a.st.MarkListingGone(ctx, sale.GiftID.Int(), time.Now()); err != nil {
+		return err
+	}
+	return a.closeIfOurs(ctx, sale)
+}
+
+// closeIfOurs books a sale of something we were holding.
+//
+// The feed reports every settled trade on the market, ours included, so a
+// position can be closed the second it sells — and, through replay, a position
+// that sold while the desk was down gets closed as soon as it comes back.
+// Before this, only the inventory poll noticed: it saw the gift gone, looked for
+// a matching trade in a tape that is refreshed one collection at a time, usually
+// did not find one yet, and filed the position as "пропал из инвентаря, продажа
+// не подтверждена". Every sale during an outage landed there.
+func (a *App) closeIfOurs(ctx context.Context, sale tonnel.Sale) error {
+	id := sale.GiftID.Int()
+	p, err := a.st.GetPosition(ctx, id)
+	if err != nil || p == nil {
+		return err
+	}
+	switch p.Status {
+	case store.StatusOpen, store.StatusListed, store.StatusMissing:
+	default:
+		return nil // already closed, or never really ours
+	}
+	// The trade that opened a position looks exactly like the trade that closes
+	// it, and it arrives on the same feed. Buying a gift and immediately booking
+	// it as sold would report a phantom round trip at zero profit and hand the
+	// gift back to the market in our own accounting.
+	if ourAcquisition(*p, store.Trade{Price: sale.Price.Float(), TS: sale.When()}, a.cfg.TonnelFee) {
+		return nil
+	}
+	return a.bookSale(ctx, *p, sale.Price.Float(), sale.When(), "подтверждено лентой событий Tonnel")
 }
 
 // ownListing reports whether a gift is one of ours.
@@ -282,6 +315,13 @@ func (a *App) routesBlock() string {
 		// a residential plan is a few gigabytes and filterStats is not small.
 		if r.Metered {
 			note += fmt.Sprintf(" · платный, потрачено %s", bytesHuman(r.Bytes))
+			// A total is only half the answer. What decides whether the plan
+			// survives is the rate, and the operator should not have to work it
+			// out from an uptime they cannot see.
+			if up := time.Since(a.startedAt); up > 5*time.Minute && r.Bytes > 0 {
+				perDay := float64(r.Bytes) / up.Hours() * 24
+				note += fmt.Sprintf(" (≈%s/сутки)", bytesHuman(int64(perDay)))
+			}
 		}
 		fmt.Fprintf(&b, "%s %s — %s\n", mark, bot.Esc(r.Name), bot.Esc(note))
 	}

@@ -35,7 +35,48 @@ type positionAdvice struct {
 	// FloorGuarded records that a sell recommendation was withheld because the
 	// live market contradicted it. It is not a normal hold and says so.
 	FloorGuarded bool
+	// Productivity is what this position is expected to earn per GRAM per day.
+	// It is what the verdicts are ranked and, at the bottom end, decided by.
+	Productivity float64
+	// AlreadyCheapest records that no competing offer on any venue undercuts our
+	// ask. Cutting it further gives money away to nobody.
+	AlreadyCheapest bool
 }
+
+// productivity is expected profit per GRAM of capital per day.
+//
+// This is the number a flip is actually judged on, and the one "цель выше
+// входа" cannot express. A position showing +0.2% with a 1% chance of selling
+// inside a week and twelve sellers in front of it is not a green hold — it is
+// three GRAM doing nothing, and the same three GRAM in the next signal are
+// worth several percent. Expected profit, discounted by the chance of actually
+// getting it, spread over the wait it implies, divided by the money tied up:
+// every term is one the operator would have applied by hand.
+func productivity(v pricing.Valuation, cost float64) float64 {
+	if cost <= 0 || !v.Valid {
+		return 0
+	}
+	horizon, chance := 7.0, v.Fill.In7d
+	switch {
+	case v.Fill.In24h >= .5:
+		horizon, chance = 1, v.Fill.In24h
+	case v.Fill.In72h >= .5:
+		horizon, chance = 3, v.Fill.In72h
+	}
+	if chance <= 0 {
+		return 0
+	}
+	return v.Net * chance / horizon / cost
+}
+
+// deadCapital is the productivity below which holding is worse than rotating.
+//
+// Half a percent per GRAM per day is roughly what an ordinary signal offers
+// after its own fill probability, so anything under it is capital that would do
+// better almost anywhere else. It is deliberately not zero: a position that
+// technically shows a profit it will never realise is the most expensive kind
+// of hold, because nothing ever forces the decision.
+const deadCapital = 0.005
 
 // The verdicts shown on a position. They are compared as well as displayed, so
 // they live here rather than as literals at each branch.
@@ -118,6 +159,13 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		ask = v.Price
 	}
 	ad.CheaperElsewhere = countCheaperElsewhere(v, ask, a.cfg.TonnelFee)
+	ad.Productivity = productivity(v, p.BuyPrice)
+	// Being the cheapest offer on every screen is the one state in which cutting
+	// the ask buys nothing: there is no one to get in front of. The engine's
+	// target is an undercut of the nearest competitor, so when that competitor
+	// is already above us the target is below a price the market has not
+	// refused — and following it hands back several percent for free.
+	ad.AlreadyCheapest = v.Walkaway > 0 && ask > 0 && ask <= v.Walkaway
 	check := risk.ExitCheck{Ask: ask, Target: v.Exit, Floor: v.Floor, ExternalRef: ad.CrossReference}
 	contradicted, why := check.ContradictsMarket()
 
@@ -144,6 +192,22 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 	case slow:
 		ad.Action = actHold
 		ad.Reason = "позиция долгая, но свободного кэша хватает — паниковать и лить во флор незачем"
+	case ad.Productivity < deadCapital:
+		// The verdict that was missing. Everything above asks whether the
+		// position is losing money; this asks whether it is doing anything at
+		// all. A +0.2% target that a week of the market gives a one-in-a-hundred
+		// chance of reaching is not a hold, it is capital parked in front of
+		// twelve other sellers.
+		ad.Action = actExit
+		ad.Reason = fmt.Sprintf(
+			"капитал стоит: ожидаемая отдача %.2f%%/день на вложенное (шанс уйти за 7д %s, %s) — те же деньги в следующем сигнале работают лучше",
+			ad.Productivity*100, prob(v.Fill.In7d), queueNote(v.Fill))
+	case ad.AlreadyCheapest && p.ListPrice > 0 && p.ListPrice > v.Exit:
+		// We are already the cheapest thing a buyer can see. The only reason to
+		// go lower would be to get in front of someone, and there is no one.
+		ad.Action = actHold
+		ad.Reason = fmt.Sprintf("мы уже самый дешёвый оффер на всех площадках (ближайший чужой %s) — резать аск не за чем",
+			num(v.Walkaway))
 	case p.ListPrice <= 0 || math.Abs(p.ListPrice/v.Exit-1) >= .02:
 		ad.Action = actRelist
 		ad.Reason = "текущий аск расходится с лучшим выходом с поправкой на риск"
@@ -158,6 +222,57 @@ func (a *App) advisePosition(ctx context.Context, p store.Position, now time.Tim
 		}
 	}
 	return ad
+}
+
+// depthLine is the order book behind a verdict, compressed to one line: the
+// nearest competing offer and where it is, then the first few rungs of the
+// merged ladder a buyer would actually walk down.
+//
+// Every recommendation in this view is derived from these numbers and none of
+// them were on screen, so the only way to tell a sound call from a confident
+// one was to trust it. Three prices and a venue name is the difference.
+func depthLine(ad positionAdvice) string { return valuationDepthLine(ad.Val) }
+
+// valuationDepthLine is the same summary for anything that has been priced,
+// position or candidate.
+func valuationDepthLine(v pricing.Valuation) string {
+	var parts []string
+	if v.Walkaway > 0 {
+		where := v.WalkawayVenue
+		if where == "" {
+			where = "Tonnel"
+		}
+		parts = append(parts, fmt.Sprintf("ближайший чужой %s (%s)", num(v.Walkaway), where))
+	}
+	if len(v.Ladder) > 0 {
+		rungs := make([]string, 0, 3)
+		for _, price := range v.Ladder {
+			if len(rungs) == 3 {
+				break
+			}
+			rungs = append(rungs, num(price))
+		}
+		parts = append(parts, "стакан "+strings.Join(rungs, " / "))
+	}
+	if n := len(v.Cross.Asks); n > 0 {
+		parts = append(parts, fmt.Sprintf("площадки: %d офф., лучший %s", n, num(v.Cross.BestBuyerCost)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " · ")
+}
+
+// queueNote says who is standing in front of the ask, in words.
+func queueNote(f pricing.FillCurve) string {
+	switch {
+	case f.Cheaper > 0:
+		return "впереди " + plural(f.Cheaper, "оффер", "оффера", "офферов")
+	case f.Undercutters > 0:
+		return "рядом " + plural(f.Undercutters, "продавец", "продавца", "продавцов")
+	default:
+		return "очереди перед нами нет"
+	}
 }
 
 // countCheaperElsewhere counts the offers on other venues that a buyer would
@@ -379,13 +494,28 @@ func (a *App) portfolioText(ctx context.Context) string {
 	fmt.Fprintf(&b, "Вложено %s → слить за 72ч %s (%+.1f%%)\n",
 		num(book.Invested), num(book.Mark72h), book.Return()*100)
 	if book.CashKnown {
-		fmt.Fprintf(&b, "Кэш %s · всего %s\n", num(book.Cash), num(book.Mark72h+book.Cash))
+		// "всего" invited the wrong sum. The gifts are counted here at what they
+		// would fetch in three days, not at what they cost, so the total is a
+		// forecast standing next to a bank balance — and a reader adding 24.3 to
+		// 13.5 and getting 37.8 instead of the 38.7 on screen is right to
+		// distrust everything under it. Say which number it is.
+		fmt.Fprintf(&b, "Кэш %s · прогноз NAV через 72ч %s\n", num(book.Cash), num(book.Mark72h+book.Cash))
 	}
 	// Capital efficiency, not ROI. +15% over twenty days is worse than +5% over
 	// two, and only a number with time in its denominator can say so.
-	if book.TonDays > 0 {
-		fmt.Fprintf(&b, "Отдача %+.2f%%/день на вложенный GRAM · %.0f GRAM·дней в работе\n",
-			book.CapitalEfficiency()*100, book.TonDays)
+	//
+	// Split, and each half printed over the days that actually produced it, so
+	// the arithmetic on screen can be checked. One blended figure could not be:
+	// the open book's own move divided by the printed GRAM·days gave half the
+	// printed rate, because banked profit from closed cycles was hiding in the
+	// numerator.
+	if book.OpenTonDays > 0 {
+		fmt.Fprintf(&b, "Открытое: %s за %.0f GRAM·дней → <b>%+.2f%%/день</b>\n",
+			signed(book.Unrealised()), book.OpenTonDays, book.UnrealisedRate()*100)
+	}
+	if closedDays := book.TonDays - book.OpenTonDays; closedDays > 0 {
+		fmt.Fprintf(&b, "Закрытое: %s за %.0f GRAM·дней → %+.2f%%/день\n",
+			signed(book.Realised), closedDays, book.RealisedRate()*100)
 	}
 	if book.StuckCapital > 0 {
 		fmt.Fprintf(&b, "⏳ %s зависло дольше 72ч (%s)\n",
@@ -427,12 +557,23 @@ func (a *App) portfolioText(ctx context.Context) string {
 		// numbers from two different comparisons, so the arithmetic on screen
 		// did not work and the position looked mis-valued. The ask belongs here
 		// too, but as its own fact.
-		fmt.Fprintf(&b, "   вход %s → цель %s · <b>%+.1f%%</b>\n",
-			num(p.BuyPrice), num(ad.Val.Exit), ad.Val.Edge*100)
+		fmt.Fprintf(&b, "   вход %s → цель %s · <b>%+.1f%%</b> · %.2f%%/день\n",
+			num(p.BuyPrice), num(ad.Val.Exit), ad.Val.Edge*100, ad.Productivity*100)
 		fmt.Fprintf(&b, "   %s\n", fillLine(ad.Val))
+		// The book, in one line, because every verdict above rests on it and
+		// none of it was visible. "Держим" against an invisible queue is an
+		// assertion the operator has no way to check, and checking it was the
+		// whole reason to read the list.
+		if line := depthLine(ad); line != "" {
+			fmt.Fprintf(&b, "   %s\n", line)
+		}
 		if p.ListPrice > 0 {
 			line := fmt.Sprintf("   стоим %s", num(p.ListPrice))
-			if !pricing.SamePrice(p.ListPrice, ad.Val.Exit) {
+			// A reprice is only suggested where a reprice is the verdict.
+			// Printing "переставить на 3.517" under ДЕРЖИМ made the desk argue
+			// with itself, and half those moves were worth two kopecks against
+			// a place in the queue that is worth more.
+			if ad.Action == actRelist && !pricing.SamePrice(p.ListPrice, ad.Val.Exit) {
 				line += fmt.Sprintf(" · переставить на %s", num(ad.Val.Exit))
 			}
 			if costIsProvisional(&p) {
@@ -444,6 +585,11 @@ func (a *App) portfolioText(ctx context.Context) string {
 		}
 		if note := ad.marketNote(); note != "" {
 			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(note))
+		}
+		// Why this verdict, in the engine's own words. One line, always, because
+		// a colour with no reason under it cannot be argued with.
+		if ad.Reason != "" {
+			fmt.Fprintf(&b, "   └ <i>%s</i>\n", bot.Esc(ad.Reason))
 		}
 	}
 	return b.String()
@@ -476,6 +622,13 @@ func sortByUrgency(ads []positionAdvice) {
 	sort.SliceStable(ads, func(i, j int) bool {
 		if ri, rj := rank(ads[i]), rank(ads[j]); ri != rj {
 			return ri < rj
+		}
+		// Within a verdict, the worst use of capital first. Two positions both
+		// marked for exit are not equally urgent: the one earning nothing on
+		// four GRAM is costing more than the one earning nothing on one, and
+		// opportunity cost is the whole reason either is on the list.
+		if pi, pj := ads[i].Productivity, ads[j].Productivity; pi != pj {
+			return pi < pj
 		}
 		return ads[i].Position.BuyPrice > ads[j].Position.BuyPrice
 	})

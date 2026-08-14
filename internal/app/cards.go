@@ -130,6 +130,12 @@ func headlineBlock(dec *signal.Decision) string {
 	fmt.Fprintf(&b, "%s → %s · <b>%s</b> · чистыми %s\n",
 		num(v.Cost), num(v.FastExit), pct(v.Edge), num(v.Net))
 	fmt.Fprintf(&b, "%s\n", fillLine(v))
+	// The queue the two lines above were computed from. Without it the card
+	// asserts a price and a probability and offers nothing to check them
+	// against — which is exactly the complaint: "не видно, пиздит или нет".
+	if line := valuationDepthLine(v); line != "" {
+		fmt.Fprintf(&b, "%s\n", line)
+	}
 	// Whichever layer is holding the verdict down, in its own words. This is the
 	// line that used to be missing entirely: the card showed a downgraded verdict
 	// and left the operator to guess which of a dozen numbers caused it.
@@ -245,8 +251,8 @@ func fillLine(v pricing.Valuation) string {
 	if f.BuyersPerDay <= 0 {
 		return "продажа: модель не торгуется — оценить нечем"
 	}
-	line := fmt.Sprintf("продать: 24ч %.0f%% · 72ч %.0f%% · 7д %.0f%%",
-		f.In24h*100, f.In72h*100, f.In7d*100)
+	line := fmt.Sprintf("продать: 24ч %s · 72ч %s · 7д %s",
+		prob(f.In24h), prob(f.In72h), prob(f.In7d))
 	switch {
 	case f.Cheaper > 0:
 		line += fmt.Sprintf(" · впереди %s", plural(f.Cheaper, "оффер", "оффера", "офферов"))
@@ -560,6 +566,43 @@ func plural(n int, one, few, many string) string {
 		}
 	}
 	return fmt.Sprintf("%d %s", n, word)
+}
+
+// signed renders a GRAM amount with its sign always shown, for the places where
+// the number is a change rather than a level.
+func signed(v float64) string {
+	if v > 0 {
+		return "+" + num(v)
+	}
+	return num(v)
+}
+
+// prob renders a fill probability without pretending to a precision the market
+// cannot support.
+//
+// The curve is a Poisson tail over a queue counted from a handful of standing
+// offers and an arrival rate estimated from a fortnight of a thin market. It
+// will happily return 0.000 and 1.000, and printing those as "0%" and "100%"
+// states a certainty that nothing in the inputs justifies — a model with two
+// buyers a week and nobody in front of us is not a guaranteed sale in seven
+// days, it is an estimate with a wide mouth. The bands say what is actually
+// known: very unlikely, very likely, and a number in between.
+func prob(p float64) string {
+	switch {
+	case p <= 0.05:
+		return "<5%"
+	case p >= 0.95:
+		return ">95%"
+	default:
+		return fmt.Sprintf("%.0f%%", p*100)
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func minInt(a, b int) int {

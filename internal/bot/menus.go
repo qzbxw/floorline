@@ -151,7 +151,7 @@ func helpMenuReply() Reply {
 			"<b>Торговать</b>\n" +
 			"<code>/trade</code> · сессия по ликвидным парам\n" +
 			"<code>/trade off</code> · выйти из сессии\n" +
-			"<code>/scan</code> · разовый скан рынка\n" +
+			"<code>/scan [коллекция] [сколько]</code> · разовый скан рынка\n" +
 			"<code>/val ID</code> · оценка лота — или кинь ссылку из Tonnel\n\n" +
 
 			"<b>Смотреть рынок</b>\n" +

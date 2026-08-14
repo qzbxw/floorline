@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,7 +78,7 @@ type Candidate struct {
 // back instead was "the venues did not answer" on every candidate — which caps
 // the score, blocks unattended buying, and poisoned the shared quote cache for
 // the feed as well.
-func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Time) []Candidate {
+func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Time, keep int) []Candidate {
 	room, hasRoom := a.spendable()
 	limits := a.rm.Limits()
 
@@ -85,7 +86,7 @@ func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Tim
 	for _, key := range keys {
 		select {
 		case <-ctx.Done():
-			return rankCandidates(found)
+			return rankCandidates(found, keep)
 		default:
 		}
 
@@ -123,7 +124,7 @@ func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Tim
 			})
 		}
 	}
-	return rankCandidates(found)
+	return rankCandidates(found, keep)
 }
 
 // refine re-prices the head of the shortlist against the queue for its own
@@ -166,10 +167,17 @@ func (a *App) refine(ctx context.Context, in []Candidate, now time.Time, limit i
 	return in
 }
 
-func rankCandidates(in []Candidate) []Candidate {
+// rankCandidates orders by conviction and cuts to what the caller asked for.
+// The cut is the caller's because /scan takes an explicit limit: a sweep that
+// always returns the same eight rows cannot answer "show me everything that
+// clears the bar".
+func rankCandidates(in []Candidate, keep int) []Candidate {
+	if keep <= 0 {
+		keep = scanKeep
+	}
 	sort.SliceStable(in, func(i, j int) bool { return in[i].Score > in[j].Score })
-	if len(in) > scanKeep {
-		in = in[:scanKeep]
+	if len(in) > keep {
+		in = in[:keep]
 	}
 	return in
 }
@@ -278,7 +286,7 @@ func (a *App) pollScan(ctx context.Context) error {
 		return nil
 	}
 	now := time.Now()
-	found := a.refine(ctx, a.scanPass(ctx, keys, now), now, scanRefine)
+	found := a.refine(ctx, a.scanPass(ctx, keys, now, scanKeep), now, scanRefine)
 
 	a.mu.Lock()
 	a.lastScan, a.lastScanFound = now, len(found)
@@ -315,7 +323,52 @@ func (a *App) pollScan(ctx context.Context) error {
 }
 
 // scanText renders the current shortlist for /scan.
-func (a *App) scanText(ctx context.Context, collection string) string {
+// scanArg splits a /scan payload into a collection and an explicit limit.
+//
+// The limit is the operator's, not ours. A sweep that always returns the same
+// eight rows out of a market of thousands is answering a question nobody asked:
+// sometimes the point is to see everything that clears the bar, and the desk has
+// no business deciding that eight is enough.
+//
+// The number is taken from the end of the payload, so "Plush Pepe 25" reads the
+// way it looks. A collection whose name ends in a number would be ambiguous, and
+// none of them do.
+func scanArg(arg string) (collection string, limit int) {
+	fields := strings.Fields(strings.TrimSpace(arg))
+	if len(fields) == 0 {
+		return "", 0
+	}
+	if n, err := strconv.Atoi(fields[len(fields)-1]); err == nil && n > 0 {
+		return strings.Join(fields[:len(fields)-1], " "), n
+	}
+	return strings.Join(fields, " "), 0
+}
+
+const (
+	// scanMaxKeep and scanMaxModels bound what one command may ask for. The
+	// ceiling is not taste, it is a Telegram message that still sends and a
+	// sweep that finishes inside its deadline.
+	scanMaxKeep   = 40
+	scanMaxModels = 300
+	// scanFrugalModels is the widest sweep worth running while the traffic is
+	// being paid for by the byte: each model is a book read.
+	scanFrugalModels = 60
+)
+
+func (a *App) scanText(ctx context.Context, arg string) string {
+	collection, want := scanArg(arg)
+	keep, models := scanKeep, scanModelsPerPass
+	if want > 0 {
+		keep = minInt(want, scanMaxKeep)
+		// Widen the sweep to have something to fill the request with: asking for
+		// twenty-five candidates out of forty models is asking the market to be
+		// mispriced two-thirds of the time.
+		models = minInt(maxInt(scanModelsPerPass, want*8), scanMaxModels)
+	}
+	frugalCapped := false
+	if a.frugal() && models > scanFrugalModels {
+		models, frugalCapped = scanFrugalModels, true
+	}
 	room, hasRoom := a.spendable()
 
 	var keys []tonnel.ModelKey
@@ -334,21 +387,28 @@ func (a *App) scanText(ctx context.Context, collection string) string {
 			return "Не нашёл коллекцию " + bot.Esc(collection)
 		}
 	} else {
-		keys = a.scanKeys(ctx, scanModelsPerPass)
+		keys = a.scanKeys(ctx, models)
 	}
 	if len(keys) == 0 {
 		return "Пока нечего сканировать — рынок ещё не прогрузился."
 	}
 
 	now := time.Now()
-	found := a.refine(ctx, a.scanPass(ctx, keys, now), now, scanRefine)
+	found := a.refine(ctx, a.scanPass(ctx, keys, now, keep), now, minInt(scanRefine, keep))
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔭 <b>Скан</b> · %s", plural(len(keys), "модель", "модели", "моделей"))
 	if hasRoom {
 		fmt.Fprintf(&b, " · в пределах %s", num(room))
 	}
-	b.WriteString("\n\n")
+	if want > 0 {
+		fmt.Fprintf(&b, " · показываю до %d", keep)
+	}
+	b.WriteString("\n")
+	if frugalCapped {
+		fmt.Fprintf(&b, "<i>Свой адрес отказывают, читаю через платный прокси — сузил проход до %d моделей.</i>\n", scanFrugalModels)
+	}
+	b.WriteString("\n")
 
 	if len(found) == 0 {
 		b.WriteString("Пусто. Это норма — рынок чаще честный, чем нет.")

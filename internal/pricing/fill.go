@@ -45,6 +45,10 @@ const (
 	// maxQueueAhead caps the queue length fed to the Poisson tail. Past this the
 	// answer is "no" and the factorials stop being worth computing.
 	maxQueueAhead = 40
+	// ladderShown is how much of the merged queue is kept for display. Three
+	// rungs is what a reader can check at a glance and enough to see whether the
+	// price in front of us is a wall or a step.
+	ladderShown = 6
 )
 
 // FillCurve is the chance of being sold within each horizon, and the queue that

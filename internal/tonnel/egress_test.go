@@ -250,7 +250,7 @@ func TestWritesStickToTheFreeRouteThatAnswered(t *testing.T) {
 func TestStatusesPutTheProblemFirstAndCountTraffic(t *testing.T) {
 	p := testPool(t, "socks5://a:b@gw:823")
 	now := time.Now()
-	p.all[0].meter(3 << 20)
+	p.all[0].bytes = 3 << 20 // as the socket counter would have folded in
 	rest(p.all[0], now)
 	p.all[0].lastErr = (&APIError{Op: "/api/pageGifts", Route: "gw:823", Status: 403, Message: "cloudflare challenge"}).Error()
 

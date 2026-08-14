@@ -443,8 +443,12 @@ func (a *App) WaiveCalibration(ctx context.Context, on bool) bot.Reply {
 }
 
 // Scan sweeps the standing book for mispriced lots.
-func (a *App) Scan(ctx context.Context, collection string) bot.Reply {
-	return bot.Text(a.scanText(ctx, collection))
+//
+// The argument is a collection, a limit, or both: "/scan 25" widens the sweep
+// and shows up to twenty-five, "/scan Plush Pepe 15" does the same inside one
+// collection.
+func (a *App) Scan(ctx context.Context, arg string) bot.Reply {
+	return bot.Text(a.scanText(ctx, arg))
 }
 
 // Trade opens, refreshes or closes a trading session.

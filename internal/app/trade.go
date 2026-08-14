@@ -204,7 +204,7 @@ func (a *App) sessionBoard(ctx context.Context) string {
 	}
 	fmt.Fprintf(&b, "<i>%s</i>\n\n", bot.Esc(strings.Join(names, " · ")))
 
-	found := a.scanPass(ctx, s.Pairs, time.Now())
+	found := a.scanPass(ctx, s.Pairs, time.Now(), scanKeep)
 	if len(found) == 0 {
 		b.WriteString("Сейчас в этих парах ничего с плюсовым эджем. Это нормально — жми обновить.\n")
 	}

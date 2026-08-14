@@ -61,6 +61,7 @@ type Egress struct {
 	calls       int64
 	blocks      int64
 	bytes       int64
+	wire        int64 // last reading of the transport's own byte counter
 }
 
 // EgressStatus is a route's health, for /status and the smoke command.
@@ -126,10 +127,20 @@ func (e *Egress) reward(now time.Time) {
 	e.calls++
 }
 
-// meter records traffic, whatever the request came back with.
-func (e *Egress) meter(bytes int64) {
+// meter reads the socket counter and folds whatever this route has moved since
+// last time into its own total. Called after every request, whatever it came
+// back with: a refusal costs bytes too.
+func (e *Egress) meter() {
+	tracker := e.http.GetBandwidthTracker()
+	if tracker == nil {
+		return // a transport built without tracking; nothing to count
+	}
+	moved := tracker.GetTotalBandwidth()
 	e.mu.Lock()
-	e.bytes += bytes
+	if moved > e.wire {
+		e.bytes += moved - e.wire
+	}
+	e.wire = moved
 	e.mu.Unlock()
 }
 
@@ -225,6 +236,13 @@ func newEgress(name, proxy string, timeout time.Duration) (*Egress, error) {
 		// address's clearance and prove we are not who we claim to be.
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
 		tls_client.WithCatchPanics(),
+		// Counts bytes at the socket, which is the only place they can be
+		// counted honestly. Tonnel serves brotli and the transport unpacks it
+		// transparently, so the decoded body overstates the wire by roughly
+		// four times — filterStats decodes to 359 KB and costs 80 KB. Metering
+		// the wrong one would have the desk think it had burnt its plan long
+		// before it had.
+		tls_client.WithBandwidthTracker(),
 	}
 	if proxy != "" {
 		opts = append(opts, tls_client.WithProxyUrl(proxy))
@@ -373,6 +391,27 @@ func (p *egressPool) available(now time.Time) int {
 		}
 	}
 	return n
+}
+
+// meteredOnly reports whether every route that could carry a read right now
+// costs money. That is the signal the desk uses to go frugal: it is not "a
+// proxy is configured", it is "the free address is unavailable and every
+// request from here on is being paid for".
+func (p *egressPool) meteredOnly(now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	free, metered := 0, 0
+	for _, e := range p.all {
+		if !e.available(now) {
+			continue
+		}
+		if e.metered {
+			metered++
+		} else {
+			free++
+		}
+	}
+	return free == 0 && metered > 0
 }
 
 func (p *egressPool) size() int {

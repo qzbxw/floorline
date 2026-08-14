@@ -219,6 +219,11 @@ func (c *Client) RoutesAvailable() int { return c.pool.available(time.Now()) }
 // RouteCount is how many routes exist at all.
 func (c *Client) RouteCount() int { return c.pool.size() }
 
+// Metered reports whether reads are currently being paid for by the byte —
+// every free route refused, only a metered one left. Callers use it to trade
+// freshness for traffic while, and only while, that is the choice on the table.
+func (c *Client) Metered() bool { return c.pool.meteredOnly(time.Now()) }
+
 // LastSuccess returns when the last call succeeded.
 func (c *Client) LastSuccess() time.Time {
 	n := c.lastOK.Load()
@@ -418,7 +423,7 @@ func (c *Client) do(ctx context.Context, o callOpts, payload []byte, route *Egre
 	}
 	// Counted whatever the answer was: a refusal costs bytes too, and on a plan
 	// sold by the gigabyte the desk has to be able to see where they went.
-	route.meter(int64(len(body)))
+	route.meter()
 
 	if resp.StatusCode != http.StatusOK {
 		return &APIError{Op: o.path, Route: route.Name(), Status: resp.StatusCode, Message: extractMessage(body), Body: string(body)}

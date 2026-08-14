@@ -68,6 +68,9 @@ type App struct {
 	// would otherwise be untestable. Both are nil in production.
 	notifier  func(string)
 	lastAPIOK func() time.Time
+	// metered overrides "are reads being paid for", for the same reason: a pool
+	// cannot be pushed onto its paid route from outside the client.
+	metered func() bool
 
 	mu          sync.RWMutex
 	pollers     map[string]*pollerState
@@ -171,6 +174,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	}
 
 	a.books = pricing.NewBookCache(a.api, cfg.BookCacheTTL, 30)
+	a.books.Frugal = a.frugal
 
 	a.rm, err = risk.New(ctx, st)
 	if err != nil {
@@ -415,6 +419,29 @@ const coolProbePoller = "stats"
 // the door rather than a second attempt to break it down.
 const coolProbeEvery = 2 * time.Minute
 
+// frugalEvery is the slowest each poller may run while the traffic is being
+// paid for by the byte.
+//
+// Measured on the wire, compressed, with TLS overhead: filterStats is 80 KB a
+// call, pageGifts 3.8 KB for thirty rows, saleHistory 3.3 KB, myGifts 2.2 KB.
+// At the free-route rates that is ~157 MB a day, and a 5 GB residential plan
+// lasts a month only if nothing else ever happens. The snapshot alone is 71% of
+// it — once a minute for a number the desk is allowed to act on when it is up
+// to five minutes old (AUTOBUY_MAX_DATA_AGE).
+//
+// At these intervals the same day costs about 40 MB, so the plan lasts four
+// months rather than four weeks. Nothing here is a degradation the operator
+// would notice: the market itself still arrives instantly on the event stream,
+// which costs nothing and does not go through the proxy at all. This is only
+// about the questions the stream cannot answer.
+var frugalEvery = map[string]time.Duration{
+	"stats":     4 * time.Minute,  // 80 KB a call — 112 MB/day becomes 28
+	"sales":     10 * time.Minute, // the tape comes from the stream now anyway
+	"inventory": 3 * time.Minute,  // our own gifts change when we change them
+	"scan":      30 * time.Minute, // a sweep of the standing book is not urgent
+	"feed":      2 * time.Minute,  // only runs at all when the stream is down
+}
+
 // mayPoll decides whether a poller may run this tick.
 //
 // This is the missing half of the block response, and its absence is what the
@@ -437,14 +464,30 @@ func (a *App) mayPoll(name string) bool {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if now.After(a.coolUntil) {
+	if !now.After(a.coolUntil) {
+		if name != coolProbePoller || now.Sub(a.lastProbe) < coolProbeEvery {
+			return false
+		}
+		a.lastProbe = now
 		return true
 	}
-	if name != coolProbePoller || now.Sub(a.lastProbe) < coolProbeEvery {
-		return false
+	// Not blocked, but possibly paying. While every free address is refused,
+	// each poller keeps its own floor on how often it may spend money.
+	if every, ok := frugalEvery[name]; ok && a.frugal() {
+		if ps := a.pollers[name]; ps != nil && !ps.LastRun.IsZero() && now.Sub(ps.LastRun) < every {
+			return false
+		}
 	}
-	a.lastProbe = now
 	return true
+}
+
+// frugal reports whether Tonnel reads are currently costing money. Callers hold
+// no lock on the client; the pool answers from its own state.
+func (a *App) frugal() bool {
+	if a.metered != nil {
+		return a.metered()
+	}
+	return a.api != nil && a.api.Metered()
 }
 
 // apiLastOK is when Tonnel last answered anything.

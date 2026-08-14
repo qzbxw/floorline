@@ -40,6 +40,10 @@ type bookSummary struct {
 	// TonDays is capital multiplied by the days it has been committed. It is the
 	// denominator that turns a percentage into a rate.
 	TonDays float64
+	// OpenTonDays is the part of it belonging to positions still held, so the
+	// open book's progress can be divided by the days that produced it rather
+	// than by every day the desk has ever traded.
+	OpenTonDays float64
 	// Stuck and StuckCapital count the positions past the flip horizon.
 	Stuck        int
 	StuckCapital float64
@@ -73,6 +77,32 @@ func (b bookSummary) CapitalEfficiency() float64 {
 	return (b.Mark72h - b.Invested + b.Realised) / b.TonDays
 }
 
+// Unrealised and UnrealisedRate split the open book out of that number.
+//
+// One figure over one denominator was not readable. The header printed
+// "+2.93%/день" beside "51 GRAM·дней в работе", and dividing the open book's
+// own progress by that denominator gives 1.4% — a reader who checks the
+// arithmetic on screen finds it does not work, because the numerator silently
+// included profit already banked on positions that closed days ago. Both facts
+// are worth having; mixed into one ratio, neither can be verified.
+func (b bookSummary) Unrealised() float64 { return b.Mark72h - b.Invested }
+
+func (b bookSummary) UnrealisedRate() float64 {
+	if b.OpenTonDays <= 0 {
+		return 0
+	}
+	return b.Unrealised() / b.OpenTonDays
+}
+
+// RealisedRate is what the closed cycles actually returned per GRAM per day.
+func (b bookSummary) RealisedRate() float64 {
+	closed := b.TonDays - b.OpenTonDays
+	if closed <= 0 {
+		return 0
+	}
+	return b.Realised / closed
+}
+
 // summarise measures the whole book from the per-position advice.
 func summarise(ads []positionAdvice, now time.Time) bookSummary {
 	b := bookSummary{
@@ -91,6 +121,7 @@ func summarise(ads []positionAdvice, now time.Time) bookSummary {
 
 		if held := heldFor(p, now); held > 0 {
 			b.TonDays += p.BuyPrice * held.Hours() / 24
+			b.OpenTonDays += p.BuyPrice * held.Hours() / 24
 			if held >= stuckAfter {
 				b.Stuck++
 				b.StuckCapital += p.BuyPrice

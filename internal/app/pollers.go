@@ -799,11 +799,22 @@ func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time
 		return
 	}
 
-	if err := a.st.SetPositionSold(ctx, p.GiftID, price, soldAt); err != nil {
+	if err := a.bookSale(ctx, p, price, soldAt, "подтверждено лентой сделок Tonnel"); err != nil {
 		log.Warn().Err(err).Int64("gift", p.GiftID).Msg("closing position failed")
-		return
 	}
-	_ = a.st.RecordPositionEvent(ctx, p.GiftID, "sold", p.ListPrice, price, "confirmed by Tonnel sale history", soldAt)
+}
+
+// bookSale closes a position and reports it. Both paths that can discover a
+// sale — the event feed and the inventory reconciliation — end here, so a sale
+// is recorded and announced the same way whichever noticed it first.
+func (a *App) bookSale(ctx context.Context, p store.Position, price float64, soldAt time.Time, source string) error {
+	if soldAt.IsZero() {
+		soldAt = time.Now()
+	}
+	if err := a.st.SetPositionSold(ctx, p.GiftID, price, soldAt); err != nil {
+		return err
+	}
+	_ = a.st.RecordPositionEvent(ctx, p.GiftID, "sold", p.ListPrice, price, source, soldAt)
 
 	msg := fmt.Sprintf("💰 <b>Продано</b> — %s\nВход %s → выход %s",
 		bot.Esc(p.Key.String()), num(p.BuyPrice), num(price))
@@ -812,7 +823,11 @@ func (a *App) closePosition(ctx context.Context, p store.Position, now time.Time
 		msg += fmt.Sprintf("\nНет %s (%+.1f%%), держали %s",
 			num(net), net/p.BuyPrice*100, dur(soldAt.Sub(p.BoughtAt)))
 	}
+	if p.Status == store.StatusMissing {
+		msg += "\n<i>Позиция числилась пропавшей — продажа нашлась и закрыта задним числом.</i>"
+	}
 	a.notify(msg)
+	return nil
 }
 
 const (
@@ -977,16 +992,34 @@ func (a *App) checkStale(ctx context.Context, p store.Position, now time.Time) {
 	if liq.Velocity <= 0 {
 		return
 	}
-	expected := time.Duration(3 / liq.Velocity * float64(24*time.Hour))
+	// How long this position should have taken depends on where it stands in the
+	// queue, not only on how often the model trades.
+	//
+	// The old estimate was the model's own turnover — three sales' worth of
+	// waiting — and it produced the line the operator called out: "торгуется 1.5
+	// раза в день, должна была уйти за 16ч" printed against a position with
+	// twenty offers in front of it. Twenty buyers have to arrive before ours
+	// does; at 1.5 a day that is a fortnight, not sixteen hours. Every buyer
+	// takes the cheapest offer on the screen, so the queue is the estimate and
+	// the trade rate is only its speed.
+	queue := 0
+	if book, err := a.books.Get(ctx, p.Key); err == nil && book != nil && p.ListPrice > 0 {
+		queue = book.CountBelow(p.ListPrice, p.GiftID, a.api.UserID())
+	}
+	expected := time.Duration(float64(queue+1) / liq.Velocity * float64(24*time.Hour))
 	if held < expected {
 		return
 	}
 	if !a.throttle(fmt.Sprintf("stale:%d", p.GiftID), 24*time.Hour) {
 		return
 	}
+	queueNote := "перед нами никого"
+	if queue > 0 {
+		queueNote = "впереди " + plural(queue, "оффер", "оффера", "офферов")
+	}
 	a.notify(fmt.Sprintf(
-		"🕸 <b>Позиция залежалась</b> — %s\nДержим %s, а модель торгуется %.1f×/день — должна была уйти за ~%s.\nВход %s · аск %s · <code>/relist %d</code>",
-		bot.Esc(p.Key.String()), dur(held), liq.Velocity, dur(expected/3), num(p.BuyPrice), num(p.ListPrice), p.GiftID))
+		"🕸 <b>Позиция залежалась</b> — %s\nДержим %s, модель торгуется %.1f×/день, %s — ждать стоило ~%s.\nВход %s · аск %s · <code>/relist %d</code>",
+		bot.Esc(p.Key.String()), dur(held), liq.Velocity, queueNote, dur(expected), num(p.BuyPrice), num(p.ListPrice), p.GiftID))
 }
 
 // checkWatch alerts on any listing of a watched model under the price the
