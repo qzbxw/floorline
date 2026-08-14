@@ -86,6 +86,9 @@ var colourFamilies = map[string]string{
 	"orange": "warm", "amber": "warm", "tangerine": "warm", "apricot": "warm",
 	"mustard": "warm", "gold": "warm", "golden": "warm", "honey": "warm",
 	"copper": "warm", "bronze": "warm", "caramel": "warm",
+	// Named after the thing rather than the colour, but unmistakably the
+	// colour: a Midas anything is gold, and the market prices it as gold.
+	"midas": "warm", "gilded": "warm", "aurum": "warm", "brass": "warm",
 
 	"pink": "pink", "rose": "pink", "magenta": "pink", "fuchsia": "pink",
 	"blush": "pink", "salmon": "pink",
@@ -94,8 +97,29 @@ var colourFamilies = map[string]string{
 	"walnut": "earth", "sand": "earth", "beige": "earth", "clay": "earth",
 }
 
+// Hints are the facts about a gift that its attribute names cannot carry.
+//
+// The colour is the one that matters. "Cyberpunk" is violet and "Old Gold" is
+// gold, and neither name contains a colour word — so every judgement about the
+// look was blind to exactly the backdrops whose whole value is that they match
+// something. The catalogue publishes the real colour; this is where it enters.
+type Hints struct {
+	// BackdropFamily is the colour family of the backdrop, read from its actual
+	// colour rather than from its name. Empty means fall back to the name.
+	BackdropFamily string
+	// Model is the model name, which carries a colour of its own often enough
+	// to matter: a Midas Bunny on Old Gold is gold on gold, and comparing only
+	// backdrop against symbol could never see it.
+	Model string
+}
+
 // Appraise reads a gift's appearance from its attribute names and number.
 func Appraise(backdrop, symbol string, giftNum int64) Appearance {
+	return AppraiseWith(backdrop, symbol, giftNum, Hints{})
+}
+
+// AppraiseWith is Appraise given what the catalogue knows.
+func AppraiseWith(backdrop, symbol string, giftNum int64, hints Hints) Appearance {
 	var a Appearance
 
 	bd := words(backdrop)
@@ -116,9 +140,21 @@ func Appraise(backdrop, symbol string, giftNum int64) Appearance {
 		}
 	}
 
-	if fam := family(bd); fam != "" && fam == family(words(symbol)) {
-		a.Mono, a.Premium = true, true
-		a.Reasons = append(a.Reasons, "моно: фон и символ в одной гамме")
+	// Mono is one palette across the specimen, and it is worth naming which two
+	// parts agree — "gold on gold" is a different sentence from "the symbol
+	// happens to match the background".
+	backdropFamily := hints.BackdropFamily
+	if backdropFamily == "" {
+		backdropFamily = family(bd)
+	}
+	if backdropFamily != "" {
+		if symbolFamily := family(words(symbol)); symbolFamily == backdropFamily {
+			a.Mono, a.Premium = true, true
+			a.Reasons = append(a.Reasons, "моно: фон и символ в одной гамме")
+		} else if modelFamily := family(words(hints.Model)); modelFamily == backdropFamily {
+			a.Mono, a.Premium = true, true
+			a.Reasons = append(a.Reasons, "моно: модель и фон в одной гамме")
+		}
 	}
 
 	if class := numberClass(giftNum); class != "" {

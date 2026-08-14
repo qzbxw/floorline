@@ -21,6 +21,7 @@ import (
 	"floorline/internal/store"
 	"floorline/internal/tgsession"
 	"floorline/internal/tonnel"
+	"floorline/internal/traits"
 	"floorline/internal/venue"
 )
 
@@ -39,12 +40,16 @@ type App struct {
 	evalQ chan tonnel.Gift
 
 	books *pricing.BookCache
-	det   *signal.Detector
-	rm    *risk.Manager
-	ex    *exec.Executor
-	cross *market.Comparison
-	fx    *fx.Client
-	tg    *bot.Bot
+	// traits is the gift catalogue: mint rarity and real backdrop colours, from
+	// a source that is not a marketplace. It answers "what is this specimen"
+	// where every other input answers "what is someone asking for it".
+	traits *traits.Client
+	det    *signal.Detector
+	rm     *risk.Manager
+	ex     *exec.Executor
+	cross  *market.Comparison
+	fx     *fx.Client
+	tg     *bot.Bot
 	// session is the real Telegram account the marketplaces' mini apps are
 	// opened through. Nil when it is not configured; everything degrades to
 	// pasted credentials rather than failing.
@@ -175,6 +180,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 
 	a.books = pricing.NewBookCache(a.api, cfg.BookCacheTTL, 30)
 	a.books.Frugal = a.frugal
+	a.traits = traits.New(cfg.TraitsHost, cfg.HTTPTimeout)
 
 	a.rm, err = risk.New(ctx, st)
 	if err != nil {
@@ -249,8 +255,9 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 			venue.NewMRKT(vhttp, venueSession, cfg.MrktFee, venue.HumanPace()),
 		)
 	}
+	a.det.Traits = a.traitHints
 	a.det.CrossSupport = a.crossMarketDepth
-	a.det.Spendable = a.spendable
+	a.det.Spendable = a.spendableWhy
 
 	// The Telegram client is created in Run, not here: `smoke` and `backfill`
 	// must work with nothing but a Tonnel session, and connecting to Telegram

@@ -135,3 +135,37 @@ func TestOrdinaryGiftIsStillCappedByTheModelQueue(t *testing.T) {
 		t.Errorf("exit %.4f priced through the external queue at %.4f", v.FastExit, want)
 	}
 }
+
+// "Midas Bunny" on "Old Gold" is gold on gold, and the old rule could see
+// neither half: it compared backdrop against symbol only, by matching colour
+// words in names that do not contain any.
+func TestMonoSeesTheModelAndTheRealColour(t *testing.T) {
+	// Names alone: nothing matches, because "Chest" is not a colour and the
+	// model was never consulted.
+	plain := Appraise("Old Gold", "Chest", 38163)
+	if plain.Mono {
+		t.Fatal("mono claimed from names that share no colour word")
+	}
+
+	// With the model in hand, gold-on-gold is visible.
+	withModel := AppraiseWith("Old Gold", "Chest", 38163, Hints{Model: "Midas Bunny"})
+	if !withModel.Mono {
+		t.Fatal("a gold model on a gold backdrop did not read as mono")
+	}
+	if !withModel.Premium {
+		t.Fatal("mono did not mark the specimen as worth comparing carefully")
+	}
+
+	// And the catalogue's colour beats the name: "Cyberpunk" contains no colour
+	// word at all, but it is violet, and a violet symbol matches it.
+	byColour := AppraiseWith("Cyberpunk", "Amethyst Skull", 12, Hints{BackdropFamily: "purple"})
+	if !byColour.Mono {
+		t.Fatal("a backdrop classified by its actual colour did not match")
+	}
+	// A hint that disagrees with the names is the one believed, because it is
+	// measured rather than guessed.
+	mismatch := AppraiseWith("Old Gold", "Chest", 12, Hints{BackdropFamily: "blue", Model: "Midas Bunny"})
+	if mismatch.Mono {
+		t.Fatal("the name won over the catalogue's colour")
+	}
+}

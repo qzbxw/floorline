@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"floorline/internal/tonnel"
+	"floorline/internal/traits"
 )
 
 // SignalGates decides what gets pushed to Telegram as an actionable card.
@@ -71,6 +72,10 @@ type Config struct {
 	EventsEnabled bool
 	// EventHost serves the event socket and its replay endpoint.
 	EventHost string
+	// TraitsHost serves the gift catalogue — mint rarity and backdrop colours.
+	// It is not a marketplace and shares nothing with Tonnel: no credentials,
+	// no anti-bot layer, and none of the metered proxy plan.
+	TraitsHost string
 
 	// TonnelProxy routes Tonnel traffic through another egress. When the
 	// refusals are per-IP rather than per-request — which is what a 429 on
@@ -197,6 +202,7 @@ func Load() (*Config, error) {
 		TonnelProxies:   envProxyList("TONNEL_PROXIES"),
 		EventsEnabled:   envBool("EVENTS_ENABLED", true),
 		EventHost:       envStr("EVENTS_HOST", tonnel.EventHost),
+		TraitsHost:      envStr("TRAITS_HOST", traits.DefaultHost),
 		PortalsAuth:     os.Getenv("PORTALS_AUTH_DATA"),
 		MrktInit:        os.Getenv("MRKT_INIT_DATA"),
 		MrktToken:       os.Getenv("MRKT_TOKEN"),

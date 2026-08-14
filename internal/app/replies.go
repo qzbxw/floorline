@@ -444,11 +444,55 @@ func (a *App) WaiveCalibration(ctx context.Context, on bool) bot.Reply {
 
 // Scan sweeps the standing book for mispriced lots.
 //
-// The argument is a collection, a limit, or both: "/scan 25" widens the sweep
-// and shows up to twenty-five, "/scan Plush Pepe 15" does the same inside one
-// collection.
+// The argument is a collection, a price band, a result limit, or any
+// combination: "/scan 3-5", "/scan 25", "/scan Plush Pepe 3-5 15".
 func (a *App) Scan(ctx context.Context, arg string) bot.Reply {
-	return bot.Text(a.scanText(ctx, arg))
+	r := bot.Text(a.scanText(ctx, arg))
+	// Always a way back to the band picker: the first thing anyone wants after
+	// reading a sweep is the same sweep one band over.
+	return r.WithRow(bot.Callback("🔭 Другой диапазон", cbRefresh, "scan"))
+}
+
+// ScanMenu asks which price band to sweep before spending any requests on one.
+//
+// The sweep used to start the moment the button was pressed, bounded by the
+// free balance, which answers "what can I buy right now" — and that is not the
+// question most of the time. Asking first costs one tap and makes the band a
+// decision rather than a default nobody chose.
+func (a *App) ScanMenu(ctx context.Context) bot.Reply {
+	var b strings.Builder
+	b.WriteString("🔭 <b>Скан</b> — в каком диапазоне искать?\n\n")
+	room, known := a.spendable()
+	if known {
+		fmt.Fprintf(&b, "Свободно под покупку сейчас <b>%s</b>", num(room))
+		if l := a.rm.Limits(); l.MinBalanceReserve > 0 {
+			if bal, ok := a.rm.Balance(); ok {
+				fmt.Fprintf(&b, " (баланс %s − резерв %s)", num(bal), num(l.MinBalanceReserve))
+			}
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("Диапазон — про рынок, а не про кошелёк: можно смотреть и выше того, что сейчас лежит.\n\n")
+	b.WriteString("Текстом тоже работает: <code>/scan 3-5</code> · <code>/scan -5</code> · <code>/scan Plush Pepe 3-5 25</code>")
+
+	r := bot.Text(b.String())
+	// Bands, not a keypad. Four taps that cover the whole market beat a free
+	// text field on a phone, and the exact number is one message away for the
+	// rare case it matters.
+	r = r.WithRow(
+		bot.Callback("до 3", cbRefresh, "scan:-3"),
+		bot.Callback("3 – 5", cbRefresh, "scan:3-5"),
+		bot.Callback("5 – 10", cbRefresh, "scan:5-10"),
+	)
+	r = r.WithRow(
+		bot.Callback("10 – 20", cbRefresh, "scan:10-20"),
+		bot.Callback("20 – 50", cbRefresh, "scan:20-50"),
+		bot.Callback("50+", cbRefresh, "scan:50-"),
+	)
+	if known {
+		r = r.WithRow(bot.Callback(fmt.Sprintf("💰 Под баланс (до %s)", num(room)), cbRefresh, "scan:balance"))
+	}
+	return r
 }
 
 // Trade opens, refreshes or closes a trading session.

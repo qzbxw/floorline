@@ -30,7 +30,8 @@ type Backend interface {
 	Val(ctx context.Context, giftID int64) Reply
 	// Scan sweeps the standing book rather than the arrival feed. An empty
 	// collection means the busiest slice of the whole market.
-	Scan(ctx context.Context, collection string) Reply
+	Scan(ctx context.Context, arg string) Reply
+	ScanMenu(ctx context.Context) Reply
 	// Trade opens, refreshes or closes a trading session: a fixed shortlist of
 	// liquid pairs, with everything outside it silenced.
 	Trade(ctx context.Context, arg string) Reply
@@ -517,7 +518,17 @@ func (b *Bot) registerCallbacks() {
 		// buttons but no navigation — so each one gets a way back to the menu
 		// it was opened from.
 		var r Reply
-		switch strings.TrimSpace(c.Data()) {
+		view := strings.TrimSpace(c.Data())
+		// A sweep carries its band in the callback: "scan:3-5". The bare "scan"
+		// asks which band first rather than picking one for the operator.
+		if band, ok := strings.CutPrefix(view, "scan:"); ok {
+			if band == "balance" {
+				band = "" // the free balance, which is what an empty argument means
+			}
+			// Scan brings its own "another band" button; this adds the way out.
+			return b.editWith(c, back(b.back.Scan(ctx, band), cbMarket, "🔙 Рынок"))
+		}
+		switch view {
 		case "pos":
 			r = back(b.back.Positions(ctx), cbMenu, "")
 		case "status":
@@ -529,7 +540,7 @@ func (b *Bot) registerCallbacks() {
 		case "balance":
 			r = back(b.back.BalanceText(ctx), cbMenu, "")
 		case "scan":
-			r = back(b.back.Scan(ctx, ""), cbMarket, "🔙 Рынок")
+			r = back(b.back.ScanMenu(ctx), cbMarket, "🔙 Рынок")
 		// The session board carries its own controls and is edited in place, so
 		// it gets no extra navigation row competing with them.
 		case "trade":
@@ -630,11 +641,14 @@ func (b *Bot) registerCallbacks() {
 // merely visible. A spinner that says nothing is indistinguishable from a bot
 // that has hung.
 func loadingText(view string) string {
+	if strings.HasPrefix(view, "scan:") {
+		return "⏳ Сканирую рынок… это до полуминуты"
+	}
 	switch view {
 	case "pos", "portfolio":
 		return "⏳ Переоцениваю позиции…"
 	case "scan":
-		return "⏳ Сканирую рынок… это до полуминуты"
+		return "🔭 Выбери диапазон…"
 	case "trade", "trade_reset":
 		return "⏳ Собираю сессию…"
 	case "pnl":

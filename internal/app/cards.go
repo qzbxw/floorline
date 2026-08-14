@@ -653,6 +653,11 @@ func (a *App) renderValuation(ctx context.Context, g tonnel.Gift, v pricing.Valu
 	}
 
 	b.WriteString("\n" + traitBlock(v, g))
+	// What the mint says, from a source that is not a marketplace. Every other
+	// number on this card is somebody's ask; this is what the thing is.
+	if line := a.traitRarityLine(ctx, v.Key, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol)); line != "" {
+		b.WriteString(bot.Esc(line) + "\n")
+	}
 	b.WriteString("\n" + mixLine(v))
 	if v.FX.Valid {
 		fmt.Fprintf(&b, "💱 GRAM/USD %s · 15м %+.1f%% · 1ч %+.1f%%", num(v.FX.CurrentUSD), v.FX.Move15m*100, v.FX.Move1h*100)

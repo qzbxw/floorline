@@ -97,11 +97,20 @@ type Detector struct {
 	CrossSupport func(context.Context, pricing.Valuation) pricing.CrossMarket
 	// OwnerID is resolved dynamically because /auth can replace the session.
 	OwnerID func() int64
+	// Traits supplies what the gift catalogue knows about a specimen — the
+	// backdrop's real colour, so "mono" is judged from the colour rather than
+	// from whether the name happens to contain a colour word. Leaving it nil
+	// falls back to the names, which is what the desk did before.
+	Traits func(ctx context.Context, collection, backdrop string) pricing.Hints
 	// Spendable reports the largest single purchase the desk could actually
-	// make right now — the ticket limit against the free balance. Signals for
-	// lots far beyond it are noise: nobody can act on them. A false second
-	// return disables the check.
-	Spendable func() (float64, bool)
+	// make right now, and which limit produced it. Signals for lots far beyond
+	// it are noise: nobody can act on them. A false last return disables the
+	// check.
+	//
+	// The reason travels with the number because the number alone is a puzzle:
+	// "можно максимум 12.67" against a balance of 16.7 looks like an accounting
+	// error until you know the reserve is 4.
+	Spendable func() (room float64, why string, known bool)
 }
 
 // New builds a Detector.
@@ -239,17 +248,25 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	}
 
 	val := pricing.Evaluate(pricing.Input{
-		GiftID:     g.GiftID.Int(),
-		GiftNum:    g.GiftNum.Int(),
-		OwnerID:    ownerID(d.OwnerID),
-		Key:        key,
-		Price:      price,
-		Book:       book,
-		Liq:        liq,
-		Floor:      floor,
-		Supply:     supply,
-		Rarity:     rarity,
-		Backdrop:   tonnel.BaseAttr(g.Backdrop),
+		GiftID:   g.GiftID.Int(),
+		GiftNum:  g.GiftNum.Int(),
+		OwnerID:  ownerID(d.OwnerID),
+		Key:      key,
+		Price:    price,
+		Book:     book,
+		Liq:      liq,
+		Floor:    floor,
+		Supply:   supply,
+		Rarity:   rarity,
+		Backdrop: tonnel.BaseAttr(g.Backdrop),
+		AppearanceHints: func() pricing.Hints {
+			if d.Traits == nil {
+				return pricing.Hints{Model: key.Model}
+			}
+			h := d.Traits(ctx, key.Name, tonnel.BaseAttr(g.Backdrop))
+			h.Model = key.Model
+			return h
+		}(),
 		Symbol:     tonnel.BaseAttr(g.Symbol),
 		Attribute:  pricing.ComputeAttributeValue(fxSales, tonnel.BaseAttr(g.Backdrop), tonnel.BaseAttr(g.Symbol), liq.Median),
 		SnapshotAt: snapshotAt,
@@ -411,8 +428,9 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 
 	// A lot the desk cannot pay for is not an opportunity, it is noise at 2am.
 	if d.Spendable != nil {
-		if room, ok := d.Spendable(); ok && v.Cost > room {
-			fails = append(fails, fmt.Sprintf("%s: лот стоит %.2f, а поднять сейчас можно максимум %.2f (тикет и свободный баланс)", budgetFailPrefix, v.Cost, room))
+		if room, why, ok := d.Spendable(); ok && v.Cost > room {
+			fails = append(fails, fmt.Sprintf("%s: лот стоит %.2f, поднять сейчас можно максимум %.2f — упирается в %s",
+				budgetFailPrefix, v.Cost, room, why))
 		}
 	}
 	// The arithmetic of the trade, and the reason behind it, are two different

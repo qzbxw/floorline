@@ -54,16 +54,20 @@ type Input struct {
 	Book *Book
 	Liq  Liquidity
 
-	Floor      float64
-	Supply     int
-	Rarity     float64
-	Backdrop   string
-	Symbol     string
-	Attribute  AttributeValue
-	SnapshotAt time.Time
-	Now        time.Time
-	FX         FXContext
-	Params     Params
+	Floor    float64
+	Supply   int
+	Rarity   float64
+	Backdrop string
+	Symbol   string
+	// Appearance carries what the gift catalogue knows that the attribute names
+	// do not — the backdrop's real colour, and the model name to compare it
+	// against. Zero means judge from the names alone, as before.
+	AppearanceHints Hints
+	Attribute       AttributeValue
+	SnapshotAt      time.Time
+	Now             time.Time
+	FX              FXContext
+	Params          Params
 	// TicketRef is the largest single purchase the desk allows, used only to
 	// judge whether a trade is big enough to be worth a slot. Zero disables the
 	// size term entirely, which is what every caller that is pricing an owned
@@ -254,7 +258,7 @@ func Evaluate(in Input) Valuation {
 	if in.Floor > 0 {
 		v.DiscountToFloor = (in.Floor - in.Price) / in.Floor
 	}
-	v.Appearance = Appraise(in.Backdrop, in.Symbol, in.GiftNum)
+	v.Appearance = AppraiseWith(in.Backdrop, in.Symbol, in.GiftNum, in.AppearanceHints)
 	if !in.Now.IsZero() {
 		bookAt := time.Time{}
 		if in.Book != nil {

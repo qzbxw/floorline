@@ -123,19 +123,39 @@ func (a *App) evaluateListings(ctx context.Context, gifts []tonnel.Gift, candida
 // Alerting on a 53 GRAM lot while the ticket cap is 5.5 and the wallet holds 25
 // is not a trading signal, it is a notification nobody can act on.
 func (a *App) spendable() (float64, bool) {
+	room, _, ok := a.spendableWhy()
+	return room, ok
+}
+
+// spendableWhy is the same number with the constraint that produced it.
+//
+// "поднять сейчас можно максимум 12.67 (тикет и свободный баланс)" against a
+// balance of 16.7 reads like an accounting error, and the operator was right to
+// ask: two limits were named and neither number was shown, so there was no way
+// to see that the ticket is 20, the reserve is 4, and it is the reserve that
+// binds. Naming the one that actually bites — with its arithmetic — turns a
+// puzzle into a setting anyone can change.
+func (a *App) spendableWhy() (room float64, why string, known bool) {
 	l := a.rm.Limits()
-	room, known := math.Inf(1), false
+	room = math.Inf(1)
 	if l.MaxTicket > 0 {
-		room, known = l.MaxTicket, true
+		room, why, known = l.MaxTicket, fmt.Sprintf("лимит на сделку %s", num(l.MaxTicket)), true
 	}
 	if bal, ok := a.rm.Balance(); ok {
 		known = true
-		room = math.Min(room, math.Max(bal-l.MinBalanceReserve, 0))
+		free := math.Max(bal-l.MinBalanceReserve, 0)
+		if free <= room {
+			room = free
+			why = fmt.Sprintf("баланс %s − резерв %s", num(bal), num(l.MinBalanceReserve))
+			if l.MinBalanceReserve <= 0 {
+				why = fmt.Sprintf("баланс %s", num(bal))
+			}
+		}
 	}
 	if !known {
-		return 0, false
+		return 0, "", false
 	}
-	return room, true
+	return room, why, true
 }
 
 // crossMarketDepth is robust price discovery: each venue contributes the middle

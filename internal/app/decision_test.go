@@ -1,11 +1,13 @@
 package app
 
 import (
+	"context"
 	"math"
 	"strings"
 	"testing"
 
 	"floorline/internal/pricing"
+	"floorline/internal/risk"
 )
 
 // Snake Box, from the 14 Aug book: +0.2% on the target, a one-in-a-hundred
@@ -117,5 +119,49 @@ func TestBookRatesDivideByTheDaysThatProducedThem(t *testing.T) {
 	// And the reader can now reproduce both from what is printed.
 	if math.Abs(b.UnrealisedRate()*b.OpenTonDays-b.Unrealised()) > 1e-9 {
 		t.Fatal("the open rate does not multiply back to the open move")
+	}
+}
+
+// "поднять сейчас можно максимум 12.67 (тикет и свободный баланс)" against a
+// balance of 16.7 reads like an accounting error. It is not — the reserve is 4
+// — but two limits were named and neither number was shown, so there was no way
+// to tell which one was biting.
+func TestSpendableNamesTheLimitThatBinds(t *testing.T) {
+	a := coolingApp(t)
+	ctx := context.Background()
+	rm, err := risk.New(ctx, a.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.rm = rm
+
+	if err := rm.SetLimit(ctx, "max_ticket", "20"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rm.SetLimit(ctx, "min_balance_reserve", "4"); err != nil {
+		t.Fatal(err)
+	}
+	rm.SetBalance(16.7)
+
+	room, why, ok := a.spendableWhy()
+	if !ok {
+		t.Fatal("nothing known about what can be spent")
+	}
+	if math.Abs(room-12.7) > 1e-9 {
+		t.Fatalf("room = %v, want the balance less the reserve", room)
+	}
+	for _, want := range []string{"16.7", "4"} {
+		if !strings.Contains(why, want) {
+			t.Fatalf("reason %q does not show %s", why, want)
+		}
+	}
+	if strings.Contains(why, "сделку") {
+		t.Fatalf("reason %q blames the ticket, which is not what binds here", why)
+	}
+
+	// And when the ticket really is the tighter one, it says so instead.
+	rm.SetBalance(500)
+	if _, why, _ = a.spendableWhy(); !strings.Contains(why, "сделку") {
+		t.Fatalf("reason %q does not name the ticket limit", why)
 	}
 }

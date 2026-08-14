@@ -507,7 +507,7 @@ func TestUnaffordableLotIsNotASignal(t *testing.T) {
 	h := newHarness(t, 800, 1200, 1250)
 	h.seedSales(t, 1200, 40, 40)
 	h.seedStat(t, 800, 12)
-	h.det.Spendable = func() (float64, bool) { return 100, true }
+	h.det.Spendable = func() (float64, string, bool) { return 100, "баланс 104 − резерв 4", true }
 
 	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
 	if err != nil {
@@ -524,7 +524,7 @@ func TestUnaffordableLotIsNotASignal(t *testing.T) {
 	}
 
 	// The same listing with money behind it is still a signal.
-	h.det.Spendable = func() (float64, bool) { return 5000, true }
+	h.det.Spendable = func() (float64, string, bool) { return 5000, "лимит на сделку 5000", true }
 	dec, err = h.det.EvaluateFresh(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)

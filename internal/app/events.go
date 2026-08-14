@@ -10,8 +10,10 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"floorline/internal/bot"
+	"floorline/internal/pricing"
 	"floorline/internal/store"
 	"floorline/internal/tonnel"
+	"floorline/internal/traits"
 )
 
 // The marketplace event stream is the desk's primary view of the market.
@@ -414,5 +416,73 @@ func (a *App) probeStream(ctx context.Context, wait time.Duration) (string, erro
 			}
 			return "", fmt.Errorf("could not connect to %s within %s", a.cfg.EventHost, wait)
 		}
+	}
+}
+
+// traitHints answers what the gift catalogue knows about a specimen.
+//
+// It is the one input the desk has that is not a marketplace: mint rarity and
+// the backdrop's actual colour, published by api.changes.tg. Everything else
+// says what somebody is asking; this says what the thing is.
+//
+// A miss is not a failure. The catalogue is cached for a day per collection and
+// its absence simply returns to judging the look by the attribute names, which
+// is what the desk did before it existed.
+func (a *App) traitHints(ctx context.Context, collection, backdrop string) pricing.Hints {
+	if a.traits == nil || collection == "" {
+		return pricing.Hints{}
+	}
+	cat, err := a.traits.Get(ctx, collection)
+	if err != nil || cat == nil {
+		return pricing.Hints{}
+	}
+	hex, ok := cat.Colour(backdrop)
+	if !ok {
+		return pricing.Hints{}
+	}
+	return pricing.Hints{BackdropFamily: traits.Family(hex)}
+}
+
+// traitRarityLine is what the mint says about this specimen, for the card.
+func (a *App) traitRarityLine(ctx context.Context, key tonnel.ModelKey, backdrop, symbol string) string {
+	if a.traits == nil {
+		return ""
+	}
+	cat, err := a.traits.Get(ctx, key.Name)
+	if err != nil || cat == nil {
+		return ""
+	}
+	var parts []string
+	if r, ok := cat.Model(key.Model); ok {
+		parts = append(parts, fmt.Sprintf("модель %.2g%%", float64(r)))
+	}
+	if r, ok := cat.Backdrop(backdrop); ok {
+		parts = append(parts, fmt.Sprintf("фон %.2g%%", float64(r)))
+	}
+	if r, ok := cat.Symbol(symbol); ok {
+		parts = append(parts, fmt.Sprintf("символ %.2g%%", float64(r)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	line := "🧬 Минт: " + strings.Join(parts, " · ")
+	// The combination is the part no marketplace can price. A model floor is
+	// set by whichever ordinary specimen is cheapest and says nothing about one
+	// that also drew a rare backdrop and a rare symbol.
+	if n := cat.OneIn(key.Model, backdrop, symbol); n >= 100 {
+		line += fmt.Sprintf(" → такое сочетание примерно 1 на %s", bigCount(n))
+	}
+	return line
+}
+
+// bigCount renders a large multiplier the way a person says it.
+func bigCount(n float64) string {
+	switch {
+	case n >= 1e6:
+		return fmt.Sprintf("%.1f млн", n/1e6)
+	case n >= 1e3:
+		return fmt.Sprintf("%.0f тыс.", n/1e3)
+	default:
+		return fmt.Sprintf("%.0f", n)
 	}
 }

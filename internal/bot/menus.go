@@ -13,6 +13,8 @@ package bot
 // Second, depth. Every tap that only leads to more taps is a tap that did
 // nothing. The submenus that existed to hold two entries are gone; what is left
 // either shows data or switches something.
+import "floorline/internal/traits"
+
 const (
 	cbMenu   = "m_menu"   // home dashboard
 	cbMarket = "m_market" // market tools
@@ -186,7 +188,13 @@ func helpMenuReply() Reply {
 			"<code>/status</code> · поллеры, свежесть данных, прогрев\n" +
 			"<code>/auth строка</code> · заменить протухшую сессию\n\n" +
 
-			"<i>Коллекция и модель разделяются слешем — обе бывают из двух слов.</i>",
+			"<i>Коллекция и модель разделяются слешем — обе бывают из двух слов.</i>\n\n" +
+
+			// The catalogue this desk reads mint rarity and backdrop colours from
+			// asks its consumers to credit it where their users can see it. It is
+			// free, unauthenticated and the only non-marketplace source here, so
+			// the line stays.
+			"<i>" + traits.Attribution + "</i>",
 		Rows: [][]Button{
 			{Callback("🏠 Домой", cbMenu, "")},
 		},
