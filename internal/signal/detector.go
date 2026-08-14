@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"floorline/internal/config"
@@ -331,6 +332,15 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	return dec, nil
 }
 
+// budgetFailPrefix tags the one gate that is about the wallet rather than about
+// the trade, so a caller who has deliberately asked past the wallet — /scan with
+// an explicit price band — can drop it instead of repeating "you cannot afford
+// this" on every line of an answer to a different question.
+const budgetFailPrefix = "бюджет"
+
+// IsBudgetFail reports whether a gate message is the affordability one.
+func IsBudgetFail(s string) bool { return strings.HasPrefix(s, budgetFailPrefix+":") }
+
 // plural renders a Russian count with the right noun form. The card layer has
 // its own copy; a gate message that reads "1 лотов" undermines every other
 // number on the card.
@@ -402,7 +412,7 @@ func (d *Detector) signalGates(v pricing.Valuation) []string {
 	// A lot the desk cannot pay for is not an opportunity, it is noise at 2am.
 	if d.Spendable != nil {
 		if room, ok := d.Spendable(); ok && v.Cost > room {
-			fails = append(fails, fmt.Sprintf("лот стоит %.2f, а поднять сейчас можно максимум %.2f (тикет и свободный баланс)", v.Cost, room))
+			fails = append(fails, fmt.Sprintf("%s: лот стоит %.2f, а поднять сейчас можно максимум %.2f (тикет и свободный баланс)", budgetFailPrefix, v.Cost, room))
 		}
 	}
 	// The arithmetic of the trade, and the reason behind it, are two different

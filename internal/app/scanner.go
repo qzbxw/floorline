@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,8 +79,7 @@ type Candidate struct {
 // back instead was "the venues did not answer" on every candidate — which caps
 // the score, blocks unattended buying, and poisoned the shared quote cache for
 // the feed as well.
-func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Time, keep int) []Candidate {
-	room, hasRoom := a.spendable()
+func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Time, keep int, band budget) []Candidate {
 	limits := a.rm.Limits()
 
 	var found []Candidate
@@ -103,8 +103,19 @@ func (a *App) scanPass(ctx context.Context, keys []tonnel.ModelKey, now time.Tim
 			if owner := a.api.UserID(); owner != 0 && ask.Seller == owner {
 				continue
 			}
-			if hasRoom && ask.Price*(1+a.cfg.TonnelFee) > room {
+			// The band is measured on the sticker price, which is what the
+			// operator typed and what they see on the marketplace. The balance
+			// band is measured on the cost, because that is what leaves the
+			// wallet.
+			price := ask.Price
+			if !band.Explicit {
+				price = ask.Price * (1 + a.cfg.TonnelFee)
+			}
+			if band.above(price) {
 				break // the book only gets more expensive from here
+			}
+			if !band.allows(price) {
+				continue
 			}
 			g := tonnel.Gift{
 				GiftID: tonnel.FlexInt(ask.GiftID), GiftNum: tonnel.FlexInt(ask.GiftNum),
@@ -195,10 +206,35 @@ const scanRankTTL = 30 * time.Minute
 // Models are ordered by how much they actually trade, so a pass spends its
 // request budget where a misprice is most likely to be sellable rather than
 // walking the alphabet.
-func (a *App) scanKeys(ctx context.Context, limit int) []tonnel.ModelKey {
+func (a *App) scanKeys(ctx context.Context, limit int, ceiling float64) []tonnel.ModelKey {
 	ranked := a.rankedModels(ctx)
 	if len(ranked) == 0 {
 		return nil
+	}
+	// A model whose cheapest listing is already above the band cannot contain
+	// anything inside it, and reading its book is a request spent to learn that.
+	// The snapshot already knows every floor, so the filter is free — and on the
+	// metered route each book skipped is a couple of kilobytes not bought.
+	if ceiling > 0 {
+		if floors, err := a.st.ModelStats(ctx); err == nil && len(floors) > 0 {
+			within := make(map[string]bool, len(floors))
+			for _, f := range floors {
+				if f.Floor > 0 && f.Floor <= ceiling {
+					within[f.Key.ID()] = true
+				}
+			}
+			kept := ranked[:0:0]
+			for _, k := range ranked {
+				if within[k.ID()] {
+					kept = append(kept, k)
+				}
+			}
+			// Only if it leaves something: a snapshot that has not landed yet
+			// must not silently turn every sweep into "nothing to scan".
+			if len(kept) > 0 {
+				ranked = kept
+			}
+		}
 	}
 
 	a.mu.Lock()
@@ -281,12 +317,18 @@ func (a *App) rankedModels(ctx context.Context) []tonnel.ModelKey {
 // the same decision path the feed uses, so unattended buying works on standing
 // listings and not only on new arrivals.
 func (a *App) pollScan(ctx context.Context) error {
-	keys := a.scanKeys(ctx, scanModelsPerPass)
+	// The unattended sweep stays inside what the desk can actually pay for.
+	room, hasRoom := a.spendable()
+	band := budget{}
+	if hasRoom {
+		band.Hi = room
+	}
+	keys := a.scanKeys(ctx, scanModelsPerPass, band.Hi)
 	if len(keys) == 0 {
 		return nil
 	}
 	now := time.Now()
-	found := a.refine(ctx, a.scanPass(ctx, keys, now, scanKeep), now, scanRefine)
+	found := a.refine(ctx, a.scanPass(ctx, keys, now, scanKeep, band), now, scanRefine)
 
 	a.mu.Lock()
 	a.lastScan, a.lastScanFound = now, len(found)
@@ -322,26 +364,122 @@ func (a *App) pollScan(ctx context.Context) error {
 	return nil
 }
 
-// scanText renders the current shortlist for /scan.
-// scanArg splits a /scan payload into a collection and an explicit limit.
+// scanRequest is everything the operator asked a sweep for.
+type scanRequest struct {
+	Collection string
+	Limit      int
+	// Lo and Hi bound the price of the gifts worth showing. Zero means unbounded
+	// at that end; Ranged says the operator set one at all.
+	Lo, Hi float64
+	Ranged bool
+}
+
+// priceRange matches "3-5", "3.5-5", "-5" and "3-": a dash with a number on at
+// least one side. A bare number is deliberately not a range — it is the result
+// limit, which is what /scan already took.
+var priceRange = regexp.MustCompile(`^(\d+(?:[.,]\d+)?)?-(\d+(?:[.,]\d+)?)?$`)
+
+// scanArg splits a /scan payload into a collection, a result limit and a price
+// range.
 //
-// The limit is the operator's, not ours. A sweep that always returns the same
-// eight rows out of a market of thousands is answering a question nobody asked:
-// sometimes the point is to see everything that clears the bar, and the desk has
-// no business deciding that eight is enough.
+// All three are the operator's, not ours. The limit was hard-coded at eight
+// until today, and the price band came from the free balance — which answers
+// "what can I afford right now" when the question was "show me what is standing
+// between three and five". Those are different questions and the second one is
+// the one asked while planning rather than while buying.
 //
-// The number is taken from the end of the payload, so "Plush Pepe 25" reads the
-// way it looks. A collection whose name ends in a number would be ambiguous, and
-// none of them do.
-func scanArg(arg string) (collection string, limit int) {
+// The tokens are recognised by shape, from the end, so the payload reads the way
+// it looks: "Plush Pepe 3-5 25" is a collection, a band and a count. A
+// collection whose name is a bare number or contains a dash between digits would
+// be ambiguous, and none of them are.
+func scanArg(arg string) scanRequest {
+	var req scanRequest
 	fields := strings.Fields(strings.TrimSpace(arg))
-	if len(fields) == 0 {
-		return "", 0
+
+	rest := fields[:0]
+	for _, f := range fields {
+		if m := priceRange.FindStringSubmatch(f); m != nil && (m[1] != "" || m[2] != "") {
+			req.Lo, req.Hi = parsePrice(m[1]), parsePrice(m[2])
+			req.Ranged = true
+			continue
+		}
+		if n, err := strconv.Atoi(f); err == nil && n > 0 {
+			req.Limit = n
+			continue
+		}
+		rest = append(rest, f)
 	}
-	if n, err := strconv.Atoi(fields[len(fields)-1]); err == nil && n > 0 {
-		return strings.Join(fields[:len(fields)-1], " "), n
+	req.Collection = strings.Join(rest, " ")
+	// A band given the wrong way round is a typo, not an empty set.
+	if req.Lo > 0 && req.Hi > 0 && req.Lo > req.Hi {
+		req.Lo, req.Hi = req.Hi, req.Lo
 	}
-	return strings.Join(fields, " "), 0
+	return req
+}
+
+func parsePrice(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(strings.Replace(s, ",", ".", 1), 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
+}
+
+// withoutBudgetFail drops the affordability gate from a list of reasons.
+func withoutBudgetFail(fails []string) []string {
+	out := fails[:0:0]
+	for _, f := range fails {
+		if !signal.IsBudgetFail(f) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// spendBudget is the band derived from what the desk can pay for right now.
+func (a *App) spendBudget() budget {
+	if room, ok := a.spendable(); ok {
+		return budget{Hi: room}
+	}
+	return budget{}
+}
+
+// budget is the price band a sweep considers, and where it came from.
+type budget struct {
+	Lo, Hi float64
+	// Explicit marks a band the operator set. The difference matters: the
+	// balance-derived one is a statement about what can be paid for now, and the
+	// gate that rejects unaffordable lots should stay; an explicit one is a
+	// question about the market, and answering it with "you cannot afford this"
+	// on every line would be answering a different question.
+	Explicit bool
+}
+
+// allows reports whether an ask price is inside the band.
+func (b budget) allows(price float64) bool {
+	if b.Lo > 0 && price < b.Lo {
+		return false
+	}
+	return b.Hi <= 0 || price <= b.Hi
+}
+
+// above reports whether an ask is past the top of the band. The book is
+// ascending, so this is where a scan can stop reading it.
+func (b budget) above(price float64) bool { return b.Hi > 0 && price > b.Hi }
+
+func (b budget) String() string {
+	switch {
+	case b.Lo > 0 && b.Hi > 0:
+		return num(b.Lo) + " – " + num(b.Hi)
+	case b.Hi > 0:
+		return "до " + num(b.Hi)
+	case b.Lo > 0:
+		return "от " + num(b.Lo)
+	}
+	return ""
 }
 
 const (
@@ -356,7 +494,8 @@ const (
 )
 
 func (a *App) scanText(ctx context.Context, arg string) string {
-	collection, want := scanArg(arg)
+	req := scanArg(arg)
+	collection, want := req.Collection, req.Limit
 	keep, models := scanKeep, scanModelsPerPass
 	if want > 0 {
 		keep = minInt(want, scanMaxKeep)
@@ -369,7 +508,14 @@ func (a *App) scanText(ctx context.Context, arg string) string {
 	if a.frugal() && models > scanFrugalModels {
 		models, frugalCapped = scanFrugalModels, true
 	}
+	// An explicit band replaces the balance entirely. "Show me what is standing
+	// between three and five" is a question about the market, and answering it
+	// with the contents of the wallet is answering a different one.
+	band := budget{Lo: req.Lo, Hi: req.Hi, Explicit: req.Ranged}
 	room, hasRoom := a.spendable()
+	if !band.Explicit && hasRoom {
+		band.Hi = room
+	}
 
 	var keys []tonnel.ModelKey
 	if collection != "" {
@@ -387,24 +533,37 @@ func (a *App) scanText(ctx context.Context, arg string) string {
 			return "Не нашёл коллекцию " + bot.Esc(collection)
 		}
 	} else {
-		keys = a.scanKeys(ctx, models)
+		keys = a.scanKeys(ctx, models, band.Hi)
 	}
 	if len(keys) == 0 {
+		if band.Explicit {
+			return "В диапазоне " + bot.Esc(band.String()) + " по снимку рынка нет ни одной модели."
+		}
 		return "Пока нечего сканировать — рынок ещё не прогрузился."
 	}
 
 	now := time.Now()
-	found := a.refine(ctx, a.scanPass(ctx, keys, now, keep), now, minInt(scanRefine, keep))
+	found := a.refine(ctx, a.scanPass(ctx, keys, now, keep, band), now, minInt(scanRefine, keep))
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔭 <b>Скан</b> · %s", plural(len(keys), "модель", "модели", "моделей"))
-	if hasRoom {
-		fmt.Fprintf(&b, " · в пределах %s", num(room))
+	if s := band.String(); s != "" {
+		if band.Explicit {
+			fmt.Fprintf(&b, " · диапазон %s", s)
+		} else {
+			fmt.Fprintf(&b, " · в пределах %s", s)
+		}
 	}
 	if want > 0 {
 		fmt.Fprintf(&b, " · показываю до %d", keep)
 	}
 	b.WriteString("\n")
+	// An explicit band above what the desk can pay for is a perfectly reasonable
+	// thing to ask — planning is not buying — but it should not be discovered at
+	// the moment of pressing buy.
+	if band.Explicit && hasRoom && band.Lo > room {
+		fmt.Fprintf(&b, "<i>Свободно сейчас %s — весь диапазон выше этого, смотрим на будущее.</i>\n", num(room))
+	}
 	if frugalCapped {
 		fmt.Fprintf(&b, "<i>Свой адрес отказывают, читаю через платный прокси — сузил проход до %d моделей.</i>\n", scanFrugalModels)
 	}
@@ -416,11 +575,19 @@ func (a *App) scanText(ctx context.Context, arg string) string {
 	}
 
 	for _, c := range found {
+		fails := c.Fails
+		if band.Explicit {
+			// The operator asked about a price band, not about their balance.
+			// Repeating "you cannot afford this" under every line would be
+			// answering a question they did not ask — and they were told the
+			// free balance once, above.
+			fails = withoutBudgetFail(fails)
+		}
 		// A candidate that fails a gate still earns its place on the list: the
 		// operator can take a trade the unattended path may not. But it must not
 		// look like one that passed.
 		verdict := "✅"
-		if len(c.Fails) > 0 {
+		if len(fails) > 0 {
 			verdict = "⚪️"
 		}
 		fmt.Fprintf(&b, "%s <b>%s</b>\n", verdict, bot.Esc(c.Val.Key.String()))
@@ -433,8 +600,8 @@ func (a *App) scanText(ctx context.Context, arg string) string {
 		if note := scanMarketNote(c); note != "" {
 			fmt.Fprintf(&b, "   %s\n", note)
 		}
-		if len(c.Fails) > 0 {
-			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(c.Fails[0]))
+		if len(fails) > 0 {
+			fmt.Fprintf(&b, "   <i>%s</i>\n", bot.Esc(fails[0]))
 		}
 		fmt.Fprintf(&b, "   <code>/val %d</code>\n\n", c.Gift.GiftID.Int())
 	}
