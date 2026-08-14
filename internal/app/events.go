@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -340,6 +341,30 @@ func bytesHuman(n int64) string {
 	default:
 		return fmt.Sprintf("%d Б", n)
 	}
+}
+
+// logTraffic writes what each route has cost to the log.
+//
+// The per-route meter otherwise exists only inside a Telegram command, which is
+// the wrong place for the one number that decides whether the desk can keep
+// reading the market at all: a residential plan is a few gigabytes, and by the
+// time anyone thinks to ask, it is spent. In the log it is a rate anyone can
+// read after the fact, including from a container that has since restarted.
+func (a *App) logTraffic(context.Context) error {
+	up := time.Since(a.startedAt)
+	for _, r := range a.api.Routes() {
+		if !r.Metered || r.Bytes == 0 {
+			continue
+		}
+		perDay := float64(r.Bytes) / math.Max(up.Hours(), .01) * 24
+		log.Info().
+			Str("route", r.Name).
+			Str("spent", bytesHuman(r.Bytes)).
+			Str("per_day", bytesHuman(int64(perDay))).
+			Int64("calls", r.Calls).
+			Msg("metered traffic")
+	}
+	return nil
 }
 
 // streamHealthy reports whether the push feed can be trusted right now. The

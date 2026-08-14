@@ -332,6 +332,7 @@ func (a *App) Run(ctx context.Context) error {
 	start("inventory", a.cfg.InventoryInterval, a.pollInventory)
 	start("gram", a.cfg.GramQuoteInterval, a.pollGram)
 	start("maintenance", time.Hour, a.maintenance)
+	start("traffic", 30*time.Minute, a.logTraffic)
 	start("scan", a.cfg.ScanInterval, a.pollScan)
 
 	// The Telegram account comes up alongside the pollers: the venues need it
