@@ -287,17 +287,26 @@ func TitleCase(s string) string {
 // error envelope. Status is preserved so callers can distinguish a Cloudflare
 // block (403/429) from a genuine rejection.
 type APIError struct {
-	Op      string
-	Status  int
+	Op     string
+	Status int
+	// Route names the egress the request went out on. A refusal is a judgement
+	// about an address, so which address was refused is the first thing anyone
+	// reading this needs — and without it a rotation is invisible in the log,
+	// which is the only place it can be observed at all.
+	Route   string
 	Message string
 	Body    string
 }
 
 func (e *APIError) Error() string {
-	if e.Message != "" {
-		return fmt.Sprintf("tonnel %s: http %d: %s", e.Op, e.Status, e.Message)
+	detail := e.Message
+	if detail == "" {
+		detail = truncate(e.Body, 300)
 	}
-	return fmt.Sprintf("tonnel %s: http %d: %s", e.Op, e.Status, truncate(e.Body, 300))
+	if e.Route != "" {
+		return fmt.Sprintf("tonnel %s via %s: http %d: %s", e.Op, e.Route, e.Status, detail)
+	}
+	return fmt.Sprintf("tonnel %s: http %d: %s", e.Op, e.Status, detail)
 }
 
 // IsBlocked reports whether the failure looks like an anti-bot block rather than

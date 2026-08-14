@@ -407,9 +407,16 @@ func (c *Client) do(ctx context.Context, o callOpts, payload []byte, route *Egre
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return &APIError{Op: o.path, Status: resp.StatusCode, Message: extractMessage(body), Body: string(body)}
+		return &APIError{Op: o.path, Route: route.Name(), Status: resp.StatusCode, Message: extractMessage(body), Body: string(body)}
 	}
-	return decodeInto(o.path, resp.StatusCode, body, o.out)
+	err = decodeInto(o.path, resp.StatusCode, body, o.out)
+	// A business rejection is still worth attributing: it is how a route that
+	// answers with a throttle page rather than a status code gets identified.
+	var ae *APIError
+	if errors.As(err, &ae) {
+		ae.Route = route.Name()
+	}
+	return err
 }
 
 // envelope is the common wrapper shape. Some endpoints return a bare array

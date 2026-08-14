@@ -143,6 +143,11 @@ func TestEveryRouteRefusedRaisesTheAlarm(t *testing.T) {
 	if alarms == 0 {
 		t.Fatal("nothing was reported after every route was refused")
 	}
+	// The refusal has to name the address it came from. A rotation that cannot
+	// be read in the log cannot be debugged at all.
+	if !strings.Contains(err.Error(), " via ") {
+		t.Fatalf("error does not say which route was refused: %v", err)
+	}
 	if c.pool.available(time.Now()) != 0 {
 		t.Fatal("a route is still considered available")
 	}
