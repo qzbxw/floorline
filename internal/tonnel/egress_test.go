@@ -86,7 +86,7 @@ func TestReadsStayOnTheFreeRouteWhileItWorks(t *testing.T) {
 	p := testPool(t, "socks5://a:b@gw:823")
 	now := time.Now()
 	for i := 0; i < 8; i++ {
-		e, ok := p.pick(now)
+		e, ok := p.pick(now, nil)
 		if !ok {
 			t.Fatal("no route available")
 		}
@@ -104,7 +104,7 @@ func TestPaidRouteTakesOverWhenTheFreeOneIsRefused(t *testing.T) {
 	direct := p.all[1]
 	rest(direct, now)
 
-	e, ok := p.pick(now)
+	e, ok := p.pick(now, nil)
 	if !ok {
 		t.Fatal("pool reported nothing available while the proxy was healthy")
 	}
@@ -113,7 +113,7 @@ func TestPaidRouteTakesOverWhenTheFreeOneIsRefused(t *testing.T) {
 	}
 	// And it hands the traffic back once the free route has rested.
 	later := now.Add(egressCooldown[0] + time.Second)
-	e, ok = p.pick(later)
+	e, ok = p.pick(later, nil)
 	if !ok || e.metered {
 		t.Fatalf("still on the paid route after the free one recovered: %v %v", e, ok)
 	}
@@ -132,7 +132,7 @@ func TestFreeRoutesShareTheLoad(t *testing.T) {
 	now := time.Now()
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
-		e, _ := p.pick(now)
+		e, _ := p.pick(now, nil)
 		seen[e.Name()]++
 	}
 	if len(seen) != 2 || seen[DirectEgress] != 3 {
@@ -216,7 +216,7 @@ func TestAllRefusedStillOffersTheSoonestRoute(t *testing.T) {
 	if got := p.available(now); got != 0 {
 		t.Fatalf("%d routes reported available with every one resting", got)
 	}
-	e, ok := p.pick(now)
+	e, ok := p.pick(now, nil)
 	if ok {
 		t.Fatal("pool claimed a route was available")
 	}
@@ -234,14 +234,14 @@ func TestWritesStickToTheFreeRouteThatAnswered(t *testing.T) {
 
 	gw.reward(now)                     // the proxy answered most recently…
 	direct.reward(now.Add(-time.Hour)) // …but the free route also works
-	e, ok := p.sticky(now)
+	e, ok := p.sticky(now, nil)
 	if !ok || e.metered {
 		t.Fatalf("a write went out on the paid route while the free one was fine: %v", e)
 	}
 
 	// Unless the free route is the one being refused.
 	rest(direct, now)
-	e, ok = p.sticky(now)
+	e, ok = p.sticky(now, nil)
 	if !ok || !e.metered {
 		t.Fatalf("write did not fall through to the paid route: %v %v", e, ok)
 	}
@@ -269,5 +269,52 @@ func TestStatusesPutTheProblemFirstAndCountTraffic(t *testing.T) {
 	}
 	if st[1].Cooling != 0 {
 		t.Fatal("the healthy route is reported as resting")
+	}
+}
+
+// A retry must not go straight back to the address that just refused. Because a
+// route only rests after several refusals, without this a single call spends
+// every attempt on the same refusing route and fails, while a working paid route
+// sits unused behind it — which is what the first poll after the residential
+// proxy was added actually did.
+func TestARetryDoesNotReturnToTheRouteThatJustRefused(t *testing.T) {
+	p := testPool(t, "socks5://a:b@gw:823")
+	now := time.Now()
+
+	first, ok := p.pick(now, nil)
+	if !ok || first.metered {
+		t.Fatalf("first pick = %v", first)
+	}
+	second, ok := p.pick(now, []*Egress{first})
+	if !ok {
+		t.Fatal("nothing offered for the retry")
+	}
+	if second == first {
+		t.Fatal("the retry went back to the route that had just refused")
+	}
+	if !second.metered {
+		t.Fatalf("retry used %s, want the paid route as the only untried one", second.Name())
+	}
+
+	// With everything tried, a repeat is allowed: on a single-route setup a
+	// retry on the same route is the only retry there is.
+	third, ok := p.pick(now, []*Egress{first, second})
+	if !ok || third == nil {
+		t.Fatal("no route offered once every one had been tried")
+	}
+}
+
+func TestAWriteRetryAlsoMovesOff(t *testing.T) {
+	p := testPool(t, "socks5://a:b@gw:823")
+	now := time.Now()
+	p.all[1].reward(now) // the free route is the natural sticky choice
+
+	first, _ := p.sticky(now, nil)
+	if first.metered {
+		t.Fatal("a write preferred the paid route")
+	}
+	second, ok := p.sticky(now, []*Egress{first})
+	if !ok || second == first {
+		t.Fatal("the write retry went back to the same route")
 	}
 }

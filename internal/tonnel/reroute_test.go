@@ -106,7 +106,7 @@ func routedClient(t *testing.T, blocked func(error), statuses ...int) (*Client, 
 }
 
 // A 403 on one address is that address being challenged. The desk should end up
-// on another one and never hear about it.
+// on another one, on the very next attempt, and never hear about it.
 func TestARefusedRouteIsReplacedWithoutAlarming(t *testing.T) {
 	var alarms int
 	c, log := routedClient(t, func(error) { alarms++ }, http.StatusForbidden, http.StatusOK)

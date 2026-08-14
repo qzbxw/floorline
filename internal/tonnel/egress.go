@@ -262,55 +262,77 @@ func proxyLabel(raw string) string {
 // The second result is false when every route is resting; the first is then the
 // one whose rest ends soonest, so a caller that must try something has the best
 // available option rather than nothing.
-func (p *egressPool) pick(now time.Time) (*Egress, bool) {
+// The `tried` argument is the routes this call has already been refused on.
+// Without it a retry goes straight back to the route that just said no — and
+// because a route only rests after several refusals, a single call would spend
+// every one of its attempts on the same refusing address and fail, while a
+// perfectly good paid route sat unused behind it. That is exactly what the
+// first poll after the residential proxy was added did.
+func (p *egressPool) pick(now time.Time, tried []*Egress) (*Egress, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.all) == 0 {
 		return nil, false
 	}
-	if e, ok := p.pickTier(now, false); ok {
-		return e, true
-	}
-	if e, ok := p.pickTier(now, true); ok {
-		return e, true
+	for _, skip := range [][]*Egress{tried, nil} {
+		if e, ok := p.pickTier(now, false, skip); ok {
+			return e, true
+		}
+		if e, ok := p.pickTier(now, true, skip); ok {
+			return e, true
+		}
+		// Nothing left untried. Fall through and allow a repeat: with one route
+		// configured, a retry on the same one is the only retry there is.
 	}
 	return p.soonest(), false
 }
 
-// pickTier round-robins within one tier. Callers hold p.mu.
-func (p *egressPool) pickTier(now time.Time, metered bool) (*Egress, bool) {
+// pickTier round-robins within one tier, skipping anything in `skip`. Callers
+// hold p.mu.
+func (p *egressPool) pickTier(now time.Time, metered bool, skip []*Egress) (*Egress, bool) {
 	for range p.all {
 		e := p.all[p.idx%len(p.all)]
 		p.idx++
-		if e.metered == metered && e.available(now) {
+		if e.metered == metered && e.available(now) && !contains(skip, e) {
 			return e, true
 		}
 	}
 	return nil, false
 }
 
+func contains(list []*Egress, e *Egress) bool {
+	for _, v := range list {
+		if v == e {
+			return true
+		}
+	}
+	return false
+}
+
 // sticky returns the route a write should go out on: the free tier if anything
 // there is available, and within a tier the one that most recently answered.
-func (p *egressPool) sticky(now time.Time) (*Egress, bool) {
+func (p *egressPool) sticky(now time.Time, tried []*Egress) (*Egress, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if e, ok := p.stickyTier(now, false); ok {
-		return e, true
-	}
-	if e, ok := p.stickyTier(now, true); ok {
-		return e, true
+	for _, skip := range [][]*Egress{tried, nil} {
+		if e, ok := p.stickyTier(now, false, skip); ok {
+			return e, true
+		}
+		if e, ok := p.stickyTier(now, true, skip); ok {
+			return e, true
+		}
 	}
 	return p.soonest(), false
 }
 
 // stickyTier is the most recently successful available route of one tier.
 // Callers hold p.mu.
-func (p *egressPool) stickyTier(now time.Time, metered bool) (*Egress, bool) {
+func (p *egressPool) stickyTier(now time.Time, metered bool, skip []*Egress) (*Egress, bool) {
 	var best *Egress
 	var bestOK time.Time
 	for _, e := range p.all {
-		if e.metered != metered || !e.available(now) {
+		if e.metered != metered || !e.available(now) || contains(skip, e) {
 			continue
 		}
 		e.mu.Lock()

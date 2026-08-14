@@ -285,6 +285,7 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 	}
 
 	var lastErr error
+	var tried []*Egress
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff with jitter. Anti-bot rejections wait longer
@@ -316,10 +317,11 @@ func (c *Client) call(ctx context.Context, o callOpts) error {
 		// last answered. Discovering that an address has gone bad is cheap on a
 		// page of listings and expensive on a purchase.
 		now := time.Now()
-		route, _ := c.pool.pick(now)
+		route, _ := c.pool.pick(now, tried)
 		if o.write {
-			route, _ = c.pool.sticky(now)
+			route, _ = c.pool.sticky(now, tried)
 		}
+		tried = append(tried, route)
 
 		lastErr = c.do(ctx, o, payload, route)
 		if lastErr == nil {
