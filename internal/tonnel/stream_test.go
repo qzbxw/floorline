@@ -159,9 +159,26 @@ func TestStreamReplaysBeforeLive(t *testing.T) {
 	go s.Run(ctx)
 
 	c.waitFor(t, 4)
-	got := strings.Join(c.seen(), ",")
-	if got != "r1,r2,l1,l2" {
-		t.Fatalf("processed %q, want replay first then live in occurredAt order, r2 deduplicated", got)
+	got := c.seen()
+	// The guarantee is that the gap is closed before anything live is applied,
+	// and that the socket re-delivering a replayed event costs nothing. The
+	// order of frames that arrive *after* the backlog is drained is the order
+	// the server sent them in — the merge cannot reorder what it never held, so
+	// asserting it here would be testing this test's own timing.
+	if len(got) != 4 {
+		t.Fatalf("processed %v, want four events with r2 deduplicated", got)
+	}
+	if got[0] != "r1" || got[1] != "r2" {
+		t.Fatalf("processed %v, want the replayed gap first", got)
+	}
+	seen := map[string]int{}
+	for _, id := range got {
+		seen[id]++
+	}
+	for _, id := range []string{"r1", "r2", "l1", "l2"} {
+		if seen[id] != 1 {
+			t.Fatalf("%s processed %d times: %v", id, seen[id], got)
+		}
 	}
 
 	// The cursor is only allowed to advance behind successful processing.
@@ -285,6 +302,33 @@ func TestStreamRetriesAFailedHandler(t *testing.T) {
 		if v == "r1" && calls < 2 {
 			t.Fatal("cursor advanced past an event the handler refused")
 		}
+	}
+}
+
+// The merge itself, without the timing: a backlog is applied oldest first,
+// whatever order the socket delivered it in.
+func TestBufferedEventsAreMergedInOccurredAtOrder(t *testing.T) {
+	evs := []Event{}
+	for _, raw := range []string{
+		event("c", "listing.created", "2026-08-13T10:00:04.000Z"),
+		event("a", "listing.created", "2026-08-13T10:00:01.000Z"),
+		event("d", "listing.cancelled", "2026-08-13T10:00:04.000Z"), // ties keep arrival order
+		event("b", "listing.price_changed", "2026-08-13T10:00:02.000Z"),
+	} {
+		ev, ok := DecodeEvent([]byte(raw))
+		if !ok {
+			t.Fatal("could not decode a test event")
+		}
+		evs = append(evs, ev)
+	}
+	sortByOccurredAt(evs)
+
+	var ids []string
+	for _, ev := range evs {
+		ids = append(ids, ev.EventID)
+	}
+	if got := strings.Join(ids, ","); got != "a,b,c,d" {
+		t.Fatalf("merged order %q, want oldest first with ties left as they arrived", got)
 	}
 }
 

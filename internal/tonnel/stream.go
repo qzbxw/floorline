@@ -226,9 +226,7 @@ func (s *Stream) session(ctx context.Context) error {
 	// still filling, and blocking it here is the backpressure that keeps the
 	// merge honest.
 	mu.Lock()
-	sort.SliceStable(buffered, func(i, j int) bool {
-		return buffered[i].OccurredAt.Before(buffered[j].OccurredAt.Time)
-	})
+	sortByOccurredAt(buffered)
 	for _, ev := range buffered {
 		if err := s.process(ctx, ev); err != nil {
 			mu.Unlock()
@@ -254,6 +252,15 @@ func (s *Stream) session(ctx context.Context) error {
 	case err := <-readDone:
 		return err
 	}
+}
+
+// sortByOccurredAt orders buffered live events the way the market produced
+// them, so the backlog can be merged behind the replay without an event being
+// applied before an older one about the same gift.
+func sortByOccurredAt(evs []Event) {
+	sort.SliceStable(evs, func(i, j int) bool {
+		return evs[i].OccurredAt.Before(evs[j].OccurredAt.Time)
+	})
 }
 
 // streamUserAgent identifies the desk on a public, documented endpoint. There is
