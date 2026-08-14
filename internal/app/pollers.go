@@ -192,7 +192,7 @@ func (a *App) crossDepth(ctx context.Context, key tonnel.ModelKey, backdrop, sym
 	quotes, unreachable := a.cross.QuotesForGift(qctx, key.Name, key.Model, backdrop, symbol)
 
 	cm := pricing.CrossMarket{Unreachable: unreachable}
-	var refs, buyerCosts []float64
+	var refs, buyerCosts, modelAsks []float64
 	// The cheapest offer is what bounds the exit, so it is that offer's match
 	// quality — not the average across venues — that decides whether the bound
 	// is about the same asset at all.
@@ -212,6 +212,10 @@ func (a *App) crossDepth(ctx context.Context, key tonnel.ModelKey, backdrop, sym
 			cheapest, comparable = asks[0], market.Comparable(q.Scope)
 		}
 		cm.Asks = append(cm.Asks, asks...)
+		// The model-wide queue travels alongside, never merged into the rung the
+		// exit is bounded by: those are two different questions and mixing them
+		// is what the tight rung exists to prevent.
+		modelAsks = append(modelAsks, q.ModelAsks...)
 		// The displayed ask is what the buyer pays. Quote.Fee is deliberately
 		// not added here: on these venues it is the *seller's* commission —
 		// Quote.Net is Floor*(1-Fee) — so charging it to the buyer would inflate
@@ -230,6 +234,11 @@ func (a *App) crossDepth(ctx context.Context, key tonnel.ModelKey, backdrop, sym
 	sort.Float64s(refs)
 	sort.Float64s(cm.Asks)
 	sort.Float64s(buyerCosts)
+	sort.Float64s(modelAsks)
+	cm.ModelAsks = modelAsks
+	if len(modelAsks) > 0 {
+		cm.ModelBest = modelAsks[0]
+	}
 	cm.Support = refs[len(refs)/2]
 	cm.Comparable = comparable
 	if len(buyerCosts) > 0 {

@@ -63,6 +63,16 @@ type Quote struct {
 	Scope string // exact attributes | model | floor only
 	// Fee is that venue's sale commission, used only to annotate the quote.
 	Fee float64
+	// ModelAsks is the venue's whole queue for the model, whatever rung Asks
+	// ended up on.
+	//
+	// It is kept because the tight rung alone was misleading in the direction
+	// that costs money. A Spring Basket · Midas Bunny on Old Gold showed
+	// "Portals 19 / 20 / 24 · по фону · +42% к входу", which reads as the other
+	// venues supporting the price — while the same venue was selling Midas
+	// Bunnies from 7.48. A buyer who wants the model and does not care about the
+	// backdrop takes that one, and the desk could not see it.
+	ModelAsks []float64
 }
 
 // Net is what the floor would actually pay out on that venue.
@@ -257,7 +267,8 @@ func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backd
 			var asks []float64
 			var err error
 			scope := "floor only"
-			if ds, ok := s.(DepthSource); ok {
+			ds, hasDepth := s.(DepthSource)
+			if hasDepth {
 				asks, scope, err = askLadder(ctx, ds, collection, model, backdrop, symbol)
 				if len(asks) > 0 {
 					floor = asks[0]
@@ -272,7 +283,19 @@ func (c *Comparison) QuotesForGift(ctx context.Context, collection, model, backd
 				return
 			}
 			if floor > 0 {
-				results[i] = Quote{Venue: s.Venue(), Floor: floor, Asks: asks, Scope: scope, Fee: s.Fee()}
+				q := Quote{Venue: s.Venue(), Floor: floor, Asks: asks, Scope: scope, Fee: s.Fee()}
+				// The model queue, when the comparable rung was tighter than it.
+				// One extra request, and only on the gift-level path: the sweep
+				// asks with no attributes at all, so its rung already is the
+				// model and this costs it nothing.
+				if hasDepth && (scope == ScopeExact || scope == ScopeBackdrop) {
+					if wide, err := ds.ModelAsks(ctx, collection, model, "", "", 20); err == nil {
+						q.ModelAsks = wide
+					}
+				} else {
+					q.ModelAsks = asks
+				}
+				results[i] = q
 			}
 		}(i, s)
 	}

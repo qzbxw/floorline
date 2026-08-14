@@ -306,6 +306,18 @@ type CrossMarket struct {
 	// depth rule. A venue with a single listing contributes a fact about
 	// execution and nothing about value, so it is counted here as zero.
 	Depth int
+	// ModelAsks is the merged queue for the model itself, across venues, ignoring
+	// which backdrop or symbol each specimen drew.
+	//
+	// It answers the question the comparable rung deliberately does not: what a
+	// buyer pays who wants this model and does not care what it looks like. The
+	// two can be far apart in the direction that costs money — a Midas Bunny on
+	// Old Gold was quoted at 19–25 "по фону" while the same venue sold Midas
+	// Bunnies from 7.48 — and a desk that only sees the tight rung reads that
+	// spread as support for its entry.
+	ModelAsks []float64
+	// ModelBest is the cheapest of them, in buyer terms.
+	ModelBest float64
 	// Unreachable counts venues that could not be read at all — a timeout or a
 	// rejected session, as opposed to a venue with nothing listed. Losing this
 	// data silently removes the cap that holds an optimistic exit down, so the

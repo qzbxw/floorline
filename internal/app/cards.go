@@ -190,6 +190,14 @@ func riskLines(v pricing.Valuation) []string {
 		out = append(out, fmt.Sprintf("дешевле твоего входа стоит %s — рынок ниже нас",
 			plural(v.AsksBelowEntry, "чужой аск", "чужих аска", "чужих асков")))
 	}
+	// The model queue undercutting our entry is decisive and was invisible: the
+	// card showed the backdrop rung at +42% and said nothing about the same
+	// venue selling the model itself for half what we were about to pay.
+	if v.Cross.ModelBest > 0 && v.Cost > 0 && v.Cross.ModelBest < v.Cost {
+		out = append(out, fmt.Sprintf(
+			"на других площадках эта модель начинается с %s — дешевле твоего входа %s, покупателю необязательно брать именно этот фон",
+			num(v.Cross.ModelBest), num(v.Cost)))
+	}
 	if v.CrossImplausible {
 		out = append(out, "чужие площадки показывают цену, которой не бывает — в оценку они не пошли")
 	}

@@ -492,3 +492,77 @@ func TestReferenceIgnoresABaitFloorAndAFantasyAsk(t *testing.T) {
 		t.Errorf("reference = %.2f, want 20 — the median of the three cheapest", ref)
 	}
 }
+
+// The tight rung alone was misleading in the direction that costs money. A
+// Midas Bunny on Old Gold quoted "по фону 19 / 20 / 24" reads as the venues
+// supporting the entry — while the same venue was selling Midas Bunnies from
+// 7.48 to anyone who did not care about the backdrop.
+func TestQuoteCarriesTheModelQueueBesideTheTightRung(t *testing.T) {
+	src := &depthStub{
+		byBackdrop: []float64{19, 20, 24, 25, 35},
+		byModel:    []float64{7.48, 7.49, 7.5, 8.1},
+	}
+	c := NewComparison(src)
+
+	quotes, unreachable := c.QuotesForGift(context.Background(), "Spring Basket", "Midas Bunny", "Old Gold", "Chest")
+	if unreachable != 0 || len(quotes) != 1 {
+		t.Fatalf("quotes=%v unreachable=%d", quotes, unreachable)
+	}
+	q := quotes[0]
+	if q.Scope != ScopeBackdrop {
+		t.Fatalf("scope = %q, want the backdrop rung", q.Scope)
+	}
+	// The rung that bounds the exit is unchanged: that narrowing is deliberate.
+	if len(q.Asks) != 5 || q.Asks[0] != 19 {
+		t.Fatalf("comparable asks = %v", q.Asks)
+	}
+	// And the whole model queue now travels with it.
+	if len(q.ModelAsks) != 4 || q.ModelAsks[0] != 7.48 {
+		t.Fatalf("model asks = %v, want the venue's own model queue", q.ModelAsks)
+	}
+}
+
+// When the comparable rung already *is* the model, there is no second question
+// to ask and no second request to spend on it — which is what keeps this free
+// for the sweep, whose lookups carry no attributes at all.
+func TestModelRungCostsNoExtraRequest(t *testing.T) {
+	src := &depthStub{byModel: []float64{7.48, 7.5}}
+	c := NewComparison(src)
+
+	quotes, _ := c.QuotesForGift(context.Background(), "Spring Basket", "Midas Bunny", "", "")
+	if len(quotes) != 1 || quotes[0].Scope != ScopeModel {
+		t.Fatalf("quotes = %+v", quotes)
+	}
+	if len(quotes[0].ModelAsks) != 2 {
+		t.Fatalf("model asks = %v", quotes[0].ModelAsks)
+	}
+	if src.calls != 1 {
+		t.Fatalf("made %d requests for a model-only lookup, want 1", src.calls)
+	}
+}
+
+// depthStub answers the ladder the way a venue does: filtered queries return
+// only what matches, and the model query returns the whole queue.
+type depthStub struct {
+	byBackdrop, byModel []float64
+	calls               int
+}
+
+func (d *depthStub) Venue() string { return "stub" }
+func (d *depthStub) Fee() float64  { return 0 }
+func (d *depthStub) Enabled() bool { return true }
+func (d *depthStub) ModelFloor(ctx context.Context, collection, model string) (float64, error) {
+	return 0, nil
+}
+
+func (d *depthStub) ModelAsks(ctx context.Context, collection, model, backdrop, symbol string, limit int) ([]float64, error) {
+	d.calls++
+	switch {
+	case symbol != "":
+		return nil, nil // the exact bucket is the sparsest and usually empty
+	case backdrop != "":
+		return d.byBackdrop, nil
+	default:
+		return d.byModel, nil
+	}
+}

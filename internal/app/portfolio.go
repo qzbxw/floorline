@@ -257,6 +257,12 @@ func valuationDepthLine(v pricing.Valuation) string {
 	if n := len(v.Cross.Asks); n > 0 {
 		parts = append(parts, fmt.Sprintf("площадки: %d офф., лучший %s", n, num(v.Cross.BestBuyerCost)))
 	}
+	// The model queue, when it is not the same thing as the rung above. Showing
+	// only the tight one made "Portals 19 / 20 / 24 · по фону" look like support
+	// for a 14 entry while the same venue sold the model from 7.48.
+	if v.Cross.ModelBest > 0 && !pricing.SamePrice(v.Cross.ModelBest, v.Cross.BestBuyerCost) {
+		parts = append(parts, fmt.Sprintf("модель целиком от %s", num(v.Cross.ModelBest)))
+	}
 	if len(parts) == 0 {
 		return ""
 	}
