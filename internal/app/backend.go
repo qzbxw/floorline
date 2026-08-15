@@ -53,6 +53,12 @@ func (a *App) priceGiftWithCost(ctx context.Context, g tonnel.Gift, cost, ticket
 	fxSales, fxCoverage, _ := a.normalizeGramSales(ctx, sales, since)
 	liq := pricing.ComputeLiquidity(fxSales, now, a.window(), a.Coverage())
 	liq.RawMedian, liq.FXCoverage = rawLiq.Median, fxCoverage
+	// The collection this model sits in, on the same terms the detector reads it,
+	// so /val and the Buy button cannot disagree with the card that offered the
+	// trade about how fast the thing sells.
+	if tape, err := a.st.CollectionTapeSince(ctx, key.Name, now.Add(-a.window())); err == nil {
+		liq = pricing.WithPeerSupport(liq, pricing.ComputePeers(tape, a.window(), a.Coverage()))
+	}
 
 	var floor, rarity float64
 	var supply int

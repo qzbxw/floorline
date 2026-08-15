@@ -36,14 +36,23 @@ type Liquidity struct {
 	// deduplicated count would make it identically 1 and the guard inert.
 	Turnover float64
 
-	Velocity   float64 // trades per day, normalised to the history we really have
-	Median     float64 // median price over the window
-	RawMedian  float64 // unadjusted historical GRAM median
-	FXCoverage float64 // share of sales normalized with a nearby GRAM/USD quote
-	Median7    float64 // median price over the last 7 days
-	MAD        float64 // median absolute deviation
-	MADRatio   float64 // MAD / Median — dispersion, i.e. how quotable this model is
-	Trend      float64 // Median7 / Median; < 1 means the model is bleeding
+	Velocity float64 // trades per day, normalised to the history we really have
+	// ModelVelocity is what this model's own tape literally said, before the
+	// collection around it was allowed to vouch for it. Velocity is the number
+	// the fill curve and the gates use; this one is kept so a card can show both
+	// and the operator can see which one moved.
+	ModelVelocity float64
+	// Peers is the collection this model sits in, and PeerSupported records that
+	// it lifted Velocity.
+	Peers         Peers
+	PeerSupported bool
+	Median        float64 // median price over the window
+	RawMedian     float64 // unadjusted historical GRAM median
+	FXCoverage    float64 // share of sales normalized with a nearby GRAM/USD quote
+	Median7       float64 // median price over the last 7 days
+	MAD           float64 // median absolute deviation
+	MADRatio      float64 // MAD / Median — dispersion, i.e. how quotable this model is
+	Trend         float64 // Median7 / Median; < 1 means the model is bleeding
 
 	LastSale time.Time
 }
@@ -123,6 +132,86 @@ func ComputeLiquidity(sales []store.SaleRow, now time.Time, window, coverage tim
 	}
 
 	l.Velocity = float64(l.Sales) / effectiveDays(window, coverage)
+	return l
+}
+
+// Liquidity is measured in a cascade, not at one level.
+//
+// The tradable unit is (collection, model) and that is where the *price* comes
+// from — but it is the wrong place to measure how fast something sells, and
+// measuring it there is what turned Vice Cream, a collection that empties every
+// day, into "0.71 продажи в день, только вручную". A buyer shopping Vice Cream
+// does not refuse to look at Berry Shake because Berry Shake's own tape is thin;
+// the model's rate is an estimate of a rate the collection also has evidence
+// about, and with three prints behind it that estimate is mostly noise.
+//
+// So the model's own rate is shrunk toward what the collection implies, with a
+// weight that is the model's own sample size. Ten prints of its own and the
+// model speaks for itself; three and the collection carries most of it; none and
+// nothing is lent at all, because a model that has never traded is exactly the
+// case this must not paper over.
+//
+// This is about liquidity only. What the exact backdrop-and-symbol combination
+// is worth stays where it belongs — a premium or a discount on the price, in
+// ComputeAttributeValue — and never becomes the base rate for how fast a thing
+// can be sold.
+const (
+	// peerPrior is the model sample at which its own tape and the collection's
+	// carry equal weight: n/(n+6) is ~0.14 at one print, 0.33 at three, 0.63 at
+	// ten, 0.77 at twenty.
+	peerPrior = 6.0
+	// maxPeerLift caps how far the collection may carry one model. Without it a
+	// model with two prints in a hot collection would inherit nearly the whole
+	// peer rate, which is the opposite mistake to the one being fixed.
+	maxPeerLift = 3.0
+	// minPeerBlendSales is the model's own evidence that anything is lent at all.
+	minPeerBlendSales = 2
+	// The collection has to be a market itself before it can vouch for a model:
+	// a handful of trades across two models is not a base rate, it is the same
+	// thin tape one level up.
+	minPeerSales  = 20
+	minPeerModels = 4
+)
+
+// Peers is the collection's tape, reduced to what a single model can borrow
+// from it.
+type Peers struct {
+	// Prints and Sales are the collection's raw and deduplicated trade counts;
+	// Models is how many different models actually traded.
+	Prints, Sales, Models int
+	// PerModel is the arrival rate an average model of this collection sees: the
+	// deduplicated collection rate divided across the models that traded. Zero
+	// means the collection is too thin to lend anything.
+	PerModel float64
+	LastSale time.Time
+}
+
+// ComputePeers turns a collection's aggregated tape into a per-model rate.
+func ComputePeers(t store.CollectionTape, window, coverage time.Duration) Peers {
+	p := Peers{Prints: t.Prints, Sales: t.Sales, Models: t.Models, LastSale: t.LastSale}
+	if t.Sales < minPeerSales || t.Models < minPeerModels {
+		return p
+	}
+	p.PerModel = float64(t.Sales) / float64(t.Models) / effectiveDays(window, coverage)
+	return p
+}
+
+// WithPeerSupport lets the collection vouch for a model whose own tape is thin.
+//
+// It only ever lifts. A model that visibly trades is not made slower by quiet
+// neighbours: the cascade exists to stop a thin sample from denying a liquid
+// market, not to overrule a tape that is actually there.
+func WithPeerSupport(l Liquidity, p Peers) Liquidity {
+	l.ModelVelocity, l.Peers = l.Velocity, p
+	if p.PerModel <= 0 || l.Velocity <= 0 || l.Sales < minPeerBlendSales {
+		return l
+	}
+	own := float64(l.Sales)
+	w := own / (own + peerPrior)
+	blended := math.Min(w*l.Velocity+(1-w)*p.PerModel, l.Velocity*maxPeerLift)
+	if blended > l.Velocity {
+		l.Velocity, l.PeerSupported = blended, true
+	}
 	return l
 }
 

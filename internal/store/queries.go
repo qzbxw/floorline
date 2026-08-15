@@ -360,6 +360,47 @@ ORDER BY ts ASC`, key.Name, key.Model, unix(since))
 	return out, rows.Err()
 }
 
+// CollectionTape is the whole collection's trade activity, aggregated.
+//
+// It is deliberately an aggregate and not a row set. The point of reading it is
+// to know how the market around a model behaves when the model's own tape is too
+// thin to say anything, and that question needs four counts — not the several
+// thousand rows a busy collection accumulates over the lookback window, fetched
+// once per candidate.
+type CollectionTape struct {
+	// Prints is every trade, repeats included; Sales deduplicates by physical
+	// gift, exactly as the model-level statistics do.
+	Prints int
+	Sales  int
+	// Models is how many different models actually traded. It is the divisor
+	// that turns a collection's trade rate into a rate per model.
+	Models   int
+	LastSale time.Time
+}
+
+// CollectionTapeSince aggregates a collection's trades newer than `since`.
+func (s *Store) CollectionTapeSince(ctx context.Context, name string, since time.Time) (CollectionTape, error) {
+	var t CollectionTape
+	var last int64
+	// COALESCE(NULLIF(gift_num,0), gift_id) is the same physical identity the
+	// in-memory dedupe uses: gift_num when the row carries one, gift_id for the
+	// older rows that do not.
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COUNT(DISTINCT COALESCE(NULLIF(gift_num,0), gift_id)),
+       COUNT(DISTINCT model),
+       COALESCE(MAX(ts),0)
+FROM sales
+WHERE name = ? AND ts >= ? AND price > 0`, name, unix(since)).Scan(&t.Prints, &t.Sales, &t.Models, &last)
+	if err != nil {
+		return CollectionTape{}, err
+	}
+	if last > 0 {
+		t.LastSale = fromUnix(last)
+	}
+	return t, nil
+}
+
 // RecentSalesForCollection returns the newest trades in a collection.
 func (s *Store) RecentSalesForCollection(ctx context.Context, name string, limit int) ([]CollectionSale, error) {
 	rows, err := s.db.QueryContext(ctx, `

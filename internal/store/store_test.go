@@ -203,6 +203,55 @@ func TestSalesSinceFiltersByModelAndTime(t *testing.T) {
 	}
 }
 
+// The collection tape is what a model with three prints of its own is judged
+// against, so it has to count the same way the model-level statistics do: one
+// trade per physical gift, repeats collapsed, and only the models that actually
+// traded in the divisor.
+func TestCollectionTapeCountsGiftsAndModels(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	at := func(h time.Duration) tonnel.FlexTime { return tonnel.FlexTime{Time: now.Add(-h)} }
+	_, err := st.InsertSales(ctx, []tonnel.Sale{
+		{GiftID: 1, GiftNum: 11, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 100, Timestamp: at(time.Hour)},
+		{GiftID: 1, GiftNum: 11, GiftName: "Plush Pepe", Model: "Pink Diamond (0.4%)", Price: 110, Timestamp: at(3 * time.Hour)},
+		{GiftID: 2, GiftNum: 12, GiftName: "Plush Pepe", Model: "Blue Steel (2%)", Price: 120, Timestamp: at(2 * time.Hour)},
+		{GiftID: 3, GiftNum: 13, GiftName: "Plush Pepe", Model: "Blue Steel (2%)", Price: 130, Timestamp: at(4 * time.Hour)},
+		// Out of the window, and another collection entirely.
+		{GiftID: 4, GiftNum: 14, GiftName: "Plush Pepe", Model: "Blue Steel (2%)", Price: 140, Timestamp: at(40 * 24 * time.Hour)},
+		{GiftID: 5, GiftNum: 15, GiftName: "Lol Pop", Model: "Pink Diamond (0.4%)", Price: 150, Timestamp: at(time.Hour)},
+	})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	tape, err := st.CollectionTapeSince(ctx, "Plush Pepe", now.Add(-14*24*time.Hour))
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if tape.Prints != 4 {
+		t.Errorf("prints = %d, want the four trades inside the window", tape.Prints)
+	}
+	if tape.Sales != 3 {
+		t.Errorf("sales = %d, want three distinct gifts — the same one twice is one item", tape.Sales)
+	}
+	if tape.Models != 2 {
+		t.Errorf("models = %d, want 2", tape.Models)
+	}
+	if tape.LastSale.Unix() != now.Add(-time.Hour).Unix() {
+		t.Errorf("last sale = %s, want %s", tape.LastSale, now.Add(-time.Hour))
+	}
+
+	empty, err := st.CollectionTapeSince(ctx, "Nobody Trades This", now.Add(-14*24*time.Hour))
+	if err != nil {
+		t.Fatalf("empty query: %v", err)
+	}
+	if empty.Prints != 0 || empty.Sales != 0 || empty.Models != 0 || !empty.LastSale.IsZero() {
+		t.Errorf("an untraded collection reported %+v", empty)
+	}
+}
+
 // The claim is what makes a double-tapped Buy button safe.
 func TestClaimBuyIsExclusive(t *testing.T) {
 	ctx := context.Background()

@@ -377,9 +377,14 @@ func (e *Executor) listingTarget(ctx context.Context, giftID int64, key tonnel.M
 	if err != nil {
 		return 0, "", fmt.Errorf("не перечитал историю сделок: %w", err)
 	}
-	liq := pricing.ComputeLiquidity(sales, now,
-		time.Duration(e.cfg.LookbackDays)*24*time.Hour,
-		time.Duration(e.cfg.LookbackDays)*24*time.Hour)
+	window := time.Duration(e.cfg.LookbackDays) * 24 * time.Hour
+	liq := pricing.ComputeLiquidity(sales, now, window, window)
+	// Same collection support the buy decision was made with. Pricing the exit
+	// off a slower rate than the entry was judged by would list the gift lower
+	// than the trade it came from assumed.
+	if tape, err := e.st.CollectionTapeSince(ctx, key.Name, now.Add(-window)); err == nil {
+		liq = pricing.WithPeerSupport(liq, pricing.ComputePeers(tape, window, window))
+	}
 
 	val := pricing.Evaluate(pricing.Input{
 		GiftID:    giftID,

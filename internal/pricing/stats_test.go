@@ -217,3 +217,90 @@ func TestMedianEvenAndOdd(t *testing.T) {
 		t.Errorf("median of nothing = %v, want 0", got)
 	}
 }
+
+// The tape a flipper is denied by is almost never the collection's — it is the
+// small sample belonging to one model inside it. Vice Cream empties every day
+// and Berry Shake, one model of it, showed 0.71 sales a day and was refused.
+func TestPeersLiftAThinModelTowardTheCollection(t *testing.T) {
+	now := time.Now()
+	window := 14 * 24 * time.Hour
+
+	// Three prints of our own: an estimate with a big error bar, not a verdict.
+	l := ComputeLiquidity(salesAt(now,
+		entry{1, 100, 1}, entry{5, 100, 2}, entry{9, 100, 3},
+	), now, window, window)
+	own := l.Velocity
+
+	// The collection around it: 140 different gifts across 10 models in the same
+	// fortnight — one model of it sees 1 a day on average.
+	p := ComputePeers(store.CollectionTape{Prints: 160, Sales: 140, Models: 10}, window, window)
+	if math.Abs(p.PerModel-1) > 1e-9 {
+		t.Fatalf("per-model rate = %.3f, want 1.00", p.PerModel)
+	}
+
+	l = WithPeerSupport(l, p)
+	if !l.PeerSupported {
+		t.Fatal("a three-print model in a liquid collection was left to its own tape")
+	}
+	if l.ModelVelocity != own {
+		t.Errorf("model velocity = %.3f, want the untouched %.3f", l.ModelVelocity, own)
+	}
+	if l.Velocity <= own {
+		t.Errorf("velocity = %.3f, want it lifted above the model's own %.3f", l.Velocity, own)
+	}
+	// The cap is the other half of the point: peers vouch, they do not testify.
+	if l.Velocity > own*maxPeerLift+1e-9 {
+		t.Errorf("velocity = %.3f, want no more than %.0f× the model's own %.3f", l.Velocity, maxPeerLift, own)
+	}
+}
+
+// A model nobody trades is exactly the case the cascade must not paper over.
+func TestPeersLendNothingToAModelWithNoTape(t *testing.T) {
+	now := time.Now()
+	window := 14 * 24 * time.Hour
+	p := ComputePeers(store.CollectionTape{Prints: 160, Sales: 140, Models: 10}, window, window)
+
+	one := WithPeerSupport(ComputeLiquidity(salesAt(now, entry{2, 100, 1}), now, window, window), p)
+	if one.PeerSupported || one.Velocity != one.ModelVelocity {
+		t.Errorf("a single print borrowed the collection's rate: %.3f vs own %.3f", one.Velocity, one.ModelVelocity)
+	}
+	none := WithPeerSupport(ComputeLiquidity(nil, now, window, window), p)
+	if none.Velocity != 0 {
+		t.Errorf("an untraded model was given %.3f sales a day", none.Velocity)
+	}
+}
+
+// The collection has to be a market itself before it can vouch for anything.
+func TestThinCollectionVouchesForNobody(t *testing.T) {
+	window := 14 * 24 * time.Hour
+	shallow := ComputePeers(store.CollectionTape{Prints: 12, Sales: 11, Models: 6}, window, window)
+	if shallow.PerModel != 0 {
+		t.Errorf("eleven trades produced a per-model rate of %.3f", shallow.PerModel)
+	}
+	narrow := ComputePeers(store.CollectionTape{Prints: 90, Sales: 80, Models: 2}, window, window)
+	if narrow.PerModel != 0 {
+		t.Errorf("two models produced a per-model rate of %.3f", narrow.PerModel)
+	}
+}
+
+// Confidence is about the price, so peers move it much less than they move the
+// trade rate — but "8% доверия" on a model with two prints inside a collection
+// with two hundred is understating what is known.
+func TestPeersAreDiscountedEvidenceForConfidence(t *testing.T) {
+	now := time.Now()
+	window := 14 * 24 * time.Hour
+	thin := ComputeLiquidity(salesAt(now,
+		entry{1, 100, 1}, entry{4, 100, 2},
+	), now, window, window)
+
+	alone := confidence(thin, AttributeValue{})
+	supported := confidence(WithPeerSupport(thin,
+		ComputePeers(store.CollectionTape{Prints: 240, Sales: 220, Models: 12}, window, window)), AttributeValue{})
+
+	if supported <= alone {
+		t.Errorf("confidence = %.2f with a deep collection, %.2f without", supported, alone)
+	}
+	if supported > .5 {
+		t.Errorf("confidence = %.2f — peers alone must not make a two-print model a known price", supported)
+	}
+}

@@ -222,6 +222,13 @@ func (d *Detector) evaluate(ctx context.Context, g tonnel.Gift, limits risk.Limi
 	if liq.Median <= 0 && liq.Sales < d.cfg.Sig.MinSales {
 		return nil, nil // no trade history and no chance of clearing the gate
 	}
+	// How the collection around this model trades. A model's own tape is where
+	// its price comes from, but it is a small sample of a rate the collection
+	// also has evidence about — see pricing.WithPeerSupport. Read after the early
+	// return above so hopeless candidates do not cost a query.
+	if tape, err := d.st.CollectionTapeSince(ctx, key.Name, now.Add(-d.window())); err == nil {
+		liq = pricing.WithPeerSupport(liq, pricing.ComputePeers(tape, d.window(), d.Coverage()))
+	}
 
 	stat, err := d.st.ModelStat(ctx, key)
 	if err != nil {
@@ -522,6 +529,87 @@ func requiredEdge(base float64, l pricing.Liquidity, r pricing.Regime) float64 {
 	return base + r.EdgeSurcharge()
 }
 
+// The ticket bands for the exit-speed bar, in GRAM, and the edge that counts as
+// fat enough to pay for a slower market.
+const (
+	smallTicket = 4.0
+	midTicket   = 8.0
+	fatEdge     = 0.12
+)
+
+// requiredVelocity scales the unattended exit-speed bar by what is actually at
+// stake in the trade.
+//
+// One flat "one sale a day or ask a human" prices a 3-GRAM lot with an 18% edge
+// exactly like a 20-GRAM one with 4%, and the first is the trade this desk
+// mostly makes. What the bar is really protecting is the money that would be
+// stuck if the flip does not fill, so it has to scale with the money: a small
+// ticket with a fat margin can afford to wait, and a large one cannot.
+//
+// The scale only ever relaxes, and never past the mid band: the configured bar
+// stays exactly the bar for anything the desk would call a real position. A fat
+// margin on a big lot is not a reason to be patient with it — that is the trade
+// whose being stuck stops the desk from trading at all.
+func requiredVelocity(base, cost, edge float64) float64 {
+	if base <= 0 || cost <= 0 {
+		return base
+	}
+	share := 1.0
+	switch {
+	case cost <= smallTicket:
+		share = .70
+	case cost <= midTicket:
+		share = .85
+	}
+	if edge >= fatEdge && cost <= midTicket {
+		share -= .25
+	}
+	return base * math.Max(share, 0)
+}
+
+// velocityNote says why the bar is not where the config put it, so a threshold
+// that moved under the operator does not look arbitrary. It is empty when the
+// configured bar is exactly the bar.
+func velocityNote(base, need, cost, edge float64) string {
+	if need >= base-1e-9 {
+		return ""
+	}
+	return fmt.Sprintf(" (лот %.1f GRAM, эдж %.0f%% — планка снижена с %.2f)", cost, edge*100, base)
+}
+
+// minTapeBreadth is how many different physical gifts make a tape a market
+// whatever the repeats say, and washTurnoverShare is how far under the
+// configured bar turnover has to fall before the shortfall means the tape is one
+// NFT going in circles.
+//
+// The guard used to be the bar itself, and 0.58 against a 0.60 setting blocked
+// unattended buying on a tape of fifteen different gifts. That is not the thing
+// the guard was written for: repeats inside a wide tape are ordinary flipping,
+// and the cost of them is already charged — smoothly — inside confidence, which
+// carries turnover as a factor and feeds the data layer of the verdict.
+const (
+	minTapeBreadth    = 10
+	washTurnoverShare = .75
+)
+
+// washedTape reports whether a low turnover means the tape is manufactured.
+func washedTape(l pricing.Liquidity, bar float64, lookbackDays int) (bool, string) {
+	if bar <= 0 || l.Turnover >= bar || l.Prints <= 0 {
+		return false, ""
+	}
+	switch {
+	case l.Turnover < bar*washTurnoverShare:
+		return true, fmt.Sprintf(
+			"в истории всего %d разных гифтов на %d сделок (оборот %.2f при пороге %.2f) — это один NFT по кругу, а не рынок",
+			l.DistinctGifts, l.Prints, l.Turnover, bar)
+	case l.DistinctGifts < minTapeBreadth:
+		return true, fmt.Sprintf(
+			"оборот %.2f ниже %.2f, и всего %d разных гифтов за %dд — ленты слишком мало, чтобы покупать без рук",
+			l.Turnover, bar, l.DistinctGifts, lookbackDays)
+	}
+	return false, ""
+}
+
 // regimeNote names a falling market wherever a threshold moved because of it, so
 // a bar that changed under the operator does not look arbitrary.
 func regimeNote(r pricing.Regime) string {
@@ -588,16 +676,15 @@ func (d *Detector) autoGates(v pricing.Valuation, limits risk.Limits) []string {
 	if v.AdverseSelection {
 		fails = append(fails, v.AdverseReason)
 	}
-	if v.Liq.Velocity < a.MinVelocity {
-		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже порога автобая %.2f", v.Liq.Velocity, a.MinVelocity))
+	if need := requiredVelocity(a.MinVelocity, v.Cost, v.Edge); v.Liq.Velocity < need {
+		fails = append(fails, fmt.Sprintf("скорость %.2f/день ниже порога автобая %.2f%s",
+			v.Liq.Velocity, need, velocityNote(a.MinVelocity, need, v.Cost, v.Edge)))
 	}
 	if v.Liq.Sales < a.MinSales {
 		fails = append(fails, fmt.Sprintf("%d сделок за %dд, автобаю нужно %d", v.Liq.Sales, d.cfg.LookbackDays, a.MinSales))
 	}
-	if v.Liq.Turnover < a.MinTurnover {
-		fails = append(fails, fmt.Sprintf(
-			"в истории всего %d разных гифтов на %d сделок (оборот %.2f, автобаю надо %.2f) — похоже на гон одного NFT",
-			v.Liq.DistinctGifts, v.Liq.Prints, v.Liq.Turnover, a.MinTurnover))
+	if washed, why := washedTape(v.Liq, a.MinTurnover, d.cfg.LookbackDays); washed {
+		fails = append(fails, why)
 	}
 	if v.MarketDisagreement {
 		fails = append(fails, fmt.Sprintf("рынок спорит сам с собой: история и живой стакан разъехались на %.0f%% — только руками", v.MarketDivergence*100))

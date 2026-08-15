@@ -313,6 +313,9 @@ func (a *App) evidenceBlock(ctx context.Context, v pricing.Valuation, g tonnel.G
 		plural(v.Liq.Prints, "сделка", "сделки", "сделок"),
 		plural(v.Liq.DistinctGifts, "гифт", "гифта", "гифтов"), a.cfg.LookbackDays,
 		num(v.Liq.Median), v.Liq.Velocity, ago(v.Liq.LastSale))
+	if line := peerSupportLine(v.Liq); line != "" {
+		b.WriteString(line)
+	}
 
 	if bd := tonnel.BaseAttr(g.Backdrop); bd != "" {
 		fmt.Fprintf(&b, "🎨 %s · %s — %s\n",
@@ -322,6 +325,21 @@ func (a *App) evidenceBlock(ctx context.Context, v pricing.Valuation, g tonnel.G
 		fmt.Fprintf(&b, "✨ %s\n", bot.Esc(strings.Join(v.Appearance.Reasons, " · ")))
 	}
 	return b.String()
+}
+
+// peerSupportLine says when the trade rate on the card is not the model's own.
+//
+// The number every gate is applied to is the supported one, so hiding where it
+// came from would leave the operator checking a "0.7 в день" model against a
+// card that quietly used 1.4. It prints only when the support actually moved
+// something.
+func peerSupportLine(l pricing.Liquidity) string {
+	if !l.PeerSupported {
+		return ""
+	}
+	return fmt.Sprintf("🧩 своя лента тонкая (%.2f в день) · коллекция даёт %.2f на модель (%s) → считаю по %.2f\n",
+		l.ModelVelocity, l.Peers.PerModel,
+		plural(l.Peers.Sales, "сделка", "сделки", "сделок"), l.Velocity)
 }
 
 // premiumNote states what the trades say about these traits, in a few words.
@@ -477,6 +495,7 @@ func (a *App) historyBlock(v pricing.Valuation) string {
 		v.Liq.Prints, v.Liq.DistinctGifts, v.Liq.Velocity, ago(v.Liq.LastSale))
 	fmt.Fprintf(&b, "Медиана %s · разброс %.0f%% · тренд %+.0f%%\n",
 		num(v.Liq.Median), v.Liq.MADRatio*100, (v.Liq.Trend-1)*100)
+	b.WriteString(peerSupportLine(v.Liq))
 	if v.MarketDisagreement {
 		fmt.Fprintf(&b, "⚠️ История и живой стакан разъехались на %.0f%% — только руками\n", v.MarketDivergence*100)
 	}

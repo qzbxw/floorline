@@ -2,6 +2,7 @@ package signal
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,32 @@ func (h *harness) seedSales(t *testing.T, price float64, count, distinct int) {
 	}
 	if _, err := h.st.InsertSales(context.Background(), sales); err != nil {
 		t.Fatalf("seed sales: %v", err)
+	}
+}
+
+// seedPeerSales writes trades for `models` *other* models of the same
+// collection, `each` apiece, all of them different physical gifts. It is the
+// market around the candidate: the thing a thin model is allowed to borrow a
+// trade rate from.
+func (h *harness) seedPeerSales(t *testing.T, price float64, models, each int) {
+	t.Helper()
+	now := time.Now()
+	sales := make([]tonnel.Sale, 0, models*each)
+	for m := 0; m < models; m++ {
+		for i := 0; i < each; i++ {
+			n := int64(m*each + i)
+			sales = append(sales, tonnel.Sale{
+				GiftID:    tonnel.FlexInt(700000 + n),
+				GiftName:  key.Name,
+				Model:     fmt.Sprintf("Peer %d (2%%)", m),
+				Price:     tonnel.Flex64(price),
+				GiftNum:   tonnel.FlexInt(700000 + n),
+				Timestamp: tonnel.FlexTime{Time: now.Add(-time.Duration(i) * 6 * time.Hour)},
+			})
+		}
+	}
+	if _, err := h.st.InsertSales(context.Background(), sales); err != nil {
+		t.Fatalf("seed peer sales: %v", err)
 	}
 }
 
@@ -690,5 +717,117 @@ func TestEvaluateWithCrossUsesTheSuppliedQuoteAndAsksNoVenue(t *testing.T) {
 	}
 	if !dec.Val.ExitFromCross {
 		t.Error("the exit came from another venue's queue and does not say so")
+	}
+}
+
+// One flat "a sale a day or ask a human" prices a 3-GRAM lot with an 18% edge
+// exactly like a 20-GRAM one with 4%, and the first is the trade this desk
+// mostly makes. What the bar protects is the money that would be stuck, so it
+// scales with the money.
+func TestExitSpeedBarScalesWithWhatIsAtStake(t *testing.T) {
+	const base = 1.0
+	cases := []struct {
+		name       string
+		cost, edge float64
+		want       float64
+	}{
+		{"small ticket, fat edge", 3.1, .176, .45},
+		{"small ticket, ordinary edge", 3.1, .06, .70},
+		{"mid ticket, fat edge", 6.0, .18, .60},
+		{"mid ticket, ordinary edge", 6.0, .06, .85},
+		{"a real position pays the configured bar", 12.0, .30, base},
+		{"and so does a big one", 40.0, .40, base},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := requiredVelocity(base, c.cost, c.edge)
+			if math.Abs(got-c.want) > 1e-9 {
+				t.Errorf("requiredVelocity(%.1f GRAM, %.0f%%) = %.2f, want %.2f", c.cost, c.edge*100, got, c.want)
+			}
+			// A bar that moved under the operator has to say so; one that did
+			// not must not add noise to the rejection.
+			if note := velocityNote(base, got, c.cost, c.edge); (note == "") != (got >= base) {
+				t.Errorf("bar %.2f vs base %.2f explained as %q", got, base, note)
+			}
+		})
+	}
+	// The bar never relaxes below what the configured setting means, and never
+	// tightens past it either.
+	if got := requiredVelocity(0, 3, .2); got != 0 {
+		t.Errorf("an unset bar became %.2f", got)
+	}
+	if got := requiredVelocity(base, 40, .5); got > base {
+		t.Errorf("a large ticket tightened the operator's bar to %.2f", got)
+	}
+}
+
+// Turnover exists to catch one gift being passed around. Fifteen different
+// gifts on twenty-six trades is not that, and 0.58 against a 0.60 setting used
+// to block unattended buying on exactly that tape.
+func TestWideTapeSurvivesANearMissOnTurnover(t *testing.T) {
+	const bar = 0.6
+	wide := pricing.Liquidity{Prints: 26, DistinctGifts: 15, Turnover: 15.0 / 26.0}
+	if washed, why := washedTape(wide, bar, 14); washed {
+		t.Errorf("fifteen different gifts read as a wash tape: %s", why)
+	}
+	// The thing it was written for still fails: four gifts, twenty-six trades.
+	circled := pricing.Liquidity{Prints: 26, DistinctGifts: 4, Turnover: 4.0 / 26.0}
+	washed, why := washedTape(circled, bar, 14)
+	if !washed {
+		t.Fatal("one NFT going in circles cleared the guard")
+	}
+	if !strings.Contains(why, "по кругу") {
+		t.Errorf("rejection = %q, want it to name the wash tape", why)
+	}
+	// And so does a tape that is merely too small to see a market in, even
+	// though its shortfall on turnover is small.
+	narrow := pricing.Liquidity{Prints: 12, DistinctGifts: 7, Turnover: 7.0 / 12.0}
+	if washed, _ := washedTape(narrow, bar, 14); !washed {
+		t.Error("seven gifts in a fortnight cleared the guard")
+	}
+	if washed, _ := washedTape(pricing.Liquidity{Prints: 26, DistinctGifts: 20, Turnover: 20.0 / 26.0}, bar, 14); washed {
+		t.Error("a tape above the bar was rejected by the guard")
+	}
+}
+
+// A model's own tape is a small sample of a rate the collection also has
+// evidence about. Berry Shake showed 0.71 sales a day and was refused while
+// Vice Cream, the collection it belongs to, emptied every day.
+func TestCollectionCarriesAThinModelsTradeRate(t *testing.T) {
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 4, 4)
+	h.seedPeerSales(t, 1200, 8, 12)
+	h.seedStat(t, 800, 12)
+
+	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
+	if err != nil || dec == nil {
+		t.Fatalf("evaluate: %+v err=%v", dec, err)
+	}
+	liq := dec.Val.Liq
+	if !liq.PeerSupported {
+		t.Fatalf("a four-print model in a liquid collection kept its own %.2f/day", liq.Velocity)
+	}
+	if liq.Velocity <= liq.ModelVelocity {
+		t.Errorf("velocity %.2f was not lifted above the model's own %.2f", liq.Velocity, liq.ModelVelocity)
+	}
+	if liq.Peers.Models < 8 {
+		t.Errorf("peers saw %d models, want the eight seeded around it", liq.Peers.Models)
+	}
+}
+
+// The same reading must not invent a market for a collection that has none.
+func TestQuietCollectionLendsNothing(t *testing.T) {
+	h := newHarness(t, 800, 1200, 1250)
+	h.seedSales(t, 1200, 40, 40)
+	h.seedPeerSales(t, 1200, 2, 3)
+	h.seedStat(t, 800, 12)
+
+	dec, err := h.det.Evaluate(context.Background(), gift(candidateID, 800), defaultLimits(), time.Now())
+	if err != nil || dec == nil {
+		t.Fatalf("evaluate: %+v err=%v", dec, err)
+	}
+	if dec.Val.Liq.PeerSupported {
+		t.Errorf("a six-trade collection vouched for a model: %.2f vs own %.2f",
+			dec.Val.Liq.Velocity, dec.Val.Liq.ModelVelocity)
 	}
 }

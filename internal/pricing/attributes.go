@@ -384,10 +384,10 @@ func liquidityFactor(l Liquidity) float64 {
 // scales the whole thing: with nothing traded there is nothing to be confident
 // about, however tidy the few prints look.
 func confidence(l Liquidity, a AttributeValue) float64 {
-	n := float64(l.DistinctGifts)
-	if n <= 0 {
+	if l.DistinctGifts <= 0 {
 		return 0
 	}
+	n := float64(l.DistinctGifts) + peerCredit(l.Peers)
 	// Half weight at 8 distinct gifts, 0.71 at 20, 0.83 at 40.
 	sample := n / (n + 8)
 	turnover := clamp(l.Turnover, 0, 1)
@@ -399,6 +399,26 @@ func confidence(l Liquidity, a AttributeValue) float64 {
 		base = .8*base + .2*a.Confidence
 	}
 	return clamp(base, 0, 1)
+}
+
+const (
+	// peerCreditDivisor and maxPeerCredit set how much a deep collection tape is
+	// worth to a model with almost none of its own, expressed in that model's own
+	// prints. The discount is severe on purpose: the collection is strong evidence
+	// that the thing can be sold and weak evidence about what this specimen is
+	// worth, and confidence is a statement about the second. Five equivalent
+	// prints is enough to take a two-print model out of "we know nothing" and not
+	// enough to let peers alone carry it to a confident price.
+	peerCreditDivisor = 15.0
+	maxPeerCredit     = 5.0
+)
+
+// peerCredit restates the collection's tape as equivalent prints of this model.
+func peerCredit(p Peers) float64 {
+	if p.PerModel <= 0 || p.Sales <= 0 {
+		return 0
+	}
+	return math.Min(float64(p.Sales)/peerCreditDivisor, maxPeerCredit)
 }
 
 func shrunkMedian(xs []float64, prior float64) float64 {
